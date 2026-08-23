@@ -1,4 +1,70 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+
+// ─── Supabase ─────────────────────────────────────────────────────────────────
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+const db = {
+  async getBookings(date, courtId) {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/bookings?booking_date=eq.${date}&court_id=eq.${courtId}&select=hour`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    return res.json();
+  },
+  async addBooking(data) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/bookings`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "return=representation" },
+      body: JSON.stringify(data),
+    });
+    const json = await res.json();
+    return json[0];
+  },
+  async updateSlip(id, slipUrl) {
+    await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
+    });
+  },
+  async upsertCustomer(customerId, customerName) {
+    await fetch(`${SUPABASE_URL}/rest/v1/customers`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "resolution=merge-duplicates" },
+      body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
+    });
+  },
+  async checkDiscount(code) {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/discount_codes?code=eq.${code.toUpperCase()}&active=eq.true&select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const data = await res.json();
+    if (!data || data.length === 0) return null;
+    const d = data[0];
+    if (d.used_count >= d.max_uses) return null;
+    return d;
+  },
+  async useDiscount(id, currentCount) {
+    await fetch(`${SUPABASE_URL}/rest/v1/discount_codes?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ used_count: currentCount + 1 }),
+    });
+  },
+  async uploadSlip(file, bookingId) {
+    const ext = file.name.split(".").pop();
+    const path = `slips/${bookingId}_${Date.now()}.${ext}`;
+    const res = await fetch(`${SUPABASE_URL}/storage/v1/object/slips/${path}`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": file.type },
+      body: file,
+    });
+    if (!res.ok) return null;
+    return `${SUPABASE_URL}/storage/v1/object/public/slips/${path}`;
+  },
+};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const COURTS = [
@@ -8,75 +74,35 @@ const COURTS = [
 
 const TIME_SLOTS = Array.from({ length: 17 }, (_, i) => {
   const h = 6 + i;
-  return {
-    hour: h,
-    label: `${String(h).padStart(2,"0")}:00 – ${String(h).padStart(2,"0")}:59`,
-    price: h < 13 ? 490 : 590,
-    peak: h >= 13,
-  };
+  return { hour: h, label: `${String(h).padStart(2,"0")}:00 – ${String(h).padStart(2,"0")}:59`, price: h < 13 ? 490 : 590, peak: h >= 13 };
 });
 
-// In-memory booking store
-const STORE = {};
 const toIso = (d) => d ? d.toISOString().split("T")[0] : "";
-const checkBooked = (date, courtId, hour) => !!STORE[`${toIso(date)}|${courtId}|${hour}`];
-const lockSlot = (date, courtId, hour, data) => { STORE[`${toIso(date)}|${courtId}|${hour}`] = data; };
-
-const fmtDate = (d) => d
-  ? d.toLocaleDateString("th-TH", { weekday: "short", year: "numeric", month: "short", day: "numeric" })
-  : "";
+const fmtDate = (d) => d ? d.toLocaleDateString("th-TH", { weekday: "short", year: "numeric", month: "short", day: "numeric" }) : "";
 
 // ─── CSS ──────────────────────────────────────────────────────────────────────
 const CSS = `
   @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Noto+Sans+Thai:wght@300;400;500;600;700&display=swap');
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
-    --cr: #F9E8D4;
-    --cr2: #EDD5B8;
-    --or: #F47E1F;
-    --or2: #FAA05A;
-    --or-bg: rgba(244,126,31,0.10);
-    --br: #663924;
-    --br2: #8a5035;
-    --bl: #8DB6C7;
-    --bl-bg: rgba(141,182,199,0.13);
-    --tx: #2e1a0e;
-    --mu: #8a7060;
-    --dv: rgba(102,57,36,0.14);
-    --sh: 0 2px 16px rgba(102,57,36,0.09);
-    --r: 14px;
+    --cr: #F9E8D4; --cr2: #EDD5B8; --or: #F47E1F; --or2: #FAA05A;
+    --or-bg: rgba(244,126,31,0.10); --br: #663924; --bl: #8DB6C7;
+    --bl-bg: rgba(141,182,199,0.13); --tx: #2e1a0e; --mu: #8a7060;
+    --dv: rgba(102,57,36,0.14); --sh: 0 2px 16px rgba(102,57,36,0.09); --r: 14px;
   }
   html, body { background: var(--cr); font-family: 'Noto Sans Thai', sans-serif; color: var(--tx); }
   button, input { font-family: 'Noto Sans Thai', sans-serif; }
   .bb { font-family: 'Bebas Neue', sans-serif; letter-spacing: .05em; }
-  ::-webkit-scrollbar { width: 3px; }
-  ::-webkit-scrollbar-thumb { background: var(--cr2); border-radius: 3px; }
-  @keyframes fu { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
-  .fu { animation: fu .3s ease both; }
-  .btn-primary {
-    width: 100%; padding: 15px; border-radius: var(--r); border: none;
-    background: linear-gradient(90deg, var(--or), var(--or2));
-    color: #fff; font-weight: 700; font-size: 16px; cursor: pointer;
-    box-shadow: 0 4px 18px rgba(244,126,31,.30);
-    font-family: 'Noto Sans Thai', sans-serif;
-  }
-  .btn-primary:disabled {
-    background: var(--cr2); color: var(--mu);
-    box-shadow: none; cursor: not-allowed;
-  }
-  .card {
-    background: #fff; border-radius: var(--r);
-    border: 1px solid var(--dv); box-shadow: var(--sh);
-    overflow: hidden;
-  }
-  .card-header {
-    background: var(--br); padding: 11px 18px;
-  }
-  .card-header p { color: var(--or); font-size: 13px; font-weight: 600; }
-  .card-body { padding: 16px 18px; }
+  .btn-primary { width:100%; padding:15px; border-radius:var(--r); border:none; background:linear-gradient(90deg,var(--or),var(--or2)); color:#fff; font-weight:700; font-size:16px; cursor:pointer; box-shadow:0 4px 18px rgba(244,126,31,.30); font-family:'Noto Sans Thai',sans-serif; }
+  .btn-primary:disabled { background:var(--cr2); color:var(--mu); box-shadow:none; cursor:not-allowed; }
+  .card { background:#fff; border-radius:var(--r); border:1px solid var(--dv); box-shadow:var(--sh); overflow:hidden; }
+  .card-header { background:var(--br); padding:11px 18px; }
+  .card-header p { color:var(--or); font-size:13px; font-weight:600; }
+  .card-body { padding:16px 18px; }
+  @keyframes fu { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+  .fu { animation:fu .3s ease both; }
 `;
 
-// ─── Logo SVG ─────────────────────────────────────────────────────────────────
 function NovaLogo({ width = 160 }) {
   return (
     <svg width={width} viewBox="0 0 320 100" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -92,109 +118,74 @@ function NovaLogo({ width = 160 }) {
   );
 }
 
-// ─── Court Lines SVG ──────────────────────────────────────────────────────────
 function CourtLines() {
   return (
-    <svg viewBox="0 0 400 150" fill="none" xmlns="http://www.w3.org/2000/svg"
-      style={{ width:"100%", display:"block", opacity:.15 }}>
+    <svg viewBox="0 0 400 150" fill="none" xmlns="http://www.w3.org/2000/svg" style={{width:"100%",display:"block",opacity:.15}}>
       <rect x="30" y="8" width="340" height="134" stroke="#F47E1F" strokeWidth="2.5"/>
       <rect x="80" y="8" width="240" height="134" stroke="#F47E1F" strokeWidth="2"/>
       <line x1="200" y1="8" x2="200" y2="142" stroke="#F47E1F" strokeWidth="2"/>
       <line x1="80" y1="75" x2="320" y2="75" stroke="#F47E1F" strokeWidth="2"/>
-      <line x1="200" y1="6" x2="200" y2="10" stroke="#F47E1F" strokeWidth="4"/>
     </svg>
   );
 }
 
-// ─── Tab Bar ──────────────────────────────────────────────────────────────────
 function TabBar({ tab, setTab }) {
-  const tabs = [["home","🏠","หน้าแรก"],["book","📅","จองสนาม"]];
   return (
-    <nav style={{
-      position:"fixed", bottom:0, left:0, right:0, zIndex:200,
-      backgroundColor:"#fff", borderTop:"1px solid var(--dv)",
-      display:"flex", boxShadow:"0 -3px 16px rgba(102,57,36,0.07)",
-    }}>
-      {tabs.map(([id, icon, label]) => (
-        <button key={id} onClick={() => setTab(id)} style={{
-          flex:1, padding:"11px 0 8px", background:"none", border:"none",
-          borderTop: tab===id ? "2.5px solid var(--or)" : "2.5px solid transparent",
-          color: tab===id ? "var(--or)" : "var(--mu)",
-          cursor:"pointer", display:"flex", flexDirection:"column",
-          alignItems:"center", gap:3, transition:"color .2s",
-        }}>
-          <span style={{ fontSize:21 }}>{icon}</span>
-          <span style={{ fontSize:11, fontWeight: tab===id ? 700 : 400 }}>{label}</span>
+    <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:200,backgroundColor:"#fff",borderTop:"1px solid var(--dv)",display:"flex",boxShadow:"0 -3px 16px rgba(102,57,36,0.07)"}}>
+      {[["home","🏠","หน้าแรก"],["book","📅","จองสนาม"]].map(([id,icon,label]) => (
+        <button key={id} onClick={() => setTab(id)} style={{flex:1,padding:"11px 0 8px",background:"none",border:"none",borderTop:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+          <span style={{fontSize:21}}>{icon}</span>
+          <span style={{fontSize:11,fontWeight:tab===id?700:400}}>{label}</span>
         </button>
       ))}
     </nav>
   );
 }
 
-// ─── HOME PAGE ────────────────────────────────────────────────────────────────
 function HomePage({ goBook }) {
   return (
-    <div style={{ paddingBottom:90 }}>
-      {/* Hero */}
-      <div style={{
-        background:"linear-gradient(160deg,#fff 0%,var(--cr) 55%,var(--cr2) 100%)",
-        padding:"36px 24px 0", textAlign:"center", position:"relative", overflow:"hidden",
-      }}>
+    <div style={{paddingBottom:90}}>
+      <div style={{background:"linear-gradient(160deg,#fff 0%,var(--cr) 55%,var(--cr2) 100%)",padding:"36px 24px 0",textAlign:"center"}}>
         <NovaLogo width={180} />
-        <p style={{ color:"var(--mu)", fontSize:13.5, margin:"8px 0 4px" }}>
-          สนามเทนนิสในร่ม • ระบบปรับอากาศ • พร้อมรองรับทุกระดับ
-        </p>
+        <p style={{color:"var(--mu)",fontSize:13.5,margin:"8px 0 4px"}}>สนามเทนนิสในร่ม • ระบบปรับอากาศ • พร้อมรองรับทุกระดับ</p>
         <CourtLines />
       </div>
-
-      <div style={{ padding:"0 16px", marginTop:-2 }}>
+      <div style={{padding:"0 16px",marginTop:-2}}>
         <button className="btn-primary" onClick={goBook}>จองสนามเลย →</button>
       </div>
-
-      <div style={{ padding:"18px 16px 0", display:"flex", flexDirection:"column", gap:14 }}>
-        {/* Price */}
+      <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
         <div className="card">
           <div className="card-header"><p>💰 ราคาค่าสนาม</p></div>
-          <div style={{ display:"flex", padding:"16px 18px", gap:12 }}>
-            <PriceBlock time="06:00–12:59" price="490" label="ช่วงเช้า" color="var(--or)" />
-            <div style={{ width:1, background:"var(--dv)" }} />
-            <PriceBlock time="13:00–22:59" price="590" label="ช่วงบ่าย-เย็น" color="var(--bl)" />
+          <div style={{display:"flex",padding:"16px 18px",gap:12}}>
+            <div style={{flex:1,textAlign:"center"}}>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>ช่วงเช้า</p>
+              <p style={{fontSize:28,fontWeight:800,color:"var(--or)",lineHeight:1}}>฿490</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>06:00–12:59</p>
+            </div>
+            <div style={{width:1,background:"var(--dv)"}} />
+            <div style={{flex:1,textAlign:"center"}}>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>ช่วงบ่าย-เย็น</p>
+              <p style={{fontSize:28,fontWeight:800,color:"var(--bl)",lineHeight:1}}>฿590</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>13:00–22:59</p>
+            </div>
           </div>
         </div>
-
-        {/* Rules */}
         {[
-          { icon:"📋", title:"เงื่อนไขการจอง", items:[
-            "จองล่วงหน้าได้สูงสุด 7 วัน",
-            "ชำระเงินภายใน 5 นาทีหลังยืนยัน",
-            "1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)",
-          ]},
-          { icon:"❌", title:"นโยบายการยกเลิก", items:[
-            "ยกเลิกก่อน 24 ชม. — คืนเงินเต็มจำนวน",
-            "ยกเลิกภายใน 24 ชม. — หักค่าธรรมเนียม 50%",
-            "No-show — ไม่คืนเงิน",
-          ]},
-          { icon:"🎾", title:"กฎระเบียบสนาม", items:[
-            "แต่งกายด้วยชุดกีฬาเท่านั้น",
-            "ห้ามนำอาหารและเครื่องดื่มเข้าสนาม",
-            "กรุณาตรงต่อเวลา ไม่สามารถขยายเวลาได้",
-          ]},
-          { icon:"📞", title:"ติดต่อเรา", items:[
-            "โทร: 02-xxx-xxxx",
-            "Line: @novatenniscourt",
-            "เปิดทำการ 06:00–22:00 น. ทุกวัน",
-          ]},
-        ].map(({ icon, title, items }) => (
+          {icon:"📋",title:"เงื่อนไขการจอง",items:["จองล่วงหน้าได้สูงสุด 7 วัน","ชำระเงินภายใน 5 นาทีหลังยืนยัน","1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)"]},
+          {icon:"❌",title:"นโยบายการยกเลิก",items:["ยกเลิกก่อน 24 ชม. — คืนเงินเต็มจำนวน","ยกเลิกภายใน 24 ชม. — หักค่าธรรมเนียม 50%","No-show — ไม่คืนเงิน"]},
+          {icon:"🎾",title:"กฎระเบียบสนาม",items:["แต่งกายด้วยชุดกีฬาเท่านั้น","ห้ามนำอาหารและเครื่องดื่มเข้าสนาม","กรุณาตรงต่อเวลา ไม่สามารถขยายเวลาได้"]},
+          {icon:"📞",title:"ติดต่อเรา",items:["โทร: 063-146-5997","Map: novatennis","เปิดทำการ 06:00–22:00 น. ทุกวัน"]},
+        ].map(({icon,title,items}) => (
           <div key={title} className="card">
-            <div style={{ padding:"12px 18px", borderBottom:"1px solid var(--dv)", display:"flex", alignItems:"center", gap:8 }}>
-              <span style={{ fontSize:17 }}>{icon}</span>
-              <span style={{ fontWeight:700, color:"var(--br)", fontSize:14 }}>{title}</span>
+            <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
+              <span style={{fontSize:17}}>{icon}</span>
+              <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{title}</span>
             </div>
-            <div style={{ padding:"12px 18px", display:"flex", flexDirection:"column", gap:7 }}>
+            <div style={{padding:"12px 18px",display:"flex",flexDirection:"column",gap:7}}>
               {items.map((it,i) => (
-                <div key={i} style={{ display:"flex", gap:10, alignItems:"flex-start" }}>
-                  <span style={{ color:"var(--or)", fontSize:14, lineHeight:1.5, flexShrink:0 }}>›</span>
-                  <span style={{ fontSize:13.5, color:"var(--mu)", lineHeight:1.65 }}>{it}</span>
+                <div key={i} style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+                  <span style={{color:"var(--or)",fontSize:14,lineHeight:1.5,flexShrink:0}}>›</span>
+                  <span style={{fontSize:13.5,color:"var(--mu)",lineHeight:1.65}}>{it}</span>
                 </div>
               ))}
             </div>
@@ -205,17 +196,6 @@ function HomePage({ goBook }) {
   );
 }
 
-function PriceBlock({ time, price, label, color }) {
-  return (
-    <div style={{ flex:1, textAlign:"center" }}>
-      <p style={{ fontSize:10.5, color:"var(--mu)", marginBottom:5 }}>{label}</p>
-      <p style={{ fontSize:28, fontWeight:800, color, lineHeight:1 }}>฿{price}</p>
-      <p style={{ fontSize:10.5, color:"var(--mu)", marginTop:5 }}>{time}</p>
-    </div>
-  );
-}
-
-// ─── CALENDAR ─────────────────────────────────────────────────────────────────
 function Calendar({ selected, onSelect }) {
   const today = new Date(); today.setHours(0,0,0,0);
   const maxDate = new Date(today); maxDate.setDate(maxDate.getDate()+7);
@@ -224,53 +204,30 @@ function Calendar({ selected, onSelect }) {
   const firstDay = new Date(y, m, 1).getDay();
   const daysInMonth = new Date(y, m+1, 0).getDate();
   const selIso = toIso(selected);
-
   const cells = [];
   for (let i = 0; i < firstDay; i++) cells.push(null);
   for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(y, m, d));
-
   return (
     <div className="card">
-      <div style={{
-        display:"flex", alignItems:"center", justifyContent:"space-between",
-        padding:"12px 16px", background:"var(--br)",
-      }}>
-        <button onClick={() => setView(new Date(y, m-1, 1))} style={{
-          background:"none", border:"none", color:"rgba(255,255,255,.75)",
-          fontSize:22, cursor:"pointer", lineHeight:1, padding:"0 4px",
-        }}>‹</button>
-        <span style={{ fontWeight:700, color:"#fff", fontSize:15 }}>
-          {view.toLocaleDateString("th-TH",{ month:"long", year:"numeric" })}
-        </span>
-        <button onClick={() => setView(new Date(y, m+1, 1))} style={{
-          background:"none", border:"none", color:"rgba(255,255,255,.75)",
-          fontSize:22, cursor:"pointer", lineHeight:1, padding:"0 4px",
-        }}>›</button>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px",background:"var(--br)"}}>
+        <button onClick={() => setView(new Date(y,m-1,1))} style={{background:"none",border:"none",color:"rgba(255,255,255,.75)",fontSize:22,cursor:"pointer"}}>‹</button>
+        <span style={{fontWeight:700,color:"#fff",fontSize:15}}>{view.toLocaleDateString("th-TH",{month:"long",year:"numeric"})}</span>
+        <button onClick={() => setView(new Date(y,m+1,1))} style={{background:"none",border:"none",color:"rgba(255,255,255,.75)",fontSize:22,cursor:"pointer"}}>›</button>
       </div>
-
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", padding:"10px 10px 0", gap:2 }}>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",padding:"10px 10px 0",gap:2}}>
         {["อา","จ","อ","พ","พฤ","ศ","ส"].map(d => (
-          <div key={d} style={{ textAlign:"center", fontSize:11, color:"var(--mu)", fontWeight:600, paddingBottom:6 }}>{d}</div>
+          <div key={d} style={{textAlign:"center",fontSize:11,color:"var(--mu)",fontWeight:600,paddingBottom:6}}>{d}</div>
         ))}
       </div>
-
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", padding:"2px 10px 12px", gap:3 }}>
-        {cells.map((d, i) => {
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",padding:"2px 10px 12px",gap:3}}>
+        {cells.map((d,i) => {
           if (!d) return <div key={i} />;
           const iso = toIso(d);
           const isToday = iso === toIso(today);
           const isSel = iso === selIso;
           const disabled = d < today || d > maxDate;
           return (
-            <button key={i} disabled={disabled} onClick={() => onSelect(new Date(d))} style={{
-              aspectRatio:"1", borderRadius:8, border:"none",
-              cursor: disabled ? "default" : "pointer",
-              background: isSel ? "var(--or)" : isToday ? "var(--or-bg)" : "transparent",
-              color: disabled ? "#ccc" : isSel ? "#fff" : isToday ? "var(--or)" : "var(--tx)",
-              fontWeight: (isSel || isToday) ? 700 : 400,
-              fontSize:13, transition:"background .15s",
-              outline: (isToday && !isSel) ? "1.5px solid var(--or)" : "none",
-            }}>{d.getDate()}</button>
+            <button key={i} disabled={disabled} onClick={() => onSelect(new Date(d))} style={{aspectRatio:"1",borderRadius:8,border:"none",cursor:disabled?"default":"pointer",background:isSel?"var(--or)":isToday?"var(--or-bg)":"transparent",color:disabled?"#ccc":isSel?"#fff":isToday?"var(--or)":"var(--tx)",fontWeight:(isSel||isToday)?700:400,fontSize:13,outline:(isToday&&!isSel)?"1.5px solid var(--or)":"none"}}>{d.getDate()}</button>
           );
         })}
       </div>
@@ -278,256 +235,277 @@ function Calendar({ selected, onSelect }) {
   );
 }
 
-// ─── BOOKING PAGE ─────────────────────────────────────────────────────────────
 function BookingPage({ onProceed }) {
   const [date, setDate] = useState(null);
   const [court, setCourt] = useState(null);
   const [slot, setSlot] = useState(null);
+  const [bookedHours, setBookedHours] = useState([]);
+  const [loading, setLoading] = useState(false);
   const ready = date && court && slot;
 
+  useEffect(() => {
+    if (!date || !court) return;
+    setLoading(true);
+    db.getBookings(toIso(date), court.courtId).then(data => {
+      setBookedHours((data||[]).map(b => b.hour));
+      setLoading(false);
+    });
+  }, [date, court]);
+
+  const availableSlots = TIME_SLOTS.filter(ts => !bookedHours.includes(ts.hour));
+
   return (
-    <div style={{ padding:"20px 16px 100px", display:"flex", flexDirection:"column", gap:22 }} className="fu">
-      {/* Step 1 */}
+    <div style={{padding:"20px 16px 100px",display:"flex",flexDirection:"column",gap:22}} className="fu">
       <section>
         <StepHead n="1" label="เลือกวันที่" />
         <Calendar selected={date} onSelect={d => { setDate(d); setSlot(null); }} />
         {date && (
-          <div style={{
-            marginTop:10, background:"var(--or-bg)", borderRadius:10,
-            padding:"9px 14px", border:"1px solid rgba(244,126,31,.2)",
-          }}>
-            <p style={{ fontSize:13, color:"var(--br)", fontWeight:600 }}>📅 {fmtDate(date)}</p>
+          <div style={{marginTop:10,background:"var(--or-bg)",borderRadius:10,padding:"9px 14px",border:"1px solid rgba(244,126,31,.2)"}}>
+            <p style={{fontSize:13,color:"var(--br)",fontWeight:600}}>📅 {fmtDate(date)}</p>
           </div>
         )}
       </section>
-
-      {/* Step 2 */}
       <section>
         <StepHead n="2" label="เลือกสนาม" />
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
           {COURTS.map(c => {
             const sel = court?.courtId === c.courtId;
             return (
-              <button key={c.courtId} onClick={() => { setCourt(c); setSlot(null); }} style={{
-                padding:"20px 12px 16px", borderRadius:"var(--r)",
-                border:`2px solid ${sel ? "var(--or)" : "var(--dv)"}`,
-                background: sel ? "var(--or-bg)" : "#fff",
-                cursor:"pointer", textAlign:"center",
-                boxShadow: sel ? "0 2px 12px rgba(244,126,31,.18)" : "var(--sh)",
-                transition:"all .2s",
-              }}>
-                <div style={{ fontSize:30, marginBottom:7 }}>🎾</div>
-                <p style={{ fontWeight:700, color: sel ? "var(--or)" : "var(--br)", fontSize:15 }}>{c.courtName}</p>
-                <p style={{ fontSize:11, color:"var(--mu)", marginTop:4 }}>{c.desc}</p>
+              <button key={c.courtId} onClick={() => { setCourt(c); setSlot(null); }} style={{padding:"20px 12px 16px",borderRadius:"var(--r)",border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:sel?"var(--or-bg)":"#fff",cursor:"pointer",textAlign:"center",boxShadow:sel?"0 2px 12px rgba(244,126,31,.18)":"var(--sh)"}}>
+                <div style={{fontSize:30,marginBottom:7}}>🎾</div>
+                <p style={{fontWeight:700,color:sel?"var(--or)":"var(--br)",fontSize:15}}>{c.courtName}</p>
+                <p style={{fontSize:11,color:"var(--mu)",marginTop:4}}>{c.desc}</p>
               </button>
             );
           })}
         </div>
       </section>
-
-      {/* Step 3 */}
       <section>
         <StepHead n="3" label="เลือกช่วงเวลา" />
-        <div style={{ display:"flex", gap:14, marginBottom:12, flexWrap:"wrap" }}>
-          <Dot color="var(--or)" label="490 ฿ · ช่วงเช้า (06–12)" />
-          <Dot color="var(--bl)" label="590 ฿ · ช่วงบ่าย (13–22)" />
-          <Dot color="#ddd" label="จองแล้ว" />
-        </div>
-
-        {(!date || !court) ? (
-          <div style={{ background:"#fff", borderRadius:"var(--r)", padding:"22px", textAlign:"center", border:"1px solid var(--dv)" }}>
-            <p style={{ color:"var(--mu)", fontSize:14 }}>กรุณาเลือกวันที่และสนามก่อน</p>
+        {(!date||!court) ? (
+          <div style={{background:"#fff",borderRadius:"var(--r)",padding:"22px",textAlign:"center",border:"1px solid var(--dv)"}}>
+            <p style={{color:"var(--mu)",fontSize:14}}>กรุณาเลือกวันที่และสนามก่อน</p>
+          </div>
+        ) : loading ? (
+          <div style={{background:"#fff",borderRadius:"var(--r)",padding:"22px",textAlign:"center",border:"1px solid var(--dv)"}}>
+            <p style={{color:"var(--mu)",fontSize:14}}>⏳ กำลังโหลด...</p>
+          </div>
+        ) : availableSlots.length === 0 ? (
+          <div style={{background:"#fff",borderRadius:"var(--r)",padding:"22px",textAlign:"center",border:"1px solid var(--dv)"}}>
+            <p style={{color:"var(--mu)",fontSize:14}}>😔 ไม่มีช่วงเวลาว่างในวันนี้</p>
           </div>
         ) : (
-          <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-            {TIME_SLOTS.map(ts => {
-              const booked = checkBooked(date, court.courtId, ts.hour);
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            <div style={{display:"flex",gap:14,marginBottom:8,flexWrap:"wrap"}}>
+              <Dot color="var(--or)" label="490 ฿ · ช่วงเช้า" />
+              <Dot color="var(--bl)" label="590 ฿ · ช่วงบ่าย" />
+            </div>
+            {availableSlots.map(ts => {
               const isSel = slot?.hour === ts.hour;
               return (
-                <button key={ts.hour} disabled={booked} onClick={() => setSlot(ts)} style={{
-                  display:"flex", justifyContent:"space-between", alignItems:"center",
-                  padding:"13px 16px", borderRadius:10,
-                  border:`1.5px solid ${isSel ? "var(--or)" : booked ? "transparent" : "var(--dv)"}`,
-                  background: isSel ? "var(--or-bg)" : booked ? "rgba(0,0,0,.03)" : "#fff",
-                  cursor: booked ? "not-allowed" : "pointer",
-                  opacity: booked ? .5 : 1,
-                  boxShadow: isSel ? "0 2px 10px rgba(244,126,31,.15)" : "none",
-                  transition:"all .15s",
-                }}>
-                  <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                    <div style={{
-                      width:8, height:8, borderRadius:"50%", flexShrink:0,
-                      background: booked ? "#ccc" : ts.peak ? "var(--bl)" : "var(--or)",
-                    }} />
-                    <span style={{
-                      fontSize:14, color: booked ? "var(--mu)" : "var(--tx)",
-                      textDecoration: booked ? "line-through" : "none",
-                    }}>{ts.label}</span>
+                <button key={ts.hour} onClick={() => setSlot(ts)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"13px 16px",borderRadius:10,border:`1.5px solid ${isSel?"var(--or)":"var(--dv)"}`,background:isSel?"var(--or-bg)":"#fff",cursor:"pointer",boxShadow:isSel?"0 2px 10px rgba(244,126,31,.15)":"none"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <div style={{width:8,height:8,borderRadius:"50%",background:ts.peak?"var(--bl)":"var(--or)"}} />
+                    <span style={{fontSize:14}}>{ts.label}</span>
                   </div>
-                  <span style={{
-                    fontSize:14, fontWeight:700,
-                    color: booked ? "var(--mu)" : ts.peak ? "var(--bl)" : "var(--or)",
-                  }}>{booked ? "เต็ม" : `฿${ts.price.toLocaleString()}`}</span>
+                  <span style={{fontSize:14,fontWeight:700,color:ts.peak?"var(--bl)":"var(--or)"}}>฿{ts.price.toLocaleString()}</span>
                 </button>
               );
             })}
           </div>
         )}
       </section>
-
-      <button className="btn-primary" disabled={!ready} onClick={() => onProceed({ date, court, slot })}>
+      <button className="btn-primary" disabled={!ready} onClick={() => onProceed({date,court,slot})}>
         ดำเนินการต่อ →
       </button>
     </div>
   );
 }
 
-// ─── CHECKOUT PAGE ────────────────────────────────────────────────────────────
 function CheckoutPage({ booking, onCancel, onConfirm }) {
   const { date, court, slot } = booking;
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
+  const [discountCode, setDiscountCode] = useState("");
+  const [discount, setDiscount] = useState(null);
+  const [discountMsg, setDiscountMsg] = useState("");
+  const [checkingCode, setCheckingCode] = useState(false);
   const nameOk = name.trim().length >= 1 && name.length <= 16;
   const phoneOk = /^[0-9]{9,10}$/.test(phone);
   const ok = nameOk && phoneOk;
 
-  return (
-    <div style={{ padding:"20px 16px 100px" }} className="fu">
-      <h2 className="bb" style={{ fontSize:28, color:"var(--br)", marginBottom:20 }}>ยืนยันการจอง</h2>
+  const calcDiscount = (d) => {
+    if (!d) return 0;
+    if (d.discount_amount > 0) return d.discount_amount;
+    return Math.round(slot.price * d.discount_percent / 100);
+  };
+  const discountAmount = calcDiscount(discount);
+  const finalPrice = Math.max(0, slot.price - discountAmount);
 
-      <div className="card" style={{ marginBottom:20 }}>
+  const handleCheckCode = async () => {
+    if (!discountCode.trim()) return;
+    setCheckingCode(true);
+    setDiscountMsg("");
+    const result = await db.checkDiscount(discountCode.trim());
+    if (result) {
+      setDiscount(result);
+      const saved = result.discount_amount > 0 ? result.discount_amount : Math.round(slot.price * result.discount_percent / 100);
+      const label = result.discount_amount > 0 ? `ส่วนลด ฿${result.discount_amount}` : `ส่วนลด ${result.discount_percent}%`;
+      setDiscountMsg(`✅ ${label} — ประหยัด ฿${saved}`);
+    } else {
+      setDiscount(null);
+      setDiscountMsg("❌ รหัสส่วนลดไม่ถูกต้องหรือหมดอายุแล้ว");
+    }
+    setCheckingCode(false);
+  };
+
+  return (
+    <div style={{padding:"20px 16px 100px"}} className="fu">
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:20}}>ยืนยันการจอง</h2>
+      <div className="card" style={{marginBottom:20}}>
         <div className="card-header"><p>สรุปรายการจอง</p></div>
         <div className="card-body">
           <Row label="🎾 สนาม" val={court.courtName} />
           <Row label="📅 วันที่" val={fmtDate(date)} />
           <Row label="🕐 เวลา" val={slot.label} />
-          <div style={{ borderTop:"1px solid var(--dv)", margin:"12px 0" }} />
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-            <span style={{ fontWeight:700, color:"var(--br)", fontSize:15 }}>ยอดชำระ</span>
-            <span style={{ fontSize:30, fontWeight:800, color:"var(--or)" }}>฿{slot.price.toLocaleString()}</span>
+          {discount && <Row label="🏷 ส่วนลด" val={`-฿${discountAmount.toLocaleString()}`} />}
+          <div style={{borderTop:"1px solid var(--dv)",margin:"12px 0"}} />
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span style={{fontWeight:700,color:"var(--br)",fontSize:15}}>ยอดชำระ</span>
+            <div style={{textAlign:"right"}}>
+              {discount && <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿{slot.price.toLocaleString()}</p>}
+              <span style={{fontSize:30,fontWeight:800,color:"var(--or)"}}>฿{finalPrice.toLocaleString()}</span>
+            </div>
           </div>
         </div>
       </div>
 
-      <div style={{ display:"flex", flexDirection:"column", gap:15, marginBottom:26 }}>
-        <Field label="ชื่อ-นามสกุล" hint={`${name.length}/16`} err={name.length > 0 && !nameOk}>
-          <input
-            value={name} onChange={e => setName(e.target.value)} maxLength={16}
-            placeholder="กรอกชื่อของท่าน"
-            style={inp(name.length > 0 && !nameOk)}
-          />
-        </Field>
-        <Field label="เบอร์โทรศัพท์" hint="ใช้เป็น Customer ID" err={phone.length > 0 && !phoneOk}>
-          <input
-            value={phone}
-            onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))}
-            placeholder="0812345678" inputMode="numeric"
-            style={inp(phone.length > 0 && !phoneOk)}
-          />
-        </Field>
+      <div style={{display:"flex",flexDirection:"column",gap:15,marginBottom:26}}>
+        <div>
+          <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>ชื่อ-นามสกุล (ไม่เกิน 16 ตัว)</label>
+          <input value={name} onChange={e => setName(e.target.value)} maxLength={16} placeholder="กรอกชื่อของท่าน"
+            style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:`1.5px solid ${name&&!nameOk?"#c0392b":"var(--dv)"}`,color:"var(--tx)",outline:"none"}} />
+          <p style={{fontSize:11,color:"var(--mu)",marginTop:5,textAlign:"right"}}>{name.length}/16</p>
+        </div>
+        <div>
+          <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>เบอร์โทรศัพท์</label>
+          <input value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))} placeholder="0812345678" inputMode="numeric"
+            style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:`1.5px solid ${phone&&!phoneOk?"#c0392b":"var(--dv)"}`,color:"var(--tx)",outline:"none"}} />
+        </div>
+        <div>
+          <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>🏷 รหัสส่วนลด (ถ้ามี)</label>
+          <div style={{display:"flex",gap:8}}>
+            <input value={discountCode} onChange={e => setDiscountCode(e.target.value.toUpperCase())} placeholder="เช่น NOVA10"
+              style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
+            <button onClick={handleCheckCode} disabled={checkingCode || !discountCode.trim()} style={{padding:"0 16px",borderRadius:10,border:"none",background:"var(--br)",color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer",whiteSpace:"nowrap",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+              {checkingCode ? "..." : "ใช้โค้ด"}
+            </button>
+          </div>
+          {discountMsg && <p style={{fontSize:12,marginTop:6,color:discount?"#2d7a4f":"#c0392b"}}>{discountMsg}</p>}
+        </div>
       </div>
 
-      <div style={{ display:"flex", gap:12 }}>
-        <button onClick={onCancel} style={{
-          flex:1, padding:"14px", borderRadius:"var(--r)",
-          border:"1.5px solid var(--dv)", background:"#fff",
-          color:"var(--mu)", fontSize:15, cursor:"pointer",
-        }}>ยกเลิก</button>
-        <button disabled={!ok} onClick={() => onConfirm({ name:name.trim(), phone })} style={{
-          flex:2, padding:"14px", borderRadius:"var(--r)", border:"none",
-          background: ok ? "linear-gradient(90deg,var(--or),var(--or2))" : "var(--cr2)",
-          color: ok ? "#fff" : "var(--mu)", fontWeight:700, fontSize:15,
-          cursor: ok ? "pointer" : "not-allowed",
-          boxShadow: ok ? "0 4px 18px rgba(244,126,31,.28)" : "none",
-        }}>ยืนยัน ✓</button>
+      <div style={{display:"flex",gap:12}}>
+        <button onClick={onCancel} style={{flex:1,padding:"14px",borderRadius:"var(--r)",border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:15,cursor:"pointer"}}>ยกเลิก</button>
+        <button disabled={!ok} onClick={() => onConfirm({name:name.trim(),phone,discount,finalPrice,discountAmount})} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:ok?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:ok?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:ok?"pointer":"not-allowed"}}>ยืนยัน ✓</button>
       </div>
     </div>
   );
 }
 
-const inp = (err) => ({
-  width:"100%", padding:"13px 14px", borderRadius:10, fontSize:15,
-  background:"#fff", border:`1.5px solid ${err ? "#c0392b" : "var(--dv)"}`,
-  color:"var(--tx)", outline:"none",
-});
-
-function Field({ label, hint, err, children }) {
-  return (
-    <div>
-      <label style={{ fontSize:13, fontWeight:600, color:"var(--br)", marginBottom:7, display:"block" }}>{label}</label>
-      {children}
-      <p style={{ fontSize:11, color: err ? "#c0392b" : "var(--mu)", marginTop:5, textAlign:"right" }}>{hint}</p>
-    </div>
-  );
-}
-
-// ─── PAYMENT PAGE ─────────────────────────────────────────────────────────────
 function PaymentPage({ booking, customer, onDone }) {
   const { date, court, slot } = booking;
+  const { finalPrice, discountAmount, discount } = customer;
   const [secs, setSecs] = useState(300);
-  const expired = secs <= 0;
-  const urgent = secs <= 60 && !expired;
+  const [expired, setExpired] = useState(false);
+  const [slip, setSlip] = useState(null);
+  const [slipPreview, setSlipPreview] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploaded, setUploaded] = useState(false);
+  const [bookingId, setBookingId] = useState(null);
+  const fileRef = useRef();
+  const savedRef = useRef(false);
 
   useEffect(() => {
-    if (expired) return;
-    const t = setTimeout(() => setSecs(s => s - 1), 1000);
+    const save = async () => {
+      if (savedRef.current) return;
+      savedRef.current = true;
+      await db.upsertCustomer(customer.phone, customer.name);
+      const b = await db.addBooking({
+        court_id: court.courtId,
+        customer_id: customer.phone,
+        booking_date: toIso(date),
+        hour: slot.hour,
+        price: finalPrice,
+        discount_code: discount?.code || null,
+        discount_amount: discountAmount || 0,
+        status: "pending",
+      });
+      if (b) {
+        setBookingId(b.id);
+        if (discount) await db.useDiscount(discount.id, discount.used_count);
+      }
+    };
+    save();
+  }, []);
+
+  useEffect(() => {
+    if (secs <= 0) { setExpired(true); return; }
+    const t = setTimeout(() => setSecs(s => s-1), 1000);
     return () => clearTimeout(t);
-  }, [secs, expired]);
+  }, [secs]);
 
   const mm = String(Math.floor(Math.max(secs,0)/60)).padStart(2,"0");
   const ss = String(Math.max(secs,0)%60).padStart(2,"0");
   const pct = (Math.max(secs,0)/300)*100;
+  const urgent = secs <= 60 && !expired;
+
+  const handleSlipChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setSlip(file);
+    setSlipPreview(URL.createObjectURL(file));
+  };
+
+  const handleUpload = async () => {
+    if (!slip || !bookingId) return;
+    setUploading(true);
+    const url = await db.uploadSlip(slip, bookingId);
+    if (url) {
+      await db.updateSlip(bookingId, url);
+      setUploaded(true);
+    }
+    setUploading(false);
+  };
 
   return (
-    <div style={{ padding:"20px 16px 90px" }} className="fu">
-      <h2 className="bb" style={{ fontSize:28, color:"var(--br)", marginBottom:18 }}>ชำระเงิน</h2>
+    <div style={{padding:"20px 16px 90px"}} className="fu">
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:18}}>ชำระเงิน</h2>
 
       {/* Countdown */}
-      <div style={{
-        background:"#fff", borderRadius:"var(--r)", marginBottom:16,
-        border:`1.5px solid ${expired ? "#c0392b" : urgent ? "#e67e22" : "var(--dv)"}`,
-        padding:"16px 20px", textAlign:"center", boxShadow:"var(--sh)",
-      }}>
-        <p style={{ fontSize:12, color:"var(--mu)", marginBottom:3 }}>
-          {expired ? "หมดเวลา" : "กรุณาชำระภายใน"}
-        </p>
-        <p className="bb" style={{
-          fontSize:54, lineHeight:1,
-          color: expired ? "#c0392b" : urgent ? "#e67e22" : "var(--br)",
-        }}>{mm}:{ss}</p>
-        <div style={{ height:4, background:"var(--cr2)", borderRadius:4, marginTop:12, overflow:"hidden" }}>
-          <div style={{
-            height:"100%", borderRadius:4, transition:"width 1s linear",
-            width:`${pct}%`,
-            background: expired ? "#c0392b" : urgent ? "#e67e22" : "var(--or)",
-          }} />
+      <div style={{background:"#fff",borderRadius:"var(--r)",marginBottom:16,border:`1.5px solid ${expired?"#c0392b":urgent?"#e67e22":"var(--dv)"}`,padding:"16px 20px",textAlign:"center",boxShadow:"var(--sh)"}}>
+        <p style={{fontSize:12,color:"var(--mu)",marginBottom:3}}>{expired?"หมดเวลา":"กรุณาชำระภายใน"}</p>
+        <p className="bb" style={{fontSize:54,lineHeight:1,color:expired?"#c0392b":urgent?"#e67e22":"var(--br)"}}>{mm}:{ss}</p>
+        <div style={{height:4,background:"var(--cr2)",borderRadius:4,marginTop:12,overflow:"hidden"}}>
+          <div style={{height:"100%",borderRadius:4,width:`${pct}%`,background:expired?"#c0392b":urgent?"#e67e22":"var(--or)",transition:"width 1s linear"}} />
         </div>
-        {expired && <p style={{ color:"#c0392b", fontSize:13, marginTop:8, fontWeight:600 }}>⚠️ หมดเวลา — กรุณาเริ่มต้นใหม่</p>}
       </div>
 
       {/* QR */}
-      <div style={{
-        background:"#fff", borderRadius:"var(--r)", padding:"20px",
-        textAlign:"center", boxShadow:"0 4px 24px rgba(102,57,36,.12)",
-        marginBottom:16, border:"1px solid var(--dv)",
-      }}>
-        <p style={{ fontSize:13, color:"var(--mu)", marginBottom:12 }}>สแกน QR Code ชำระผ่าน PromptPay</p>
-        <img
-          src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&color=663924&bgcolor=F9E8D4&data=PromptPay0812345678`}
-          alt="QR PromptPay"
-          style={{ width:200, height:200, borderRadius:10 }}
-        />
-        <div style={{
-          marginTop:14, display:"inline-flex", alignItems:"center", gap:8,
-          background:"var(--or-bg)", borderRadius:20, padding:"8px 18px",
-        }}>
-          <span style={{ fontSize:24, fontWeight:800, color:"var(--or)" }}>฿{slot.price.toLocaleString()}</span>
-          <span style={{ fontSize:12, color:"var(--mu)" }}>โอนให้ถูกต้อง</span>
+      <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",boxShadow:"0 4px 24px rgba(102,57,36,.12)",marginBottom:16,border:"1px solid var(--dv)"}}>
+        <p style={{fontSize:13,color:"var(--mu)",marginBottom:12}}>สแกน QR Code ชำระผ่าน PromptPay</p>
+        <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&color=663924&bgcolor=F9E8D4&data=PromptPay0812345678" alt="QR" style={{width:200,height:200,borderRadius:10}} />
+        <div style={{marginTop:14,display:"inline-flex",alignItems:"center",gap:8,background:"var(--or-bg)",borderRadius:20,padding:"8px 18px"}}>
+          <span style={{fontSize:24,fontWeight:800,color:"var(--or)"}}>฿{finalPrice.toLocaleString()}</span>
+          <span style={{fontSize:12,color:"var(--mu)"}}>โอนให้ถูกต้อง</span>
         </div>
+        {discountAmount > 0 && (
+          <p style={{fontSize:12,color:"#2d7a4f",marginTop:8}}>🏷 ประหยัดไป ฿{discountAmount.toLocaleString()}</p>
+        )}
       </div>
 
       {/* Booking detail */}
-      <div className="card" style={{ marginBottom:16 }}>
+      <div className="card" style={{marginBottom:16}}>
         <div className="card-header"><p>รายละเอียดการจอง</p></div>
         <div className="card-body">
           <Row label="👤 ชื่อ" val={customer.name} />
@@ -538,124 +516,511 @@ function PaymentPage({ booking, customer, onDone }) {
         </div>
       </div>
 
-      {/* Steps */}
-      <div className="card" style={{ marginBottom:24 }}>
-        <div style={{ padding:"11px 18px", borderBottom:"1px solid var(--dv)", background:"var(--bl-bg)" }}>
-          <p style={{ fontWeight:700, color:"var(--br)", fontSize:14 }}>ขั้นตอนการชำระเงิน</p>
+      {/* Upload slip */}
+      <div className="card" style={{marginBottom:16}}>
+        <div className="card-header"><p>📎 แนบสลิปการโอนเงิน</p></div>
+        <div className="card-body">
+          {uploaded ? (
+            <div style={{textAlign:"center",padding:"10px 0"}}>
+              <p style={{color:"#2d7a4f",fontWeight:700,fontSize:15}}>✅ ส่งสลิปเรียบร้อยแล้ว</p>
+              <p style={{color:"var(--mu)",fontSize:13,marginTop:4}}>ทีมงานจะตรวจสอบและยืนยันการจองของท่าน</p>
+            </div>
+          ) : (
+            <>
+              {slipPreview && (
+                <img src={slipPreview} alt="slip" style={{width:"100%",borderRadius:10,marginBottom:12,maxHeight:200,objectFit:"cover"}} />
+              )}
+              <input ref={fileRef} type="file" accept="image/*" onChange={handleSlipChange} style={{display:"none"}} />
+              <button onClick={() => fileRef.current.click()} style={{width:"100%",padding:"12px",borderRadius:10,border:"1.5px dashed var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:600,fontSize:14,cursor:"pointer",marginBottom:slip?10:0,fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {slip ? "🔄 เปลี่ยนรูปสลิป" : "📷 เลือกรูปสลิป"}
+              </button>
+              {slip && (
+                <button onClick={handleUpload} disabled={uploading} style={{width:"100%",padding:"12px",borderRadius:10,border:"none",background:uploading?"var(--cr2)":"var(--br)",color:uploading?"var(--mu)":"var(--or)",fontWeight:700,fontSize:14,cursor:uploading?"not-allowed":"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                  {uploading ? "⏳ กำลังส่ง..." : "✅ ส่งสลิป"}
+                </button>
+              )}
+            </>
+          )}
         </div>
-        <div style={{ padding:"14px 18px", display:"flex", flexDirection:"column", gap:12 }}>
-          {[
-            "บันทึกด้วยการถ่ายภาพหน้าจอ",
-            "เปิดแอปธนาคารที่พร้อมชำระเงินของคุณ",
-            "เลือกตัวเลือกเพื่อสแกนรหัส QR",
-            "ส่งไฟล์รหัส QR ที่คุณบันทึกไว้ก่อนหน้านี้",
-            "ทำธุรกรรมให้เสร็จสิ้น",
-          ].map((s, i) => (
-            <div key={i} style={{ display:"flex", gap:12, alignItems:"flex-start" }}>
-              <div style={{
-                width:24, height:24, borderRadius:"50%", flexShrink:0,
-                background:"var(--br)", color:"var(--or)",
-                display:"flex", alignItems:"center", justifyContent:"center",
-                fontSize:11, fontWeight:800, marginTop:1,
-              }}>{i+1}</div>
-              <p style={{ fontSize:13.5, color:"var(--mu)", lineHeight:1.65 }}>{s}</p>
+      </div>
+
+      {/* Steps */}
+      <div className="card" style={{marginBottom:24}}>
+        <div style={{padding:"11px 18px",borderBottom:"1px solid var(--dv)",background:"var(--bl-bg)"}}>
+          <p style={{fontWeight:700,color:"var(--br)",fontSize:14}}>ขั้นตอนการชำระเงิน</p>
+        </div>
+        <div style={{padding:"14px 18px",display:"flex",flexDirection:"column",gap:12}}>
+          {["โอนเงินผ่าน QR Code ด้านบน","ถ่ายภาพสลิปการโอนเงิน","กด 'เลือกรูปสลิป' แล้วอัพโหลดสลิป","กด 'ส่งสลิป' เพื่อยืนยัน","รอทีมงานตรวจสอบและยืนยันการจอง"].map((s,i) => (
+            <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+              <div style={{width:24,height:24,borderRadius:"50%",flexShrink:0,background:"var(--br)",color:"var(--or)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800,marginTop:1}}>{i+1}</div>
+              <p style={{fontSize:13.5,color:"var(--mu)",lineHeight:1.65}}>{s}</p>
             </div>
           ))}
         </div>
       </div>
 
-      <button className="btn-primary" onClick={() => {
-        lockSlot(date, court.courtId, slot.hour, customer);
-        onDone();
-      }}>ชำระเงินแล้ว / กลับหน้าหลัก</button>
+      <button className="btn-primary" onClick={onDone}>กลับหน้าหลัก</button>
     </div>
   );
 }
 
-// ─── Shared micro-components ──────────────────────────────────────────────────
 function StepHead({ n, label }) {
   return (
-    <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:13 }}>
-      <div style={{
-        width:28, height:28, borderRadius:"50%",
-        background:"var(--br)", color:"var(--or)",
-        display:"flex", alignItems:"center", justifyContent:"center",
-        fontSize:13, fontWeight:800, flexShrink:0,
-      }}>{n}</div>
-      <span style={{ fontWeight:700, fontSize:16, color:"var(--br)" }}>{label}</span>
+    <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:13}}>
+      <div style={{width:28,height:28,borderRadius:"50%",background:"var(--br)",color:"var(--or)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:800}}>{n}</div>
+      <span style={{fontWeight:700,fontSize:16,color:"var(--br)"}}>{label}</span>
     </div>
   );
 }
 
 function Row({ label, val }) {
   return (
-    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:9, gap:12 }}>
-      <span style={{ color:"var(--mu)", fontSize:13, flexShrink:0 }}>{label}</span>
-      <span style={{ fontWeight:600, fontSize:13, color:"var(--tx)", textAlign:"right" }}>{val}</span>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:9,gap:12}}>
+      <span style={{color:"var(--mu)",fontSize:13,flexShrink:0}}>{label}</span>
+      <span style={{fontWeight:600,fontSize:13,color:"var(--tx)",textAlign:"right"}}>{val}</span>
     </div>
   );
 }
 
 function Dot({ color, label }) {
   return (
-    <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-      <div style={{ width:9, height:9, borderRadius:"50%", background:color, flexShrink:0 }} />
-      <span style={{ fontSize:12, color:"var(--mu)" }}>{label}</span>
+    <div style={{display:"flex",alignItems:"center",gap:6}}>
+      <div style={{width:9,height:9,borderRadius:"50%",background:color,flexShrink:0}} />
+      <span style={{fontSize:12,color:"var(--mu)"}}>{label}</span>
     </div>
   );
 }
 
-// ─── APP ROOT ──────────────────────────────────────────────────────────────────
-export default function App() {
+function App() {
   const [tab, setTab] = useState("home");
   const [page, setPage] = useState("booking");
   const [booking, setBooking] = useState(null);
   const [customer, setCustomer] = useState(null);
-
-  const goTab = (id) => { setTab(id); if (id === "book") setPage("booking"); };
+  const goTab = (id) => { setTab(id); if(id==="book") setPage("booking"); };
 
   return (
     <>
       <style>{CSS}</style>
-      <div style={{ maxWidth:480, margin:"0 auto", minHeight:"100dvh", background:"var(--cr)" }}>
-        {/* Header */}
-        <header style={{
-          position:"sticky", top:0, zIndex:100,
-          backgroundColor:"rgba(249,232,212,0.93)",
-          backdropFilter:"blur(10px)",
-          borderBottom:"1px solid var(--dv)",
-          padding:"8px 20px",
-        }}>
+      <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)"}}>
+        <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px"}}>
           <NovaLogo width={100} />
         </header>
-
         <main>
-          {tab === "home" && (
-            <HomePage goBook={() => goTab("book")} />
+          {tab==="home" && <HomePage goBook={() => goTab("book")} />}
+          {tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} />}
+          {tab==="book" && page==="checkout" && booking && (
+            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} />
           )}
-          {tab === "book" && page === "booking" && (
-            <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} />
-          )}
-          {tab === "book" && page === "checkout" && booking && (
-            <CheckoutPage
-              booking={booking}
-              onCancel={() => setPage("booking")}
-              onConfirm={c => { setCustomer(c); setPage("payment"); }}
-            />
-          )}
-          {tab === "book" && page === "payment" && booking && customer && (
-            <PaymentPage
-              booking={booking}
-              customer={customer}
-              onDone={() => {
-                setBooking(null); setCustomer(null);
-                setPage("booking"); goTab("home");
-              }}
-            />
+          {tab==="book" && page==="payment" && booking && customer && (
+            <PaymentPage booking={booking} customer={customer} onDone={() => { setBooking(null); setCustomer(null); setPage("booking"); goTab("home"); }} />
           )}
         </main>
-
         <TabBar tab={tab} setTab={goTab} />
+      </div>
+    </>
+  );
+}
+
+// ─── Cancel / Check Booking Page ─────────────────────────────────────────────
+function CancelPage() {
+  const [phone, setPhone] = useState("");
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [searched, setSearched] = useState(false);
+  const [cancelling, setCancelling] = useState(null);
+  const [msg, setMsg] = useState("");
+
+  const handleSearch = async () => {
+    if (!/^[0-9]{9,10}$/.test(phone)) return;
+    setLoading(true); setSearched(false); setMsg(""); setBookings([]);
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/bookings?customer_id=eq.${phone}&select=*&order=booking_date.desc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const data = await res.json();
+    setBookings(data || []);
+    setLoading(false); setSearched(true);
+  };
+
+  const handleCancel = async (b) => {
+    const bookingDate = new Date(b.booking_date + "T" + String(b.hour).padStart(2,"0") + ":00:00");
+    const now = new Date();
+    const diffHours = (bookingDate - now) / (1000 * 60 * 60);
+    if (diffHours < 0) { setMsg("❌ ไม่สามารถยกเลิกได้ เนื่องจากเลยเวลาแล้ว"); return; }
+    if (diffHours < 24) { setMsg("❌ ไม่สามารถยกเลิกได้ เนื่องจากเหลือเวลาน้อยกว่า 24 ชั่วโมง"); return; }
+    const confirmed = window.confirm("ยืนยันการยกเลิก?\nคุณจะได้รับเงินคืนเต็มจำนวน");
+    if (!confirmed) return;
+    setCancelling(b.id);
+    await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${b.id}`, {
+      method: "PATCH",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "cancelled" }),
+    });
+    setBookings(prev => prev.map(x => x.id === b.id ? { ...x, status: "cancelled" } : x));
+    setCancelling(null);
+    setMsg("✅ ยกเลิกการจองเรียบร้อยแล้ว");
+  };
+
+  const statusLabel = (s) => {
+    if (s === "cancelled") return { text: "ยกเลิกแล้ว", color: "#c0392b" };
+    if (s === "reviewing") return { text: "รอตรวจสอบสลิป", color: "#e67e22" };
+    if (s === "confirmed") return { text: "ยืนยันแล้ว", color: "#2d7a4f" };
+    return { text: "รอชำระเงิน", color: "var(--mu)" };
+  };
+
+  return (
+    <div style={{padding:"20px 16px 100px"}} className="fu">
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:20}}>การจองของฉัน</h2>
+      <div style={{display:"flex",gap:8,marginBottom:20}}>
+        <input value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))}
+          placeholder="กรอกเบอร์โทรของคุณ" inputMode="numeric"
+          style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
+        <button onClick={handleSearch} disabled={loading || phone.length < 9} style={{padding:"0 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
+          {loading ? "..." : "ค้นหา"}
+        </button>
+      </div>
+
+      {msg && (
+        <div style={{background:msg.startsWith("✅")?"rgba(45,122,79,.1)":"rgba(192,57,43,.1)",borderRadius:10,padding:"10px 14px",marginBottom:16,border:`1px solid ${msg.startsWith("✅")?"#2d7a4f":"#c0392b"}`}}>
+          <p style={{fontSize:13,color:msg.startsWith("✅")?"#2d7a4f":"#c0392b",fontWeight:600}}>{msg}</p>
+        </div>
+      )}
+
+      {searched && bookings.length === 0 && (
+        <div style={{background:"#fff",borderRadius:"var(--r)",padding:"24px",textAlign:"center",border:"1px solid var(--dv)"}}>
+          <p style={{color:"var(--mu)"}}>ไม่พบการจองสำหรับเบอร์นี้</p>
+        </div>
+      )}
+
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {bookings.map(b => {
+          const st = statusLabel(b.status);
+          const bookingDate = new Date(b.booking_date + "T" + String(b.hour).padStart(2,"0") + ":00:00");
+          const isPast = bookingDate < new Date();
+          const diffHours = (bookingDate - new Date()) / (1000 * 60 * 60);
+          const canCancel = b.status !== "cancelled" && !isPast && diffHours >= 24;
+          return (
+            <div key={b.id} className="card">
+              <div style={{padding:"14px 16px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                  <span style={{fontWeight:700,color:"var(--br)",fontSize:15}}>Court {b.court_id}</span>
+                  <span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 10px",borderRadius:20}}>{st.text}</span>
+                </div>
+                <Row label="📅 วันที่" val={new Date(b.booking_date).toLocaleDateString("th-TH",{year:"numeric",month:"long",day:"numeric"})} />
+                <Row label="🕐 เวลา" val={`${String(b.hour).padStart(2,"0")}:00 – ${String(b.hour).padStart(2,"0")}:59`} />
+                <Row label="💰 ราคา" val={`฿${b.price?.toLocaleString()}`} />
+                {canCancel && (
+                  <button onClick={() => handleCancel(b)} disabled={cancelling===b.id} style={{width:"100%",marginTop:10,padding:"11px",borderRadius:10,border:"1.5px solid #c0392b",background:"rgba(192,57,43,.08)",color:"#c0392b",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                    {cancelling===b.id ? "⏳ กำลังยกเลิก..." : "❌ ยกเลิกการจอง"}
+                  </button>
+                )}
+                {b.status !== "cancelled" && !isPast && diffHours < 24 && diffHours >= 0 && (
+                  <div style={{marginTop:10,padding:"9px 12px",borderRadius:10,background:"rgba(230,126,34,.1)",border:"1px solid #e67e22"}}>
+                    <p style={{fontSize:12,color:"#e67e22",fontWeight:600}}>⚠️ ไม่สามารถยกเลิกได้ เนื่องจากเหลือเวลาน้อยกว่า 24 ชั่วโมง</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ─── App V2 with Cancel Tab + Admin ──────────────────────────────────────────
+export default function AppV2() {
+  const [tab, setTab] = useState("home");
+  const [page, setPage] = useState("booking");
+  const [booking, setBooking] = useState(null);
+  const [customer, setCustomer] = useState(null);
+  const [adminLoggedIn, setAdminLoggedIn] = useState(false);
+  const [adminPw, setAdminPw] = useState("");
+  const [adminErr, setAdminErr] = useState(false);
+  const ADMIN_PW = import.meta.env.VITE_ADMIN_PASSWORD || "nova2024";
+  const isAdmin = window.location.hash === "#admin";
+  const goTab = (id) => { setTab(id); if(id==="book") setPage("booking"); };
+
+  if (isAdmin && !adminLoggedIn) return (
+    <>
+      <style>{CSS}</style>
+      <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(135deg,#663924,#3a1a0a)"}}>
+        <div style={{background:"#fff",borderRadius:20,padding:"40px 32px",width:300,textAlign:"center",boxShadow:"0 20px 60px rgba(0,0,0,.3)"}}>
+          <p className="bb" style={{fontSize:36,color:"var(--or)",marginBottom:4}}>NOVA</p>
+          <p style={{fontSize:13,color:"var(--mu)",marginBottom:28}}>Admin Dashboard</p>
+          <input type="password" value={adminPw} onChange={e=>setAdminPw(e.target.value)}
+            onKeyDown={e=>e.key==="Enter"&&(adminPw===ADMIN_PW?setAdminLoggedIn(true):(setAdminErr(true),setTimeout(()=>setAdminErr(false),2000)))}
+            placeholder="รหัสผ่าน"
+            style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1.5px solid ${adminErr?"#c0392b":"var(--dv)"}`,fontSize:15,marginBottom:12,outline:"none"}} />
+          {adminErr && <p style={{color:"#c0392b",fontSize:12,marginBottom:8}}>รหัสผ่านไม่ถูกต้อง</p>}
+          <button onClick={()=>adminPw===ADMIN_PW?setAdminLoggedIn(true):(setAdminErr(true),setTimeout(()=>setAdminErr(false),2000))}
+            style={{width:"100%",padding:"13px",borderRadius:10,border:"none",background:"#663924",color:"#F47E1F",fontWeight:700,fontSize:15,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            เข้าสู่ระบบ
+          </button>
+        </div>
+      </div>
+    </>
+  );
+
+  if (isAdmin && adminLoggedIn) return (
+    <>
+      <style>{CSS}</style>
+      <AdminDashboard onLogout={()=>{setAdminLoggedIn(false);setAdminPw("");}} />
+    </>
+  );
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)"}}>
+        <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px"}}>
+          <NovaLogo width={100} />
+        </header>
+        <main>
+          {tab==="home" && <HomePage goBook={() => goTab("book")} />}
+          {tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} />}
+          {tab==="book" && page==="checkout" && booking && (
+            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} />
+          )}
+          {tab==="book" && page==="payment" && booking && customer && (
+            <PaymentPage booking={booking} customer={customer} onDone={() => { setBooking(null); setCustomer(null); setPage("booking"); goTab("home"); }} />
+          )}
+          {tab==="cancel" && <CancelPage />}
+        </main>
+        <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:200,backgroundColor:"#fff",borderTop:"1px solid var(--dv)",display:"flex",boxShadow:"0 -3px 16px rgba(102,57,36,0.07)"}}>
+          {[["home","🏠","หน้าแรก"],["book","📅","จองสนาม"],["cancel","🔍","การจองของฉัน"]].map(([id,icon,label]) => (
+            <button key={id} onClick={() => goTab(id)} style={{flex:1,padding:"11px 0 8px",background:"none",border:"none",borderTop:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+              <span style={{fontSize:19}}>{icon}</span>
+              <span style={{fontSize:10,fontWeight:tab===id?700:400}}>{label}</span>
+            </button>
+          ))}
+        </nav>
+      </div>
+    </>
+  );
+}
+
+// Use AppV2 as the default export (has cancel tab)
+
+// ─── Admin Dashboard (inline) ─────────────────────────────────────────────────
+function AdminDashboard({ onLogout }) {
+  const [tab, setTab] = useState("bookings");
+  const [bookings, setBookings] = useState([]);
+  const [discounts, setDiscounts] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
+  const [newCode, setNewCode] = useState("");
+  const [newAmt, setNewAmt] = useState("50");
+  const [newMax, setNewMax] = useState("1");
+
+  const loadBookings = async () => {
+    setLoading(true);
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/bookings?booking_date=eq.${date}&select=*&order=hour.asc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
+    setBookings(await res.json() || []); setLoading(false);
+  };
+  const loadDiscounts = async () => {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/discount_codes?select=*&order=created_at.desc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
+    setDiscounts(await res.json() || []);
+  };
+  const loadCustomers = async () => {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/customers?select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
+    setCustomers(await res.json() || []);
+  };
+
+  useEffect(() => { loadBookings(); }, [date]);
+  useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); }, [tab]);
+
+  const updateStatus = async (id, status) => {
+    await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+    setBookings(prev => prev.map(b => b.id === id ? { ...b, status } : b));
+  };
+
+  const createCode = async () => {
+    if (!newCode.trim()) return;
+    await fetch(`${SUPABASE_URL}/rest/v1/discount_codes`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: newCode.toUpperCase(), discount_amount: parseInt(newAmt), discount_percent: 0, max_uses: parseInt(newMax), active: true }),
+    });
+    setNewCode(""); loadDiscounts();
+  };
+
+  const genCode = () => {
+    const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    setNewCode(Array.from({length:8}, () => c[Math.floor(Math.random()*c.length)]).join(""));
+  };
+
+  const toggleDiscount = async (id, active) => {
+    await fetch(`${SUPABASE_URL}/rest/v1/discount_codes?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ active }),
+    });
+    loadDiscounts();
+  };
+
+  const stInfo = (s) => {
+    if(s==="confirmed") return {text:"✅ ยืนยัน", color:"#2d7a4f"};
+    if(s==="cancelled") return {text:"❌ ยกเลิก", color:"#c0392b"};
+    if(s==="reviewing") return {text:"🔍 รอตรวจสลิป", color:"#e67e22"};
+    return {text:"⏳ รอชำระ", color:"var(--mu)"};
+  };
+
+  const revenue = bookings.filter(b=>b.status==="confirmed").reduce((s,b)=>s+(b.price||0),0);
+
+  const adminCSS = `
+    .adm-table { width:100%; border-collapse:collapse; font-size:13px; }
+    .adm-table th { background:#663924; color:#F47E1F; padding:9px 12px; text-align:left; }
+    .adm-table td { padding:9px 12px; border-bottom:1px solid rgba(102,57,36,.1); }
+    .adm-table tr:hover td { background:rgba(244,126,31,.04); }
+  `;
+
+  return (
+    <>
+      <style>{adminCSS}</style>
+      <div style={{minHeight:"100vh",background:"#f5f5f5"}}>
+        <header style={{background:"var(--br)",padding:"12px 20px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <p className="bb" style={{fontSize:22,color:"var(--or)",lineHeight:1}}>NOVA TENNIS</p>
+            <p style={{fontSize:11,color:"rgba(255,255,255,.5)"}}>Admin Dashboard</p>
+          </div>
+          <button onClick={onLogout} style={{background:"rgba(255,255,255,.1)",border:"none",color:"rgba(255,255,255,.7)",padding:"7px 14px",borderRadius:8,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            ออกจากระบบ
+          </button>
+        </header>
+
+        <div style={{background:"#fff",borderBottom:"1px solid var(--dv)",display:"flex",padding:"0 20px"}}>
+          {[["bookings","📋 การจอง"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
+            <button key={id} onClick={() => setTab(id)} style={{padding:"13px 16px",background:"none",border:"none",borderBottom:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",fontWeight:tab===id?700:400,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{padding:"20px",maxWidth:1000,margin:"0 auto"}}>
+          {tab==="bookings" && (
+            <div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:20}}>
+                {[
+                  {label:"ทั้งหมด",val:bookings.length,color:"var(--br)"},
+                  {label:"ยืนยันแล้ว",val:bookings.filter(b=>b.status==="confirmed").length,color:"#2d7a4f"},
+                  {label:"รอดำเนินการ",val:bookings.filter(b=>b.status==="reviewing"||b.status==="pending").length,color:"#e67e22"},
+                  {label:"รายได้",val:`฿${revenue.toLocaleString()}`,color:"var(--or)"},
+                ].map(({label,val,color}) => (
+                  <div key={label} style={{background:"#fff",borderRadius:12,padding:"14px",textAlign:"center",border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                    <p style={{fontSize:11,color:"var(--mu)",marginBottom:4}}>{label}</p>
+                    <p style={{fontSize:20,fontWeight:800,color}}>{val}</p>
+                  </div>
+                ))}
+              </div>
+              <div style={{display:"flex",gap:10,marginBottom:16}}>
+                <input type="date" value={date} onChange={e=>setDate(e.target.value)}
+                  style={{padding:"9px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                <button onClick={loadBookings} style={{padding:"9px 16px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
+              </div>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                {loading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                bookings.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่มีการจองในวันนี้</p> : (
+                  <table className="adm-table">
+                    <thead><tr><th>สนาม</th><th>เวลา</th><th>เบอร์</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                    <tbody>
+                      {bookings.map(b => {
+                        const st = stInfo(b.status);
+                        return (
+                          <tr key={b.id}>
+                            <td style={{fontWeight:700}}>Court {b.court_id}</td>
+                            <td>{String(b.hour).padStart(2,"0")}:00</td>
+                            <td>{b.customer_id}</td>
+                            <td style={{fontWeight:700,color:"var(--or)"}}>฿{b.price?.toLocaleString()}</td>
+                            <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
+                            <td><span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 8px",borderRadius:20}}>{st.text}</span></td>
+                            <td>
+                              {b.status!=="cancelled" && (
+                                <div style={{display:"flex",gap:6}}>
+                                  {b.status!=="confirmed" && <button onClick={()=>updateStatus(b.id,"confirmed")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>}
+                                  <button onClick={()=>updateStatus(b.id,"cancelled")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab==="discounts" && (
+            <div>
+              <div style={{background:"#fff",borderRadius:12,padding:20,marginBottom:20,border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                <p style={{fontWeight:700,color:"var(--br)",marginBottom:14}}>➕ สร้างรหัสส่วนลดใหม่</p>
+                <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:8,marginBottom:10}}>
+                  <input value={newCode} onChange={e=>setNewCode(e.target.value.toUpperCase())} placeholder="รหัส เช่น NOVA50"
+                    style={{padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  <button onClick={genCode} style={{padding:"0 14px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:13,cursor:"pointer"}}>🎲 สุ่ม</button>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>ส่วนลด (บาท)</label>
+                    <input type="number" value={newAmt} onChange={e=>setNewAmt(e.target.value)} min="1"
+                      style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>ใช้ได้กี่ครั้ง</label>
+                    <input type="number" value={newMax} onChange={e=>setNewMax(e.target.value)} min="1"
+                      style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                </div>
+                <button onClick={createCode} disabled={!newCode.trim()} style={{width:"100%",padding:"12px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                  สร้างรหัส
+                </button>
+              </div>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                <table className="adm-table">
+                  <thead><tr><th>รหัส</th><th>ส่วนลด</th><th>ใช้แล้ว/ทั้งหมด</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                  <tbody>
+                    {discounts.map(c => (
+                      <tr key={c.id}>
+                        <td style={{fontWeight:700,fontFamily:"monospace"}}>{c.code}</td>
+                        <td style={{fontWeight:700,color:"var(--or)"}}>฿{c.discount_amount||`${c.discount_percent}%`}</td>
+                        <td>{c.used_count}/{c.max_uses}</td>
+                        <td><span style={{fontSize:12,fontWeight:600,color:c.active?"#2d7a4f":"#c0392b",background:c.active?"rgba(45,122,79,.1)":"rgba(192,57,43,.1)",padding:"3px 8px",borderRadius:20}}>{c.active?"ใช้งานได้":"ปิดใช้งาน"}</span></td>
+                        <td><button onClick={()=>toggleDiscount(c.id,!c.active)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:c.active?"rgba(192,57,43,.1)":"rgba(45,122,79,.1)",color:c.active?"#c0392b":"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{c.active?"ปิด":"เปิด"}</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {tab==="customers" && (
+            <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+              <table className="adm-table">
+                <thead><tr><th>#</th><th>ชื่อ</th><th>เบอร์โทร</th></tr></thead>
+                <tbody>
+                  {customers.map((c,i) => (
+                    <tr key={c.customer_id}>
+                      <td style={{color:"var(--mu)"}}>{i+1}</td>
+                      <td style={{fontWeight:600}}>{c.customer_name}</td>
+                      <td style={{fontFamily:"monospace"}}>{c.customer_id}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </div>
     </>
   );
