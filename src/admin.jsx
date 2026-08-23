@@ -1,5 +1,9 @@
-import AdminApp from './src/AdminPage'
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import AppV2 from './src/nova-tennis'
 
-export default function Admin() {
-  return <AdminApp />
-}
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <AppV2 adminMode={true} />
+  </React.StrictMode>
+)
