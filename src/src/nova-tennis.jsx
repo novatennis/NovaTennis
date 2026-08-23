@@ -1,5 +1,44 @@
 import { useState, useEffect } from "react";
 
+// ─── Supabase ─────────────────────────────────────────────────────────────────
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+const supabase = {
+  async getBookings(date, courtId) {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/bookings?booking_date=eq.${date}&court_id=eq.${courtId}&select=hour`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    return res.json();
+  },
+  async addBooking(data) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/bookings`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify(data),
+    });
+    return res.ok;
+  },
+  async upsertCustomer(customerId, customerName) {
+    await fetch(`${SUPABASE_URL}/rest/v1/customers`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates",
+      },
+      body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
+    });
+  },
+};
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 const COURTS = [
   { courtId: 1, courtName: "Court 1", desc: "สนามในร่ม • ปรับอากาศ" },
@@ -16,12 +55,7 @@ const TIME_SLOTS = Array.from({ length: 17 }, (_, i) => {
   };
 });
 
-// In-memory booking store
-const STORE = {};
 const toIso = (d) => d ? d.toISOString().split("T")[0] : "";
-const checkBooked = (date, courtId, hour) => !!STORE[`${toIso(date)}|${courtId}|${hour}`];
-const lockSlot = (date, courtId, hour, data) => { STORE[`${toIso(date)}|${courtId}|${hour}`] = data; };
-
 const fmtDate = (d) => d
   ? d.toLocaleDateString("th-TH", { weekday: "short", year: "numeric", month: "short", day: "numeric" })
   : "";
@@ -37,7 +71,6 @@ const CSS = `
     --or2: #FAA05A;
     --or-bg: rgba(244,126,31,0.10);
     --br: #663924;
-    --br2: #8a5035;
     --bl: #8DB6C7;
     --bl-bg: rgba(141,182,199,0.13);
     --tx: #2e1a0e;
@@ -49,10 +82,6 @@ const CSS = `
   html, body { background: var(--cr); font-family: 'Noto Sans Thai', sans-serif; color: var(--tx); }
   button, input { font-family: 'Noto Sans Thai', sans-serif; }
   .bb { font-family: 'Bebas Neue', sans-serif; letter-spacing: .05em; }
-  ::-webkit-scrollbar { width: 3px; }
-  ::-webkit-scrollbar-thumb { background: var(--cr2); border-radius: 3px; }
-  @keyframes fu { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
-  .fu { animation: fu .3s ease both; }
   .btn-primary {
     width: 100%; padding: 15px; border-radius: var(--r); border: none;
     background: linear-gradient(90deg, var(--or), var(--or2));
@@ -60,23 +89,16 @@ const CSS = `
     box-shadow: 0 4px 18px rgba(244,126,31,.30);
     font-family: 'Noto Sans Thai', sans-serif;
   }
-  .btn-primary:disabled {
-    background: var(--cr2); color: var(--mu);
-    box-shadow: none; cursor: not-allowed;
-  }
-  .card {
-    background: #fff; border-radius: var(--r);
-    border: 1px solid var(--dv); box-shadow: var(--sh);
-    overflow: hidden;
-  }
-  .card-header {
-    background: var(--br); padding: 11px 18px;
-  }
+  .btn-primary:disabled { background: var(--cr2); color: var(--mu); box-shadow: none; cursor: not-allowed; }
+  .card { background: #fff; border-radius: var(--r); border: 1px solid var(--dv); box-shadow: var(--sh); overflow: hidden; }
+  .card-header { background: var(--br); padding: 11px 18px; }
   .card-header p { color: var(--or); font-size: 13px; font-weight: 600; }
   .card-body { padding: 16px 18px; }
+  @keyframes fu { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+  .fu { animation: fu .3s ease both; }
 `;
 
-// ─── Logo SVG ─────────────────────────────────────────────────────────────────
+// ─── Logo ─────────────────────────────────────────────────────────────────────
 function NovaLogo({ width = 160 }) {
   return (
     <svg width={width} viewBox="0 0 320 100" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -92,36 +114,31 @@ function NovaLogo({ width = 160 }) {
   );
 }
 
-// ─── Court Lines SVG ──────────────────────────────────────────────────────────
 function CourtLines() {
   return (
-    <svg viewBox="0 0 400 150" fill="none" xmlns="http://www.w3.org/2000/svg"
-      style={{ width:"100%", display:"block", opacity:.15 }}>
+    <svg viewBox="0 0 400 150" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ width:"100%", display:"block", opacity:.15 }}>
       <rect x="30" y="8" width="340" height="134" stroke="#F47E1F" strokeWidth="2.5"/>
       <rect x="80" y="8" width="240" height="134" stroke="#F47E1F" strokeWidth="2"/>
       <line x1="200" y1="8" x2="200" y2="142" stroke="#F47E1F" strokeWidth="2"/>
       <line x1="80" y1="75" x2="320" y2="75" stroke="#F47E1F" strokeWidth="2"/>
-      <line x1="200" y1="6" x2="200" y2="10" stroke="#F47E1F" strokeWidth="4"/>
     </svg>
   );
 }
 
-// ─── Tab Bar ──────────────────────────────────────────────────────────────────
 function TabBar({ tab, setTab }) {
-  const tabs = [["home","🏠","หน้าแรก"],["book","📅","จองสนาม"]];
   return (
     <nav style={{
       position:"fixed", bottom:0, left:0, right:0, zIndex:200,
       backgroundColor:"#fff", borderTop:"1px solid var(--dv)",
       display:"flex", boxShadow:"0 -3px 16px rgba(102,57,36,0.07)",
     }}>
-      {tabs.map(([id, icon, label]) => (
+      {[["home","🏠","หน้าแรก"],["book","📅","จองสนาม"]].map(([id, icon, label]) => (
         <button key={id} onClick={() => setTab(id)} style={{
           flex:1, padding:"11px 0 8px", background:"none", border:"none",
           borderTop: tab===id ? "2.5px solid var(--or)" : "2.5px solid transparent",
           color: tab===id ? "var(--or)" : "var(--mu)",
           cursor:"pointer", display:"flex", flexDirection:"column",
-          alignItems:"center", gap:3, transition:"color .2s",
+          alignItems:"center", gap:3,
         }}>
           <span style={{ fontSize:21 }}>{icon}</span>
           <span style={{ fontSize:11, fontWeight: tab===id ? 700 : 400 }}>{label}</span>
@@ -131,59 +148,39 @@ function TabBar({ tab, setTab }) {
   );
 }
 
-// ─── HOME PAGE ────────────────────────────────────────────────────────────────
 function HomePage({ goBook }) {
   return (
     <div style={{ paddingBottom:90 }}>
-      {/* Hero */}
-      <div style={{
-        background:"linear-gradient(160deg,#fff 0%,var(--cr) 55%,var(--cr2) 100%)",
-        padding:"36px 24px 0", textAlign:"center", position:"relative", overflow:"hidden",
-      }}>
+      <div style={{ background:"linear-gradient(160deg,#fff 0%,var(--cr) 55%,var(--cr2) 100%)", padding:"36px 24px 0", textAlign:"center" }}>
         <NovaLogo width={180} />
-        <p style={{ color:"var(--mu)", fontSize:13.5, margin:"8px 0 4px" }}>
-          สนามเทนนิสในร่ม • ระบบปรับอากาศ • พร้อมรองรับทุกระดับ
-        </p>
+        <p style={{ color:"var(--mu)", fontSize:13.5, margin:"8px 0 4px" }}>สนามเทนนิสในร่ม • ระบบปรับอากาศ • พร้อมรองรับทุกระดับ</p>
         <CourtLines />
       </div>
-
       <div style={{ padding:"0 16px", marginTop:-2 }}>
         <button className="btn-primary" onClick={goBook}>จองสนามเลย →</button>
       </div>
-
       <div style={{ padding:"18px 16px 0", display:"flex", flexDirection:"column", gap:14 }}>
-        {/* Price */}
         <div className="card">
           <div className="card-header"><p>💰 ราคาค่าสนาม</p></div>
           <div style={{ display:"flex", padding:"16px 18px", gap:12 }}>
-            <PriceBlock time="06:00–12:59" price="490" label="ช่วงเช้า" color="var(--or)" />
+            <div style={{ flex:1, textAlign:"center" }}>
+              <p style={{ fontSize:10.5, color:"var(--mu)", marginBottom:5 }}>ช่วงเช้า</p>
+              <p style={{ fontSize:28, fontWeight:800, color:"var(--or)", lineHeight:1 }}>฿490</p>
+              <p style={{ fontSize:10.5, color:"var(--mu)", marginTop:5 }}>06:00–12:59</p>
+            </div>
             <div style={{ width:1, background:"var(--dv)" }} />
-            <PriceBlock time="13:00–22:59" price="590" label="ช่วงบ่าย-เย็น" color="var(--bl)" />
+            <div style={{ flex:1, textAlign:"center" }}>
+              <p style={{ fontSize:10.5, color:"var(--mu)", marginBottom:5 }}>ช่วงบ่าย-เย็น</p>
+              <p style={{ fontSize:28, fontWeight:800, color:"var(--bl)", lineHeight:1 }}>฿590</p>
+              <p style={{ fontSize:10.5, color:"var(--mu)", marginTop:5 }}>13:00–22:59</p>
+            </div>
           </div>
         </div>
-
-        {/* Rules */}
         {[
-          { icon:"📋", title:"เงื่อนไขการจอง", items:[
-            "จองล่วงหน้าได้สูงสุด 7 วัน",
-            "ชำระเงินภายใน 5 นาทีหลังยืนยัน",
-            "1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)",
-          ]},
-          { icon:"❌", title:"นโยบายการยกเลิก", items:[
-            "ยกเลิกก่อน 24 ชม. — คืนเงินเต็มจำนวน",
-            "ยกเลิกภายใน 24 ชม. — หักค่าธรรมเนียม 50%",
-            "No-show — ไม่คืนเงิน",
-          ]},
-          { icon:"🎾", title:"กฎระเบียบสนาม", items:[
-            "แต่งกายด้วยชุดกีฬาเท่านั้น",
-            "ห้ามนำอาหารและเครื่องดื่มเข้าสนาม",
-            "กรุณาตรงต่อเวลา ไม่สามารถขยายเวลาได้",
-          ]},
-          { icon:"📞", title:"ติดต่อเรา", items:[
-            "โทร: 02-xxx-xxxx",
-            "Line: @novatenniscourt",
-            "เปิดทำการ 06:00–22:00 น. ทุกวัน",
-          ]},
+          { icon:"📋", title:"เงื่อนไขการจอง", items:["จองล่วงหน้าได้สูงสุด 7 วัน","ชำระเงินภายใน 5 นาทีหลังยืนยัน","1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)"] },
+          { icon:"❌", title:"นโยบายการยกเลิก", items:["ยกเลิกก่อน 24 ชม. — คืนเงินเต็มจำนวน","ยกเลิกภายใน 24 ชม. — หักค่าธรรมเนียม 50%","No-show — ไม่คืนเงิน"] },
+          { icon:"🎾", title:"กฎระเบียบสนาม", items:["แต่งกายด้วยชุดกีฬาเท่านั้น","ห้ามนำอาหารและเครื่องดื่มเข้าสนาม","กรุณาตรงต่อเวลา ไม่สามารถขยายเวลาได้"] },
+          { icon:"📞", title:"ติดต่อเรา", items:["โทร: 02-xxx-xxxx","Line: @novatenniscourt","เปิดทำการ 06:00–22:00 น. ทุกวัน"] },
         ].map(({ icon, title, items }) => (
           <div key={title} className="card">
             <div style={{ padding:"12px 18px", borderBottom:"1px solid var(--dv)", display:"flex", alignItems:"center", gap:8 }}>
@@ -205,17 +202,6 @@ function HomePage({ goBook }) {
   );
 }
 
-function PriceBlock({ time, price, label, color }) {
-  return (
-    <div style={{ flex:1, textAlign:"center" }}>
-      <p style={{ fontSize:10.5, color:"var(--mu)", marginBottom:5 }}>{label}</p>
-      <p style={{ fontSize:28, fontWeight:800, color, lineHeight:1 }}>฿{price}</p>
-      <p style={{ fontSize:10.5, color:"var(--mu)", marginTop:5 }}>{time}</p>
-    </div>
-  );
-}
-
-// ─── CALENDAR ─────────────────────────────────────────────────────────────────
 function Calendar({ selected, onSelect }) {
   const today = new Date(); today.setHours(0,0,0,0);
   const maxDate = new Date(today); maxDate.setDate(maxDate.getDate()+7);
@@ -224,36 +210,21 @@ function Calendar({ selected, onSelect }) {
   const firstDay = new Date(y, m, 1).getDay();
   const daysInMonth = new Date(y, m+1, 0).getDate();
   const selIso = toIso(selected);
-
   const cells = [];
   for (let i = 0; i < firstDay; i++) cells.push(null);
   for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(y, m, d));
-
   return (
     <div className="card">
-      <div style={{
-        display:"flex", alignItems:"center", justifyContent:"space-between",
-        padding:"12px 16px", background:"var(--br)",
-      }}>
-        <button onClick={() => setView(new Date(y, m-1, 1))} style={{
-          background:"none", border:"none", color:"rgba(255,255,255,.75)",
-          fontSize:22, cursor:"pointer", lineHeight:1, padding:"0 4px",
-        }}>‹</button>
-        <span style={{ fontWeight:700, color:"#fff", fontSize:15 }}>
-          {view.toLocaleDateString("th-TH",{ month:"long", year:"numeric" })}
-        </span>
-        <button onClick={() => setView(new Date(y, m+1, 1))} style={{
-          background:"none", border:"none", color:"rgba(255,255,255,.75)",
-          fontSize:22, cursor:"pointer", lineHeight:1, padding:"0 4px",
-        }}>›</button>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"12px 16px", background:"var(--br)" }}>
+        <button onClick={() => setView(new Date(y, m-1, 1))} style={{ background:"none", border:"none", color:"rgba(255,255,255,.75)", fontSize:22, cursor:"pointer" }}>‹</button>
+        <span style={{ fontWeight:700, color:"#fff", fontSize:15 }}>{view.toLocaleDateString("th-TH",{ month:"long", year:"numeric" })}</span>
+        <button onClick={() => setView(new Date(y, m+1, 1))} style={{ background:"none", border:"none", color:"rgba(255,255,255,.75)", fontSize:22, cursor:"pointer" }}>›</button>
       </div>
-
       <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", padding:"10px 10px 0", gap:2 }}>
         {["อา","จ","อ","พ","พฤ","ศ","ส"].map(d => (
           <div key={d} style={{ textAlign:"center", fontSize:11, color:"var(--mu)", fontWeight:600, paddingBottom:6 }}>{d}</div>
         ))}
       </div>
-
       <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", padding:"2px 10px 12px", gap:3 }}>
         {cells.map((d, i) => {
           if (!d) return <div key={i} />;
@@ -267,8 +238,7 @@ function Calendar({ selected, onSelect }) {
               cursor: disabled ? "default" : "pointer",
               background: isSel ? "var(--or)" : isToday ? "var(--or-bg)" : "transparent",
               color: disabled ? "#ccc" : isSel ? "#fff" : isToday ? "var(--or)" : "var(--tx)",
-              fontWeight: (isSel || isToday) ? 700 : 400,
-              fontSize:13, transition:"background .15s",
+              fontWeight: (isSel || isToday) ? 700 : 400, fontSize:13,
               outline: (isToday && !isSel) ? "1.5px solid var(--or)" : "none",
             }}>{d.getDate()}</button>
           );
@@ -278,30 +248,34 @@ function Calendar({ selected, onSelect }) {
   );
 }
 
-// ─── BOOKING PAGE ─────────────────────────────────────────────────────────────
 function BookingPage({ onProceed }) {
   const [date, setDate] = useState(null);
   const [court, setCourt] = useState(null);
   const [slot, setSlot] = useState(null);
+  const [bookedHours, setBookedHours] = useState([]);
+  const [loading, setLoading] = useState(false);
   const ready = date && court && slot;
+
+  useEffect(() => {
+    if (!date || !court) return;
+    setLoading(true);
+    supabase.getBookings(toIso(date), court.courtId).then(data => {
+      setBookedHours((data || []).map(b => b.hour));
+      setLoading(false);
+    });
+  }, [date, court]);
 
   return (
     <div style={{ padding:"20px 16px 100px", display:"flex", flexDirection:"column", gap:22 }} className="fu">
-      {/* Step 1 */}
       <section>
         <StepHead n="1" label="เลือกวันที่" />
         <Calendar selected={date} onSelect={d => { setDate(d); setSlot(null); }} />
         {date && (
-          <div style={{
-            marginTop:10, background:"var(--or-bg)", borderRadius:10,
-            padding:"9px 14px", border:"1px solid rgba(244,126,31,.2)",
-          }}>
+          <div style={{ marginTop:10, background:"var(--or-bg)", borderRadius:10, padding:"9px 14px", border:"1px solid rgba(244,126,31,.2)" }}>
             <p style={{ fontSize:13, color:"var(--br)", fontWeight:600 }}>📅 {fmtDate(date)}</p>
           </div>
         )}
       </section>
-
-      {/* Step 2 */}
       <section>
         <StepHead n="2" label="เลือกสนาม" />
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
@@ -314,7 +288,6 @@ function BookingPage({ onProceed }) {
                 background: sel ? "var(--or-bg)" : "#fff",
                 cursor:"pointer", textAlign:"center",
                 boxShadow: sel ? "0 2px 12px rgba(244,126,31,.18)" : "var(--sh)",
-                transition:"all .2s",
               }}>
                 <div style={{ fontSize:30, marginBottom:7 }}>🎾</div>
                 <p style={{ fontWeight:700, color: sel ? "var(--or)" : "var(--br)", fontSize:15 }}>{c.courtName}</p>
@@ -324,24 +297,20 @@ function BookingPage({ onProceed }) {
           })}
         </div>
       </section>
-
-      {/* Step 3 */}
       <section>
         <StepHead n="3" label="เลือกช่วงเวลา" />
-        <div style={{ display:"flex", gap:14, marginBottom:12, flexWrap:"wrap" }}>
-          <Dot color="var(--or)" label="490 ฿ · ช่วงเช้า (06–12)" />
-          <Dot color="var(--bl)" label="590 ฿ · ช่วงบ่าย (13–22)" />
-          <Dot color="#ddd" label="จองแล้ว" />
-        </div>
-
         {(!date || !court) ? (
           <div style={{ background:"#fff", borderRadius:"var(--r)", padding:"22px", textAlign:"center", border:"1px solid var(--dv)" }}>
             <p style={{ color:"var(--mu)", fontSize:14 }}>กรุณาเลือกวันที่และสนามก่อน</p>
           </div>
+        ) : loading ? (
+          <div style={{ background:"#fff", borderRadius:"var(--r)", padding:"22px", textAlign:"center", border:"1px solid var(--dv)" }}>
+            <p style={{ color:"var(--mu)", fontSize:14 }}>⏳ กำลังโหลด...</p>
+          </div>
         ) : (
           <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
             {TIME_SLOTS.map(ts => {
-              const booked = checkBooked(date, court.courtId, ts.hour);
+              const booked = bookedHours.includes(ts.hour);
               const isSel = slot?.hour === ts.hour;
               return (
                 <button key={ts.hour} disabled={booked} onClick={() => setSlot(ts)} style={{
@@ -349,32 +318,21 @@ function BookingPage({ onProceed }) {
                   padding:"13px 16px", borderRadius:10,
                   border:`1.5px solid ${isSel ? "var(--or)" : booked ? "transparent" : "var(--dv)"}`,
                   background: isSel ? "var(--or-bg)" : booked ? "rgba(0,0,0,.03)" : "#fff",
-                  cursor: booked ? "not-allowed" : "pointer",
-                  opacity: booked ? .5 : 1,
-                  boxShadow: isSel ? "0 2px 10px rgba(244,126,31,.15)" : "none",
-                  transition:"all .15s",
+                  cursor: booked ? "not-allowed" : "pointer", opacity: booked ? .5 : 1,
                 }}>
                   <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                    <div style={{
-                      width:8, height:8, borderRadius:"50%", flexShrink:0,
-                      background: booked ? "#ccc" : ts.peak ? "var(--bl)" : "var(--or)",
-                    }} />
-                    <span style={{
-                      fontSize:14, color: booked ? "var(--mu)" : "var(--tx)",
-                      textDecoration: booked ? "line-through" : "none",
-                    }}>{ts.label}</span>
+                    <div style={{ width:8, height:8, borderRadius:"50%", background: booked ? "#ccc" : ts.peak ? "var(--bl)" : "var(--or)" }} />
+                    <span style={{ fontSize:14, textDecoration: booked ? "line-through" : "none" }}>{ts.label}</span>
                   </div>
-                  <span style={{
-                    fontSize:14, fontWeight:700,
-                    color: booked ? "var(--mu)" : ts.peak ? "var(--bl)" : "var(--or)",
-                  }}>{booked ? "เต็ม" : `฿${ts.price.toLocaleString()}`}</span>
+                  <span style={{ fontSize:14, fontWeight:700, color: booked ? "var(--mu)" : ts.peak ? "var(--bl)" : "var(--or)" }}>
+                    {booked ? "เต็ม" : `฿${ts.price.toLocaleString()}`}
+                  </span>
                 </button>
               );
             })}
           </div>
         )}
       </section>
-
       <button className="btn-primary" disabled={!ready} onClick={() => onProceed({ date, court, slot })}>
         ดำเนินการต่อ →
       </button>
@@ -382,7 +340,6 @@ function BookingPage({ onProceed }) {
   );
 }
 
-// ─── CHECKOUT PAGE ────────────────────────────────────────────────────────────
 function CheckoutPage({ booking, onCancel, onConfirm }) {
   const { date, court, slot } = booking;
   const [name, setName] = useState("");
@@ -390,11 +347,9 @@ function CheckoutPage({ booking, onCancel, onConfirm }) {
   const nameOk = name.trim().length >= 1 && name.length <= 16;
   const phoneOk = /^[0-9]{9,10}$/.test(phone);
   const ok = nameOk && phoneOk;
-
   return (
     <div style={{ padding:"20px 16px 100px" }} className="fu">
       <h2 className="bb" style={{ fontSize:28, color:"var(--br)", marginBottom:20 }}>ยืนยันการจอง</h2>
-
       <div className="card" style={{ marginBottom:20 }}>
         <div className="card-header"><p>สรุปรายการจอง</p></div>
         <div className="card-body">
@@ -408,125 +363,76 @@ function CheckoutPage({ booking, onCancel, onConfirm }) {
           </div>
         </div>
       </div>
-
       <div style={{ display:"flex", flexDirection:"column", gap:15, marginBottom:26 }}>
-        <Field label="ชื่อ-นามสกุล" hint={`${name.length}/16`} err={name.length > 0 && !nameOk}>
-          <input
-            value={name} onChange={e => setName(e.target.value)} maxLength={16}
-            placeholder="กรอกชื่อของท่าน"
-            style={inp(name.length > 0 && !nameOk)}
-          />
-        </Field>
-        <Field label="เบอร์โทรศัพท์" hint="ใช้เป็น Customer ID" err={phone.length > 0 && !phoneOk}>
-          <input
-            value={phone}
-            onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))}
-            placeholder="0812345678" inputMode="numeric"
-            style={inp(phone.length > 0 && !phoneOk)}
-          />
-        </Field>
+        <div>
+          <label style={{ fontSize:13, fontWeight:600, color:"var(--br)", marginBottom:7, display:"block" }}>ชื่อ-นามสกุล (ไม่เกิน 16 ตัว)</label>
+          <input value={name} onChange={e => setName(e.target.value)} maxLength={16} placeholder="กรอกชื่อของท่าน"
+            style={{ width:"100%", padding:"13px 14px", borderRadius:10, fontSize:15, background:"#fff", border:`1.5px solid ${name && !nameOk ? "#c0392b" : "var(--dv)"}`, color:"var(--tx)", outline:"none" }} />
+          <p style={{ fontSize:11, color:"var(--mu)", marginTop:5, textAlign:"right" }}>{name.length}/16</p>
+        </div>
+        <div>
+          <label style={{ fontSize:13, fontWeight:600, color:"var(--br)", marginBottom:7, display:"block" }}>เบอร์โทรศัพท์</label>
+          <input value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))} placeholder="0812345678" inputMode="numeric"
+            style={{ width:"100%", padding:"13px 14px", borderRadius:10, fontSize:15, background:"#fff", border:`1.5px solid ${phone && !phoneOk ? "#c0392b" : "var(--dv)"}`, color:"var(--tx)", outline:"none" }} />
+        </div>
       </div>
-
       <div style={{ display:"flex", gap:12 }}>
-        <button onClick={onCancel} style={{
-          flex:1, padding:"14px", borderRadius:"var(--r)",
-          border:"1.5px solid var(--dv)", background:"#fff",
-          color:"var(--mu)", fontSize:15, cursor:"pointer",
-        }}>ยกเลิก</button>
+        <button onClick={onCancel} style={{ flex:1, padding:"14px", borderRadius:"var(--r)", border:"1.5px solid var(--dv)", background:"#fff", color:"var(--mu)", fontSize:15, cursor:"pointer" }}>ยกเลิก</button>
         <button disabled={!ok} onClick={() => onConfirm({ name:name.trim(), phone })} style={{
           flex:2, padding:"14px", borderRadius:"var(--r)", border:"none",
           background: ok ? "linear-gradient(90deg,var(--or),var(--or2))" : "var(--cr2)",
-          color: ok ? "#fff" : "var(--mu)", fontWeight:700, fontSize:15,
-          cursor: ok ? "pointer" : "not-allowed",
-          boxShadow: ok ? "0 4px 18px rgba(244,126,31,.28)" : "none",
+          color: ok ? "#fff" : "var(--mu)", fontWeight:700, fontSize:15, cursor: ok ? "pointer" : "not-allowed",
         }}>ยืนยัน ✓</button>
       </div>
     </div>
   );
 }
 
-const inp = (err) => ({
-  width:"100%", padding:"13px 14px", borderRadius:10, fontSize:15,
-  background:"#fff", border:`1.5px solid ${err ? "#c0392b" : "var(--dv)"}`,
-  color:"var(--tx)", outline:"none",
-});
-
-function Field({ label, hint, err, children }) {
-  return (
-    <div>
-      <label style={{ fontSize:13, fontWeight:600, color:"var(--br)", marginBottom:7, display:"block" }}>{label}</label>
-      {children}
-      <p style={{ fontSize:11, color: err ? "#c0392b" : "var(--mu)", marginTop:5, textAlign:"right" }}>{hint}</p>
-    </div>
-  );
-}
-
-// ─── PAYMENT PAGE ─────────────────────────────────────────────────────────────
 function PaymentPage({ booking, customer, onDone }) {
   const { date, court, slot } = booking;
   const [secs, setSecs] = useState(300);
   const expired = secs <= 0;
   const urgent = secs <= 60 && !expired;
-
   useEffect(() => {
     if (expired) return;
     const t = setTimeout(() => setSecs(s => s - 1), 1000);
     return () => clearTimeout(t);
   }, [secs, expired]);
-
   const mm = String(Math.floor(Math.max(secs,0)/60)).padStart(2,"0");
   const ss = String(Math.max(secs,0)%60).padStart(2,"0");
   const pct = (Math.max(secs,0)/300)*100;
 
+  const handleDone = async () => {
+    await supabase.upsertCustomer(customer.phone, customer.name);
+    await supabase.addBooking({
+      court_id: court.courtId,
+      customer_id: customer.phone,
+      booking_date: toIso(date),
+      hour: slot.hour,
+      price: slot.price,
+    });
+    onDone();
+  };
+
   return (
     <div style={{ padding:"20px 16px 90px" }} className="fu">
       <h2 className="bb" style={{ fontSize:28, color:"var(--br)", marginBottom:18 }}>ชำระเงิน</h2>
-
-      {/* Countdown */}
-      <div style={{
-        background:"#fff", borderRadius:"var(--r)", marginBottom:16,
-        border:`1.5px solid ${expired ? "#c0392b" : urgent ? "#e67e22" : "var(--dv)"}`,
-        padding:"16px 20px", textAlign:"center", boxShadow:"var(--sh)",
-      }}>
-        <p style={{ fontSize:12, color:"var(--mu)", marginBottom:3 }}>
-          {expired ? "หมดเวลา" : "กรุณาชำระภายใน"}
-        </p>
-        <p className="bb" style={{
-          fontSize:54, lineHeight:1,
-          color: expired ? "#c0392b" : urgent ? "#e67e22" : "var(--br)",
-        }}>{mm}:{ss}</p>
+      <div style={{ background:"#fff", borderRadius:"var(--r)", marginBottom:16, border:`1.5px solid ${expired ? "#c0392b" : urgent ? "#e67e22" : "var(--dv)"}`, padding:"16px 20px", textAlign:"center", boxShadow:"var(--sh)" }}>
+        <p style={{ fontSize:12, color:"var(--mu)", marginBottom:3 }}>{expired ? "หมดเวลา" : "กรุณาชำระภายใน"}</p>
+        <p className="bb" style={{ fontSize:54, lineHeight:1, color: expired ? "#c0392b" : urgent ? "#e67e22" : "var(--br)" }}>{mm}:{ss}</p>
         <div style={{ height:4, background:"var(--cr2)", borderRadius:4, marginTop:12, overflow:"hidden" }}>
-          <div style={{
-            height:"100%", borderRadius:4, transition:"width 1s linear",
-            width:`${pct}%`,
-            background: expired ? "#c0392b" : urgent ? "#e67e22" : "var(--or)",
-          }} />
+          <div style={{ height:"100%", borderRadius:4, width:`${pct}%`, background: expired ? "#c0392b" : urgent ? "#e67e22" : "var(--or)", transition:"width 1s linear" }} />
         </div>
         {expired && <p style={{ color:"#c0392b", fontSize:13, marginTop:8, fontWeight:600 }}>⚠️ หมดเวลา — กรุณาเริ่มต้นใหม่</p>}
       </div>
-
-      {/* QR */}
-      <div style={{
-        background:"#fff", borderRadius:"var(--r)", padding:"20px",
-        textAlign:"center", boxShadow:"0 4px 24px rgba(102,57,36,.12)",
-        marginBottom:16, border:"1px solid var(--dv)",
-      }}>
+      <div style={{ background:"#fff", borderRadius:"var(--r)", padding:"20px", textAlign:"center", boxShadow:"0 4px 24px rgba(102,57,36,.12)", marginBottom:16, border:"1px solid var(--dv)" }}>
         <p style={{ fontSize:13, color:"var(--mu)", marginBottom:12 }}>สแกน QR Code ชำระผ่าน PromptPay</p>
-        <img
-          src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&color=663924&bgcolor=F9E8D4&data=PromptPay0812345678`}
-          alt="QR PromptPay"
-          style={{ width:200, height:200, borderRadius:10 }}
-        />
-        <div style={{
-          marginTop:14, display:"inline-flex", alignItems:"center", gap:8,
-          background:"var(--or-bg)", borderRadius:20, padding:"8px 18px",
-        }}>
+        <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&color=663924&bgcolor=F9E8D4&data=PromptPay0812345678" alt="QR" style={{ width:200, height:200, borderRadius:10 }} />
+        <div style={{ marginTop:14, display:"inline-flex", alignItems:"center", gap:8, background:"var(--or-bg)", borderRadius:20, padding:"8px 18px" }}>
           <span style={{ fontSize:24, fontWeight:800, color:"var(--or)" }}>฿{slot.price.toLocaleString()}</span>
           <span style={{ fontSize:12, color:"var(--mu)" }}>โอนให้ถูกต้อง</span>
         </div>
       </div>
-
-      {/* Booking detail */}
       <div className="card" style={{ marginBottom:16 }}>
         <div className="card-header"><p>รายละเอียดการจอง</p></div>
         <div className="card-body">
@@ -537,51 +443,28 @@ function PaymentPage({ booking, customer, onDone }) {
           <Row label="🕐 เวลา" val={slot.label} />
         </div>
       </div>
-
-      {/* Steps */}
       <div className="card" style={{ marginBottom:24 }}>
         <div style={{ padding:"11px 18px", borderBottom:"1px solid var(--dv)", background:"var(--bl-bg)" }}>
           <p style={{ fontWeight:700, color:"var(--br)", fontSize:14 }}>ขั้นตอนการชำระเงิน</p>
         </div>
         <div style={{ padding:"14px 18px", display:"flex", flexDirection:"column", gap:12 }}>
-          {[
-            "บันทึกด้วยการถ่ายภาพหน้าจอ",
-            "เปิดแอปธนาคารที่พร้อมชำระเงินของคุณ",
-            "เลือกตัวเลือกเพื่อสแกนรหัส QR",
-            "ส่งไฟล์รหัส QR ที่คุณบันทึกไว้ก่อนหน้านี้",
-            "ทำธุรกรรมให้เสร็จสิ้น",
-          ].map((s, i) => (
+          {["บันทึกด้วยการถ่ายภาพหน้าจอ","เปิดแอปธนาคารที่พร้อมชำระเงินของคุณ","เลือกตัวเลือกเพื่อสแกนรหัส QR","ส่งไฟล์รหัส QR ที่คุณบันทึกไว้ก่อนหน้านี้","ทำธุรกรรมให้เสร็จสิ้น"].map((s,i) => (
             <div key={i} style={{ display:"flex", gap:12, alignItems:"flex-start" }}>
-              <div style={{
-                width:24, height:24, borderRadius:"50%", flexShrink:0,
-                background:"var(--br)", color:"var(--or)",
-                display:"flex", alignItems:"center", justifyContent:"center",
-                fontSize:11, fontWeight:800, marginTop:1,
-              }}>{i+1}</div>
+              <div style={{ width:24, height:24, borderRadius:"50%", flexShrink:0, background:"var(--br)", color:"var(--or)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:11, fontWeight:800, marginTop:1 }}>{i+1}</div>
               <p style={{ fontSize:13.5, color:"var(--mu)", lineHeight:1.65 }}>{s}</p>
             </div>
           ))}
         </div>
       </div>
-
-      <button className="btn-primary" onClick={() => {
-        lockSlot(date, court.courtId, slot.hour, customer);
-        onDone();
-      }}>ชำระเงินแล้ว / กลับหน้าหลัก</button>
+      <button className="btn-primary" onClick={handleDone}>ชำระเงินแล้ว / กลับหน้าหลัก</button>
     </div>
   );
 }
 
-// ─── Shared micro-components ──────────────────────────────────────────────────
 function StepHead({ n, label }) {
   return (
     <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:13 }}>
-      <div style={{
-        width:28, height:28, borderRadius:"50%",
-        background:"var(--br)", color:"var(--or)",
-        display:"flex", alignItems:"center", justifyContent:"center",
-        fontSize:13, fontWeight:800, flexShrink:0,
-      }}>{n}</div>
+      <div style={{ width:28, height:28, borderRadius:"50%", background:"var(--br)", color:"var(--or)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, fontWeight:800 }}>{n}</div>
       <span style={{ fontWeight:700, fontSize:16, color:"var(--br)" }}>{label}</span>
     </div>
   );
@@ -596,16 +479,6 @@ function Row({ label, val }) {
   );
 }
 
-function Dot({ color, label }) {
-  return (
-    <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-      <div style={{ width:9, height:9, borderRadius:"50%", background:color, flexShrink:0 }} />
-      <span style={{ fontSize:12, color:"var(--mu)" }}>{label}</span>
-    </div>
-  );
-}
-
-// ─── APP ROOT ──────────────────────────────────────────────────────────────────
 export default function App() {
   const [tab, setTab] = useState("home");
   const [page, setPage] = useState("booking");
@@ -618,43 +491,19 @@ export default function App() {
     <>
       <style>{CSS}</style>
       <div style={{ maxWidth:480, margin:"0 auto", minHeight:"100dvh", background:"var(--cr)" }}>
-        {/* Header */}
-        <header style={{
-          position:"sticky", top:0, zIndex:100,
-          backgroundColor:"rgba(249,232,212,0.93)",
-          backdropFilter:"blur(10px)",
-          borderBottom:"1px solid var(--dv)",
-          padding:"8px 20px",
-        }}>
+        <header style={{ position:"sticky", top:0, zIndex:100, backgroundColor:"rgba(249,232,212,0.93)", backdropFilter:"blur(10px)", borderBottom:"1px solid var(--dv)", padding:"8px 20px" }}>
           <NovaLogo width={100} />
         </header>
-
         <main>
-          {tab === "home" && (
-            <HomePage goBook={() => goTab("book")} />
-          )}
-          {tab === "book" && page === "booking" && (
-            <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} />
-          )}
+          {tab === "home" && <HomePage goBook={() => goTab("book")} />}
+          {tab === "book" && page === "booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} />}
           {tab === "book" && page === "checkout" && booking && (
-            <CheckoutPage
-              booking={booking}
-              onCancel={() => setPage("booking")}
-              onConfirm={c => { setCustomer(c); setPage("payment"); }}
-            />
+            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} />
           )}
           {tab === "book" && page === "payment" && booking && customer && (
-            <PaymentPage
-              booking={booking}
-              customer={customer}
-              onDone={() => {
-                setBooking(null); setCustomer(null);
-                setPage("booking"); goTab("home");
-              }}
-            />
+            <PaymentPage booking={booking} customer={customer} onDone={() => { setBooking(null); setCustomer(null); setPage("booking"); goTab("home"); }} />
           )}
         </main>
-
         <TabBar tab={tab} setTab={goTab} />
       </div>
     </>
