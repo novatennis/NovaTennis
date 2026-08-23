@@ -1,4 +1,277 @@
-import { createRoot } from 'react-dom/client'
-import AdminApp from './src/AdminPage'
+cat > /mnt/user-data/outputs/admin.html << 'EOF'
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NOVA Tennis - Admin</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@300;400;600;700&family=Bebas+Neue&display=swap" rel="stylesheet">
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    :root{--or:#F47E1F;--br:#663924;--cr:#F9E8D4;--bl:#8DB6C7;--dv:rgba(102,57,36,0.14);--sh:0 2px 16px rgba(102,57,36,0.09);--r:12px;--green:#2d7a4f;--red:#c0392b;--orange:#e67e22}
+    body{font-family:'Noto Sans Thai',sans-serif;background:#f5f5f5;color:#2e1a0e}
+    .bb{font-family:'Bebas Neue',sans-serif;letter-spacing:.05em}
+    #login{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#663924,#3a1a0a)}
+    .login-box{background:#fff;border-radius:20px;padding:40px 32px;width:300px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+    input{width:100%;padding:12px 14px;border-radius:10px;border:1.5px solid var(--dv);font-size:15px;outline:none;font-family:'Noto Sans Thai',sans-serif;margin-bottom:10px}
+    .btn{padding:13px;border-radius:10px;border:none;background:var(--br);color:var(--or);font-weight:700;font-size:15px;cursor:pointer;font-family:'Noto Sans Thai',sans-serif;width:100%}
+    .btn:disabled{background:#ddd;color:#999;cursor:not-allowed}
+    header{background:var(--br);padding:12px 20px;display:flex;justify-content:space-between;align-items:center}
+    .tabs{background:#fff;border-bottom:1px solid var(--dv);display:flex;padding:0 20px}
+    .tab{padding:13px 16px;background:none;border:none;border-bottom:2.5px solid transparent;color:#8a7060;font-weight:400;font-size:14px;cursor:pointer;font-family:'Noto Sans Thai',sans-serif}
+    .tab.active{border-bottom-color:var(--or);color:var(--or);font-weight:700}
+    .content{padding:20px;max-width:1100px;margin:0 auto}
+    .card{background:#fff;border-radius:var(--r);border:1px solid var(--dv);box-shadow:var(--sh);overflow:hidden;margin-bottom:16px}
+    .card-header{background:var(--br);padding:11px 18px;color:var(--or);font-size:13px;font-weight:600}
+    .card-body{padding:16px 18px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th{background:var(--br);color:var(--or);padding:9px 12px;text-align:left}
+    td{padding:9px 12px;border-bottom:1px solid var(--dv)}
+    tr:hover td{background:rgba(244,126,31,.04)}
+    .badge{font-size:12px;font-weight:600;padding:3px 8px;border-radius:20px;display:inline-block}
+    .grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+    .stat{background:#fff;border-radius:var(--r);padding:14px;text-align:center;border:1px solid var(--dv)}
+    .stat-label{font-size:11px;color:#8a7060;margin-bottom:4px}
+    .stat-val{font-size:20px;font-weight:800}
+    .action-btn{padding:5px 10px;border-radius:6px;border:none;font-weight:700;font-size:12px;cursor:pointer;font-family:'Noto Sans Thai',sans-serif}
+    .row-form{display:grid;grid-template-columns:1fr auto;gap:8px;margin-bottom:10px}
+    .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
+    label{font-size:12px;color:#8a7060;display:block;margin-bottom:5px}
+    .hidden{display:none}
+    @media(max-width:600px){.grid-4{grid-template-columns:repeat(2,1fr)}.content{padding:12px}}
+  </style>
+</head>
+<body>
 
-createRoot(document.getElementById('root')).render(<AdminApp />)
+<!-- Login -->
+<div id="login">
+  <div class="login-box">
+    <p class="bb" style="font-size:36px;color:var(--or);line-height:1">NOVA</p>
+    <p style="font-size:13px;color:#8a7060;margin-bottom:28px">Admin Dashboard</p>
+    <input type="password" id="pw-input" placeholder="รหัสผ่าน" onkeydown="if(event.key==='Enter')doLogin()" />
+    <p id="pw-err" style="color:#c0392b;font-size:12px;margin-bottom:8px;display:none">รหัสผ่านไม่ถูกต้อง</p>
+    <button class="btn" onclick="doLogin()">เข้าสู่ระบบ</button>
+  </div>
+</div>
+
+<!-- Dashboard -->
+<div id="dashboard" class="hidden">
+  <header>
+    <div>
+      <p class="bb" style="font-size:22px;color:var(--or);line-height:1">NOVA TENNIS</p>
+      <p style="font-size:11px;color:rgba(255,255,255,.5)">Admin Dashboard</p>
+    </div>
+    <button onclick="logout()" style="background:rgba(255,255,255,.1);border:none;color:rgba(255,255,255,.7);padding:7px 14px;border-radius:8px;font-size:13px;cursor:pointer;font-family:'Noto Sans Thai',sans-serif">ออกจากระบบ</button>
+  </header>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('bookings',this)">📋 การจอง</button>
+    <button class="tab" onclick="switchTab('discounts',this)">🏷 ส่วนลด</button>
+    <button class="tab" onclick="switchTab('customers',this)">👥 ลูกค้า</button>
+  </div>
+
+  <!-- Bookings Tab -->
+  <div id="tab-bookings" class="content">
+    <div class="grid-4">
+      <div class="stat"><div class="stat-label">ทั้งหมด</div><div class="stat-val" id="stat-total" style="color:var(--br)">0</div></div>
+      <div class="stat"><div class="stat-label">ยืนยันแล้ว</div><div class="stat-val" id="stat-confirmed" style="color:var(--green)">0</div></div>
+      <div class="stat"><div class="stat-label">รอดำเนินการ</div><div class="stat-val" id="stat-pending" style="color:var(--orange)">0</div></div>
+      <div class="stat"><div class="stat-label">รายได้</div><div class="stat-val" id="stat-revenue" style="color:var(--or)">฿0</div></div>
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:16px">
+      <input type="date" id="booking-date" style="padding:9px 12px;border-radius:8px;border:1.5px solid var(--dv);font-size:14px;outline:none;width:auto" onchange="loadBookings()" />
+      <button onclick="loadBookings()" style="padding:9px 16px;border-radius:8px;border:none;background:var(--br);color:var(--or);font-weight:700;font-size:13px;cursor:pointer;font-family:'Noto Sans Thai',sans-serif">🔄 รีเฟรช</button>
+    </div>
+    <div class="card">
+      <div id="bookings-table">
+        <p style="padding:24px;text-align:center;color:#8a7060">กำลังโหลด...</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Discounts Tab -->
+  <div id="tab-discounts" class="content hidden">
+    <div class="card">
+      <div class="card-header">➕ สร้างรหัสส่วนลดใหม่</div>
+      <div class="card-body">
+        <div class="row-form">
+          <input type="text" id="new-code" placeholder="รหัส เช่น NOVA50" style="text-transform:uppercase;margin:0" oninput="this.value=this.value.toUpperCase()" />
+          <button onclick="genCode()" style="padding:0 14px;border-radius:8px;border:1.5px solid var(--dv);background:#fff;color:#8a7060;font-size:13px;cursor:pointer">🎲 สุ่ม</button>
+        </div>
+        <div class="grid-2">
+          <div><label>ส่วนลด (บาท)</label><input type="number" id="new-amount" value="50" min="1" style="margin:0" /></div>
+          <div><label>ใช้ได้กี่ครั้ง</label><input type="number" id="new-max" value="1" min="1" style="margin:0" /></div>
+        </div>
+        <button class="btn" onclick="createCode()">สร้างรหัส</button>
+      </div>
+    </div>
+    <div class="card">
+      <div id="discounts-table"><p style="padding:24px;text-align:center;color:#8a7060">กำลังโหลด...</p></div>
+    </div>
+  </div>
+
+  <!-- Customers Tab -->
+  <div id="tab-customers" class="content hidden">
+    <div class="card">
+      <div id="customers-table"><p style="padding:24px;text-align:center;color:#8a7060">กำลังโหลด...</p></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const SUPABASE_URL = 'REPLACE_WITH_YOUR_SUPABASE_URL';
+const SUPABASE_KEY = 'REPLACE_WITH_YOUR_SUPABASE_KEY';
+const ADMIN_PW = 'REPLACE_WITH_YOUR_ADMIN_PASSWORD';
+
+const h = (headers={}) => ({
+  'apikey': SUPABASE_KEY,
+  'Authorization': `Bearer ${SUPABASE_KEY}`,
+  'Content-Type': 'application/json',
+  ...headers
+});
+
+async function api(path, opts={}) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, { headers: h(), ...opts });
+  return res.json();
+}
+
+function doLogin() {
+  const pw = document.getElementById('pw-input').value;
+  const err = document.getElementById('pw-err');
+  if (pw === ADMIN_PW) {
+    document.getElementById('login').classList.add('hidden');
+    document.getElementById('dashboard').classList.remove('hidden');
+    initDashboard();
+  } else {
+    err.style.display = 'block';
+    setTimeout(() => err.style.display = 'none', 2000);
+  }
+}
+
+function logout() {
+  document.getElementById('login').classList.remove('hidden');
+  document.getElementById('dashboard').classList.add('hidden');
+  document.getElementById('pw-input').value = '';
+}
+
+function switchTab(tab, el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  document.querySelectorAll('[id^="tab-"]').forEach(t => t.classList.add('hidden'));
+  document.getElementById(`tab-${tab}`).classList.remove('hidden');
+  if (tab === 'discounts') loadDiscounts();
+  if (tab === 'customers') loadCustomers();
+}
+
+function initDashboard() {
+  const today = new Date().toISOString().split('T')[0];
+  document.getElementById('booking-date').value = today;
+  loadBookings();
+}
+
+function statusInfo(s) {
+  if (s === 'confirmed') return {text:'✅ ยืนยัน', color:'#2d7a4f', bg:'rgba(45,122,79,.1)'};
+  if (s === 'cancelled') return {text:'❌ ยกเลิก', color:'#c0392b', bg:'rgba(192,57,43,.1)'};
+  if (s === 'reviewing') return {text:'🔍 รอตรวจสลิป', color:'#e67e22', bg:'rgba(230,126,34,.1)'};
+  return {text:'⏳ รอชำระ', color:'#8a7060', bg:'rgba(0,0,0,.06)'};
+}
+
+async function loadBookings() {
+  const date = document.getElementById('booking-date').value;
+  const data = await api(`bookings?booking_date=eq.${date}&select=*&order=hour.asc`) || [];
+  
+  const confirmed = data.filter(b => b.status === 'confirmed');
+  const pending = data.filter(b => b.status === 'reviewing' || b.status === 'pending');
+  const revenue = confirmed.reduce((s,b) => s+(b.price||0), 0);
+  
+  document.getElementById('stat-total').textContent = data.length;
+  document.getElementById('stat-confirmed').textContent = confirmed.length;
+  document.getElementById('stat-pending').textContent = pending.length;
+  document.getElementById('stat-revenue').textContent = `฿${revenue.toLocaleString()}`;
+
+  const el = document.getElementById('bookings-table');
+  if (!data.length) { el.innerHTML = '<p style="padding:24px;text-align:center;color:#8a7060">ไม่มีการจองในวันนี้</p>'; return; }
+  
+  el.innerHTML = `<div style="overflow-x:auto"><table>
+    <thead><tr><th>สนาม</th><th>เวลา</th><th>เบอร์</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+    <tbody>${data.map(b => {
+      const st = statusInfo(b.status);
+      return `<tr>
+        <td><b>Court ${b.court_id}</b></td>
+        <td>${String(b.hour).padStart(2,'0')}:00</td>
+        <td>${b.customer_id}</td>
+        <td style="font-weight:700;color:var(--or)">฿${(b.price||0).toLocaleString()}</td>
+        <td>${b.slip_url ? `<a href="${b.slip_url}" target="_blank" style="color:var(--bl);font-weight:600">ดูสลิป 🔗</a>` : '<span style="color:#8a7060">-</span>'}</td>
+        <td><span class="badge" style="color:${st.color};background:${st.bg}">${st.text}</span></td>
+        <td>${b.status !== 'cancelled' ? `
+          <div style="display:flex;gap:6px">
+            ${b.status !== 'confirmed' ? `<button class="action-btn" style="background:rgba(45,122,79,.15);color:#2d7a4f" onclick="updateStatus(${b.id},'confirmed')">✅</button>` : ''}
+            <button class="action-btn" style="background:rgba(192,57,43,.1);color:#c0392b" onclick="updateStatus(${b.id},'cancelled')">❌</button>
+          </div>` : ''}
+        </td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table></div>`;
+}
+
+async function updateStatus(id, status) {
+  await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${id}`, {
+    method: 'PATCH', headers: h(),
+    body: JSON.stringify({status})
+  });
+  loadBookings();
+}
+
+async function loadDiscounts() {
+  const data = await api('discount_codes?select=*&order=created_at.desc') || [];
+  const el = document.getElementById('discounts-table');
+  el.innerHTML = `<div style="overflow-x:auto"><table>
+    <thead><tr><th>รหัส</th><th>ส่วนลด</th><th>ใช้แล้ว/ทั้งหมด</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+    <tbody>${data.map(c => `<tr>
+      <td style="font-weight:700;font-family:monospace">${c.code}</td>
+      <td style="font-weight:700;color:var(--or)">฿${c.discount_amount||`${c.discount_percent}%`}</td>
+      <td>${c.used_count}/${c.max_uses}</td>
+      <td><span class="badge" style="color:${c.active?'#2d7a4f':'#c0392b'};background:${c.active?'rgba(45,122,79,.1)':'rgba(192,57,43,.1)'}">${c.active?'ใช้งานได้':'ปิดใช้งาน'}</span></td>
+      <td><button class="action-btn" style="background:${c.active?'rgba(192,57,43,.1)':'rgba(45,122,79,.1)'};color:${c.active?'#c0392b':'#2d7a4f'}" onclick="toggleDiscount(${c.id},${!c.active})">${c.active?'ปิด':'เปิด'}</button></td>
+    </tr>`).join('')}</tbody>
+  </table></div>`;
+}
+
+async function toggleDiscount(id, active) {
+  await fetch(`${SUPABASE_URL}/rest/v1/discount_codes?id=eq.${id}`, {
+    method: 'PATCH', headers: h(), body: JSON.stringify({active})
+  });
+  loadDiscounts();
+}
+
+function genCode() {
+  const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  document.getElementById('new-code').value = Array.from({length:8}, () => c[Math.floor(Math.random()*c.length)]).join('');
+}
+
+async function createCode() {
+  const code = document.getElementById('new-code').value.trim();
+  const amount = parseInt(document.getElementById('new-amount').value);
+  const max = parseInt(document.getElementById('new-max').value);
+  if (!code) return;
+  await fetch(`${SUPABASE_URL}/rest/v1/discount_codes`, {
+    method: 'POST', headers: h(),
+    body: JSON.stringify({code, discount_amount: amount, discount_percent: 0, max_uses: max, active: true})
+  });
+  document.getElementById('new-code').value = '';
+  loadDiscounts();
+}
+
+async function loadCustomers() {
+  const data = await api('customers?select=*') || [];
+  document.getElementById('customers-table').innerHTML = `<div style="overflow-x:auto"><table>
+    <thead><tr><th>#</th><th>ชื่อ</th><th>เบอร์โทร</th></tr></thead>
+    <tbody>${data.map((c,i) => `<tr><td style="color:#8a7060">${i+1}</td><td style="font-weight:600">${c.customer_name}</td><td style="font-family:monospace">${c.customer_id}</td></tr>`).join('')}</tbody>
+  </table></div>`;
+}
+</script>
+</body>
+</html>
+EOF
+Output
+exit code 0
