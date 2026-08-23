@@ -46,11 +46,11 @@ const db = {
     if (d.used_count >= d.max_uses) return null;
     return d;
   },
-  async useDiscount(id) {
+  async useDiscount(id, currentCount) {
     await fetch(`${SUPABASE_URL}/rest/v1/discount_codes?id=eq.${id}`, {
       method: "PATCH",
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ used_count: null }),
+      body: JSON.stringify({ used_count: currentCount + 1 }),
     });
   },
   async uploadSlip(file, bookingId) {
@@ -441,7 +441,10 @@ function PaymentPage({ booking, customer, onDone }) {
         discount_amount: discountAmount || 0,
         status: "pending",
       });
-      if (b) setBookingId(b.id);
+      if (b) {
+        setBookingId(b.id);
+        if (discount) await db.useDiscount(discount.id, discount.used_count);
+      }
     };
     save();
   }, []);
