@@ -728,19 +728,65 @@ function CancelPage() {
   );
 }
 
-// ─── App V2 with Cancel Tab ───────────────────────────────────────────────────
+// ─── App V2 with Cancel Tab + Admin ──────────────────────────────────────────
 export default function AppV2() {
   const [tab, setTab] = useState("home");
   const [page, setPage] = useState("booking");
   const [booking, setBooking] = useState(null);
   const [customer, setCustomer] = useState(null);
+  const [adminLoggedIn, setAdminLoggedIn] = useState(false);
+  const [adminMode, setAdminMode] = useState(false);
+  const [adminPw, setAdminPw] = useState("");
+  const [adminErr, setAdminErr] = useState(false);
+  const [logoTaps, setLogoTaps] = useState(0);
+  const ADMIN_PW = import.meta.env.VITE_ADMIN_PASSWORD || "nova2024";
   const goTab = (id) => { setTab(id); if(id==="book") setPage("booking"); };
+
+  // กดโลโก้ 5 ครั้งเปิด Admin
+  const handleLogoTap = () => {
+    const next = logoTaps + 1;
+    setLogoTaps(next);
+    if (next >= 5) { setAdminMode(true); setLogoTaps(0); }
+    setTimeout(() => setLogoTaps(0), 3000);
+  };
+
+  if (adminMode && !adminLoggedIn) return (
+    <>
+      <style>{CSS}</style>
+      <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(135deg,#663924,#3a1a0a)"}}>
+        <div style={{background:"#fff",borderRadius:20,padding:"40px 32px",width:300,textAlign:"center",boxShadow:"0 20px 60px rgba(0,0,0,.3)"}}>
+          <p className="bb" style={{fontSize:36,color:"var(--or)",marginBottom:4}}>NOVA</p>
+          <p style={{fontSize:13,color:"var(--mu)",marginBottom:28}}>Admin Dashboard</p>
+          <input type="password" value={adminPw} onChange={e=>setAdminPw(e.target.value)}
+            onKeyDown={e=>e.key==="Enter"&&(adminPw===ADMIN_PW?setAdminLoggedIn(true):(setAdminErr(true),setTimeout(()=>setAdminErr(false),2000)))}
+            placeholder="รหัสผ่าน"
+            style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1.5px solid ${adminErr?"#c0392b":"var(--dv)"}`,fontSize:15,marginBottom:12,outline:"none"}} />
+          {adminErr && <p style={{color:"#c0392b",fontSize:12,marginBottom:8}}>รหัสผ่านไม่ถูกต้อง</p>}
+          <button onClick={()=>adminPw===ADMIN_PW?setAdminLoggedIn(true):(setAdminErr(true),setTimeout(()=>setAdminErr(false),2000))}
+            style={{width:"100%",padding:"13px",borderRadius:10,border:"none",background:"#663924",color:"#F47E1F",fontWeight:700,fontSize:15,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            เข้าสู่ระบบ
+          </button>
+          <button onClick={()=>{setAdminMode(false);setAdminPw("");}}
+            style={{marginTop:10,background:"none",border:"none",color:"var(--mu)",fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            ยกเลิก
+          </button>
+        </div>
+      </div>
+    </>
+  );
+
+  if (adminMode && adminLoggedIn) return (
+    <>
+      <style>{CSS}</style>
+      <AdminDashboard onLogout={()=>{setAdminLoggedIn(false);setAdminMode(false);setAdminPw("");}} />
+    </>
+  );
 
   return (
     <>
       <style>{CSS}</style>
       <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)"}}>
-        <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px"}}>
+        <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px",cursor:"pointer"}} onClick={handleLogoTap}>
           <NovaLogo width={100} />
         </header>
         <main>
@@ -768,3 +814,227 @@ export default function AppV2() {
 }
 
 // Use AppV2 as the default export (has cancel tab)
+
+// ─── Admin Dashboard (inline) ─────────────────────────────────────────────────
+function AdminDashboard({ onLogout }) {
+  const [tab, setTab] = useState("bookings");
+  const [bookings, setBookings] = useState([]);
+  const [discounts, setDiscounts] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
+  const [newCode, setNewCode] = useState("");
+  const [newAmt, setNewAmt] = useState("50");
+  const [newMax, setNewMax] = useState("1");
+
+  const loadBookings = async () => {
+    setLoading(true);
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/bookings?booking_date=eq.${date}&select=*&order=hour.asc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
+    setBookings(await res.json() || []); setLoading(false);
+  };
+  const loadDiscounts = async () => {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/discount_codes?select=*&order=created_at.desc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
+    setDiscounts(await res.json() || []);
+  };
+  const loadCustomers = async () => {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/customers?select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
+    setCustomers(await res.json() || []);
+  };
+
+  useEffect(() => { loadBookings(); }, [date]);
+  useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); }, [tab]);
+
+  const updateStatus = async (id, status) => {
+    await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+    setBookings(prev => prev.map(b => b.id === id ? { ...b, status } : b));
+  };
+
+  const createCode = async () => {
+    if (!newCode.trim()) return;
+    await fetch(`${SUPABASE_URL}/rest/v1/discount_codes`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ code: newCode.toUpperCase(), discount_amount: parseInt(newAmt), discount_percent: 0, max_uses: parseInt(newMax), active: true }),
+    });
+    setNewCode(""); loadDiscounts();
+  };
+
+  const genCode = () => {
+    const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    setNewCode(Array.from({length:8}, () => c[Math.floor(Math.random()*c.length)]).join(""));
+  };
+
+  const toggleDiscount = async (id, active) => {
+    await fetch(`${SUPABASE_URL}/rest/v1/discount_codes?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ active }),
+    });
+    loadDiscounts();
+  };
+
+  const stInfo = (s) => {
+    if(s==="confirmed") return {text:"✅ ยืนยัน", color:"#2d7a4f"};
+    if(s==="cancelled") return {text:"❌ ยกเลิก", color:"#c0392b"};
+    if(s==="reviewing") return {text:"🔍 รอตรวจสลิป", color:"#e67e22"};
+    return {text:"⏳ รอชำระ", color:"var(--mu)"};
+  };
+
+  const revenue = bookings.filter(b=>b.status==="confirmed").reduce((s,b)=>s+(b.price||0),0);
+
+  const adminCSS = `
+    .adm-table { width:100%; border-collapse:collapse; font-size:13px; }
+    .adm-table th { background:#663924; color:#F47E1F; padding:9px 12px; text-align:left; }
+    .adm-table td { padding:9px 12px; border-bottom:1px solid rgba(102,57,36,.1); }
+    .adm-table tr:hover td { background:rgba(244,126,31,.04); }
+  `;
+
+  return (
+    <>
+      <style>{adminCSS}</style>
+      <div style={{minHeight:"100vh",background:"#f5f5f5"}}>
+        <header style={{background:"var(--br)",padding:"12px 20px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <p className="bb" style={{fontSize:22,color:"var(--or)",lineHeight:1}}>NOVA TENNIS</p>
+            <p style={{fontSize:11,color:"rgba(255,255,255,.5)"}}>Admin Dashboard</p>
+          </div>
+          <button onClick={onLogout} style={{background:"rgba(255,255,255,.1)",border:"none",color:"rgba(255,255,255,.7)",padding:"7px 14px",borderRadius:8,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            ออกจากระบบ
+          </button>
+        </header>
+
+        <div style={{background:"#fff",borderBottom:"1px solid var(--dv)",display:"flex",padding:"0 20px"}}>
+          {[["bookings","📋 การจอง"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
+            <button key={id} onClick={() => setTab(id)} style={{padding:"13px 16px",background:"none",border:"none",borderBottom:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",fontWeight:tab===id?700:400,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{padding:"20px",maxWidth:1000,margin:"0 auto"}}>
+          {tab==="bookings" && (
+            <div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:20}}>
+                {[
+                  {label:"ทั้งหมด",val:bookings.length,color:"var(--br)"},
+                  {label:"ยืนยันแล้ว",val:bookings.filter(b=>b.status==="confirmed").length,color:"#2d7a4f"},
+                  {label:"รอดำเนินการ",val:bookings.filter(b=>b.status==="reviewing"||b.status==="pending").length,color:"#e67e22"},
+                  {label:"รายได้",val:`฿${revenue.toLocaleString()}`,color:"var(--or)"},
+                ].map(({label,val,color}) => (
+                  <div key={label} style={{background:"#fff",borderRadius:12,padding:"14px",textAlign:"center",border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                    <p style={{fontSize:11,color:"var(--mu)",marginBottom:4}}>{label}</p>
+                    <p style={{fontSize:20,fontWeight:800,color}}>{val}</p>
+                  </div>
+                ))}
+              </div>
+              <div style={{display:"flex",gap:10,marginBottom:16}}>
+                <input type="date" value={date} onChange={e=>setDate(e.target.value)}
+                  style={{padding:"9px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                <button onClick={loadBookings} style={{padding:"9px 16px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
+              </div>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                {loading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                bookings.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่มีการจองในวันนี้</p> : (
+                  <table className="adm-table">
+                    <thead><tr><th>สนาม</th><th>เวลา</th><th>เบอร์</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                    <tbody>
+                      {bookings.map(b => {
+                        const st = stInfo(b.status);
+                        return (
+                          <tr key={b.id}>
+                            <td style={{fontWeight:700}}>Court {b.court_id}</td>
+                            <td>{String(b.hour).padStart(2,"0")}:00</td>
+                            <td>{b.customer_id}</td>
+                            <td style={{fontWeight:700,color:"var(--or)"}}>฿{b.price?.toLocaleString()}</td>
+                            <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
+                            <td><span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 8px",borderRadius:20}}>{st.text}</span></td>
+                            <td>
+                              {b.status!=="cancelled" && (
+                                <div style={{display:"flex",gap:6}}>
+                                  {b.status!=="confirmed" && <button onClick={()=>updateStatus(b.id,"confirmed")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>}
+                                  <button onClick={()=>updateStatus(b.id,"cancelled")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab==="discounts" && (
+            <div>
+              <div style={{background:"#fff",borderRadius:12,padding:20,marginBottom:20,border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                <p style={{fontWeight:700,color:"var(--br)",marginBottom:14}}>➕ สร้างรหัสส่วนลดใหม่</p>
+                <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:8,marginBottom:10}}>
+                  <input value={newCode} onChange={e=>setNewCode(e.target.value.toUpperCase())} placeholder="รหัส เช่น NOVA50"
+                    style={{padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  <button onClick={genCode} style={{padding:"0 14px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:13,cursor:"pointer"}}>🎲 สุ่ม</button>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>ส่วนลด (บาท)</label>
+                    <input type="number" value={newAmt} onChange={e=>setNewAmt(e.target.value)} min="1"
+                      style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>ใช้ได้กี่ครั้ง</label>
+                    <input type="number" value={newMax} onChange={e=>setNewMax(e.target.value)} min="1"
+                      style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                </div>
+                <button onClick={createCode} disabled={!newCode.trim()} style={{width:"100%",padding:"12px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                  สร้างรหัส
+                </button>
+              </div>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                <table className="adm-table">
+                  <thead><tr><th>รหัส</th><th>ส่วนลด</th><th>ใช้แล้ว/ทั้งหมด</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                  <tbody>
+                    {discounts.map(c => (
+                      <tr key={c.id}>
+                        <td style={{fontWeight:700,fontFamily:"monospace"}}>{c.code}</td>
+                        <td style={{fontWeight:700,color:"var(--or)"}}>฿{c.discount_amount||`${c.discount_percent}%`}</td>
+                        <td>{c.used_count}/{c.max_uses}</td>
+                        <td><span style={{fontSize:12,fontWeight:600,color:c.active?"#2d7a4f":"#c0392b",background:c.active?"rgba(45,122,79,.1)":"rgba(192,57,43,.1)",padding:"3px 8px",borderRadius:20}}>{c.active?"ใช้งานได้":"ปิดใช้งาน"}</span></td>
+                        <td><button onClick={()=>toggleDiscount(c.id,!c.active)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:c.active?"rgba(192,57,43,.1)":"rgba(45,122,79,.1)",color:c.active?"#c0392b":"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{c.active?"ปิด":"เปิด"}</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {tab==="customers" && (
+            <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+              <table className="adm-table">
+                <thead><tr><th>#</th><th>ชื่อ</th><th>เบอร์โทร</th></tr></thead>
+                <tbody>
+                  {customers.map((c,i) => (
+                    <tr key={c.customer_id}>
+                      <td style={{color:"var(--mu)"}}>{i+1}</td>
+                      <td style={{fontWeight:600}}>{c.customer_name}</td>
+                      <td style={{fontFamily:"monospace"}}>{c.customer_id}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
