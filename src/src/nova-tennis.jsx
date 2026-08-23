@@ -647,11 +647,8 @@ function CancelPage() {
     const now = new Date();
     const diffHours = (bookingDate - now) / (1000 * 60 * 60);
     if (diffHours < 0) { setMsg("❌ ไม่สามารถยกเลิกได้ เนื่องจากเลยเวลาแล้ว"); return; }
-    const confirmed = window.confirm(
-      diffHours >= 24
-        ? "ยืนยันการยกเลิก?\nคุณจะได้รับเงินคืนเต็มจำนวน"
-        : "ยืนยันการยกเลิก?\nเนื่องจากน้อยกว่า 24 ชม. จะมีค่าธรรมเนียม 50%"
-    );
+    if (diffHours < 24) { setMsg("❌ ไม่สามารถยกเลิกได้ เนื่องจากเหลือเวลาน้อยกว่า 24 ชั่วโมง"); return; }
+    const confirmed = window.confirm("ยืนยันการยกเลิก?\nคุณจะได้รับเงินคืนเต็มจำนวน");
     if (!confirmed) return;
     setCancelling(b.id);
     await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${b.id}`, {
@@ -700,7 +697,8 @@ function CancelPage() {
           const st = statusLabel(b.status);
           const bookingDate = new Date(b.booking_date + "T" + String(b.hour).padStart(2,"0") + ":00:00");
           const isPast = bookingDate < new Date();
-          const canCancel = b.status !== "cancelled" && !isPast;
+          const diffHours = (bookingDate - new Date()) / (1000 * 60 * 60);
+          const canCancel = b.status !== "cancelled" && !isPast && diffHours >= 24;
           return (
             <div key={b.id} className="card">
               <div style={{padding:"14px 16px"}}>
@@ -715,6 +713,11 @@ function CancelPage() {
                   <button onClick={() => handleCancel(b)} disabled={cancelling===b.id} style={{width:"100%",marginTop:10,padding:"11px",borderRadius:10,border:"1.5px solid #c0392b",background:"rgba(192,57,43,.08)",color:"#c0392b",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
                     {cancelling===b.id ? "⏳ กำลังยกเลิก..." : "❌ ยกเลิกการจอง"}
                   </button>
+                )}
+                {b.status !== "cancelled" && !isPast && diffHours < 24 && diffHours >= 0 && (
+                  <div style={{marginTop:10,padding:"9px 12px",borderRadius:10,background:"rgba(230,126,34,.1)",border:"1px solid #e67e22"}}>
+                    <p style={{fontSize:12,color:"#e67e22",fontWeight:600}}>⚠️ ไม่สามารถยกเลิกได้ เนื่องจากเหลือเวลาน้อยกว่า 24 ชั่วโมง</p>
+                  </div>
                 )}
               </div>
             </div>
