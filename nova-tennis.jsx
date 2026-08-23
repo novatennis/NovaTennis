@@ -735,13 +735,22 @@ export default function AppV2() {
   const [booking, setBooking] = useState(null);
   const [customer, setCustomer] = useState(null);
   const [adminLoggedIn, setAdminLoggedIn] = useState(false);
+  const [adminMode, setAdminMode] = useState(false);
   const [adminPw, setAdminPw] = useState("");
   const [adminErr, setAdminErr] = useState(false);
+  const [logoTaps, setLogoTaps] = useState(0);
   const ADMIN_PW = import.meta.env.VITE_ADMIN_PASSWORD || "nova2024";
-  const isAdmin = window.location.hash === "#admin";
   const goTab = (id) => { setTab(id); if(id==="book") setPage("booking"); };
 
-  if (isAdmin && !adminLoggedIn) return (
+  // กดโลโก้ 5 ครั้งเปิด Admin
+  const handleLogoTap = () => {
+    const next = logoTaps + 1;
+    setLogoTaps(next);
+    if (next >= 5) { setAdminMode(true); setLogoTaps(0); }
+    setTimeout(() => setLogoTaps(0), 3000);
+  };
+
+  if (adminMode && !adminLoggedIn) return (
     <>
       <style>{CSS}</style>
       <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(135deg,#663924,#3a1a0a)"}}>
@@ -757,15 +766,19 @@ export default function AppV2() {
             style={{width:"100%",padding:"13px",borderRadius:10,border:"none",background:"#663924",color:"#F47E1F",fontWeight:700,fontSize:15,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
             เข้าสู่ระบบ
           </button>
+          <button onClick={()=>{setAdminMode(false);setAdminPw("");}}
+            style={{marginTop:10,background:"none",border:"none",color:"var(--mu)",fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            ยกเลิก
+          </button>
         </div>
       </div>
     </>
   );
 
-  if (isAdmin && adminLoggedIn) return (
+  if (adminMode && adminLoggedIn) return (
     <>
       <style>{CSS}</style>
-      <AdminDashboard onLogout={()=>{setAdminLoggedIn(false);setAdminPw("");}} />
+      <AdminDashboard onLogout={()=>{setAdminLoggedIn(false);setAdminMode(false);setAdminPw("");}} />
     </>
   );
 
@@ -773,7 +786,7 @@ export default function AppV2() {
     <>
       <style>{CSS}</style>
       <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)"}}>
-        <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px"}}>
+        <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px",cursor:"pointer"}} onClick={handleLogoTap}>
           <NovaLogo width={100} />
         </header>
         <main>
