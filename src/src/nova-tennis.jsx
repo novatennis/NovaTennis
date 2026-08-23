@@ -334,10 +334,13 @@ function CheckoutPage({ booking, onCancel, onConfirm }) {
   const phoneOk = /^[0-9]{9,10}$/.test(phone);
   const ok = nameOk && phoneOk;
 
-  const finalPrice = discount
-    ? Math.round(slot.price * (1 - discount.discount_percent / 100))
-    : slot.price;
-  const discountAmount = slot.price - finalPrice;
+  const calcDiscount = (d) => {
+    if (!d) return 0;
+    if (d.discount_amount > 0) return d.discount_amount;
+    return Math.round(slot.price * d.discount_percent / 100);
+  };
+  const discountAmount = calcDiscount(discount);
+  const finalPrice = Math.max(0, slot.price - discountAmount);
 
   const handleCheckCode = async () => {
     if (!discountCode.trim()) return;
@@ -346,7 +349,9 @@ function CheckoutPage({ booking, onCancel, onConfirm }) {
     const result = await db.checkDiscount(discountCode.trim());
     if (result) {
       setDiscount(result);
-      setDiscountMsg(`✅ ส่วนลด ${result.discount_percent}% — ประหยัด ฿${Math.round(slot.price * result.discount_percent / 100)}`);
+      const saved = result.discount_amount > 0 ? result.discount_amount : Math.round(slot.price * result.discount_percent / 100);
+      const label = result.discount_amount > 0 ? `ส่วนลด ฿${result.discount_amount}` : `ส่วนลด ${result.discount_percent}%`;
+      setDiscountMsg(`✅ ${label} — ประหยัด ฿${saved}`);
     } else {
       setDiscount(null);
       setDiscountMsg("❌ รหัสส่วนลดไม่ถูกต้องหรือหมดอายุแล้ว");
@@ -363,7 +368,7 @@ function CheckoutPage({ booking, onCancel, onConfirm }) {
           <Row label="🎾 สนาม" val={court.courtName} />
           <Row label="📅 วันที่" val={fmtDate(date)} />
           <Row label="🕐 เวลา" val={slot.label} />
-          {discount && <Row label="🏷 ส่วนลด" val={`-฿${discountAmount.toLocaleString()} (${discount.discount_percent}%)`} />}
+          {discount && <Row label="🏷 ส่วนลด" val={`-฿${discountAmount.toLocaleString()}`} />}
           <div style={{borderTop:"1px solid var(--dv)",margin:"12px 0"}} />
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <span style={{fontWeight:700,color:"var(--br)",fontSize:15}}>ยอดชำระ</span>
