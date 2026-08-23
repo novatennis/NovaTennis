@@ -1,12 +1,4 @@
-<!DOCTYPE html>
-<html lang="th">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NOVA Tennis - Admin</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/admin.jsx"></script>
-  </body>
-</html>
+import { createRoot } from 'react-dom/client'
+import AdminApp from './src/AdminPage'
+
+createRoot(document.getElementById('root')).render(<AdminApp />)
