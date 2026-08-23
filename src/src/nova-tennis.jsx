@@ -591,7 +591,7 @@ function Dot({ color, label }) {
   );
 }
 
-export default function App() {
+function App() {
   const [tab, setTab] = useState("home");
   const [page, setPage] = useState("booking");
   const [booking, setBooking] = useState(null);
@@ -620,3 +620,148 @@ export default function App() {
     </>
   );
 }
+
+// ─── Cancel / Check Booking Page ─────────────────────────────────────────────
+function CancelPage() {
+  const [phone, setPhone] = useState("");
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [searched, setSearched] = useState(false);
+  const [cancelling, setCancelling] = useState(null);
+  const [msg, setMsg] = useState("");
+
+  const handleSearch = async () => {
+    if (!/^[0-9]{9,10}$/.test(phone)) return;
+    setLoading(true); setSearched(false); setMsg(""); setBookings([]);
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/bookings?customer_id=eq.${phone}&select=*&order=booking_date.desc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const data = await res.json();
+    setBookings(data || []);
+    setLoading(false); setSearched(true);
+  };
+
+  const handleCancel = async (b) => {
+    const bookingDate = new Date(b.booking_date + "T" + String(b.hour).padStart(2,"0") + ":00:00");
+    const now = new Date();
+    const diffHours = (bookingDate - now) / (1000 * 60 * 60);
+    if (diffHours < 0) { setMsg("❌ ไม่สามารถยกเลิกได้ เนื่องจากเลยเวลาแล้ว"); return; }
+    const confirmed = window.confirm(
+      diffHours >= 24
+        ? "ยืนยันการยกเลิก?\nคุณจะได้รับเงินคืนเต็มจำนวน"
+        : "ยืนยันการยกเลิก?\nเนื่องจากน้อยกว่า 24 ชม. จะมีค่าธรรมเนียม 50%"
+    );
+    if (!confirmed) return;
+    setCancelling(b.id);
+    await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${b.id}`, {
+      method: "PATCH",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "cancelled" }),
+    });
+    setBookings(prev => prev.map(x => x.id === b.id ? { ...x, status: "cancelled" } : x));
+    setCancelling(null);
+    setMsg("✅ ยกเลิกการจองเรียบร้อยแล้ว");
+  };
+
+  const statusLabel = (s) => {
+    if (s === "cancelled") return { text: "ยกเลิกแล้ว", color: "#c0392b" };
+    if (s === "reviewing") return { text: "รอตรวจสอบสลิป", color: "#e67e22" };
+    if (s === "confirmed") return { text: "ยืนยันแล้ว", color: "#2d7a4f" };
+    return { text: "รอชำระเงิน", color: "var(--mu)" };
+  };
+
+  return (
+    <div style={{padding:"20px 16px 100px"}} className="fu">
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:20}}>การจองของฉัน</h2>
+      <div style={{display:"flex",gap:8,marginBottom:20}}>
+        <input value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))}
+          placeholder="กรอกเบอร์โทรของคุณ" inputMode="numeric"
+          style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
+        <button onClick={handleSearch} disabled={loading || phone.length < 9} style={{padding:"0 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
+          {loading ? "..." : "ค้นหา"}
+        </button>
+      </div>
+
+      {msg && (
+        <div style={{background:msg.startsWith("✅")?"rgba(45,122,79,.1)":"rgba(192,57,43,.1)",borderRadius:10,padding:"10px 14px",marginBottom:16,border:`1px solid ${msg.startsWith("✅")?"#2d7a4f":"#c0392b"}`}}>
+          <p style={{fontSize:13,color:msg.startsWith("✅")?"#2d7a4f":"#c0392b",fontWeight:600}}>{msg}</p>
+        </div>
+      )}
+
+      {searched && bookings.length === 0 && (
+        <div style={{background:"#fff",borderRadius:"var(--r)",padding:"24px",textAlign:"center",border:"1px solid var(--dv)"}}>
+          <p style={{color:"var(--mu)"}}>ไม่พบการจองสำหรับเบอร์นี้</p>
+        </div>
+      )}
+
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {bookings.map(b => {
+          const st = statusLabel(b.status);
+          const bookingDate = new Date(b.booking_date + "T" + String(b.hour).padStart(2,"0") + ":00:00");
+          const isPast = bookingDate < new Date();
+          const canCancel = b.status !== "cancelled" && !isPast;
+          return (
+            <div key={b.id} className="card">
+              <div style={{padding:"14px 16px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                  <span style={{fontWeight:700,color:"var(--br)",fontSize:15}}>Court {b.court_id}</span>
+                  <span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 10px",borderRadius:20}}>{st.text}</span>
+                </div>
+                <Row label="📅 วันที่" val={new Date(b.booking_date).toLocaleDateString("th-TH",{year:"numeric",month:"long",day:"numeric"})} />
+                <Row label="🕐 เวลา" val={`${String(b.hour).padStart(2,"0")}:00 – ${String(b.hour).padStart(2,"0")}:59`} />
+                <Row label="💰 ราคา" val={`฿${b.price?.toLocaleString()}`} />
+                {canCancel && (
+                  <button onClick={() => handleCancel(b)} disabled={cancelling===b.id} style={{width:"100%",marginTop:10,padding:"11px",borderRadius:10,border:"1.5px solid #c0392b",background:"rgba(192,57,43,.08)",color:"#c0392b",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                    {cancelling===b.id ? "⏳ กำลังยกเลิก..." : "❌ ยกเลิกการจอง"}
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ─── App V2 with Cancel Tab ───────────────────────────────────────────────────
+export default function AppV2() {
+  const [tab, setTab] = useState("home");
+  const [page, setPage] = useState("booking");
+  const [booking, setBooking] = useState(null);
+  const [customer, setCustomer] = useState(null);
+  const goTab = (id) => { setTab(id); if(id==="book") setPage("booking"); };
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)"}}>
+        <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px"}}>
+          <NovaLogo width={100} />
+        </header>
+        <main>
+          {tab==="home" && <HomePage goBook={() => goTab("book")} />}
+          {tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} />}
+          {tab==="book" && page==="checkout" && booking && (
+            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} />
+          )}
+          {tab==="book" && page==="payment" && booking && customer && (
+            <PaymentPage booking={booking} customer={customer} onDone={() => { setBooking(null); setCustomer(null); setPage("booking"); goTab("home"); }} />
+          )}
+          {tab==="cancel" && <CancelPage />}
+        </main>
+        <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:200,backgroundColor:"#fff",borderTop:"1px solid var(--dv)",display:"flex",boxShadow:"0 -3px 16px rgba(102,57,36,0.07)"}}>
+          {[["home","🏠","หน้าแรก"],["book","📅","จองสนาม"],["cancel","🔍","การจองของฉัน"]].map(([id,icon,label]) => (
+            <button key={id} onClick={() => goTab(id)} style={{flex:1,padding:"11px 0 8px",background:"none",border:"none",borderTop:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+              <span style={{fontSize:19}}>{icon}</span>
+              <span style={{fontSize:10,fontWeight:tab===id?700:400}}>{label}</span>
+            </button>
+          ))}
+        </nav>
+      </div>
+    </>
+  );
+}
+
+// Use AppV2 as the default export (has cancel tab)
