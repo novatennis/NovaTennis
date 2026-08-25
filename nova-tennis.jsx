@@ -157,7 +157,7 @@ const T = {
   }
 };
 
-
+function NovaLogo({ width }) {
   return (
     <svg width={width} viewBox="0 0 320 100" fill="none" xmlns="http://www.w3.org/2000/svg">
       <line x1="170" y1="22" x2="210" y2="13" stroke="#F47E1F" strokeWidth="3" strokeLinecap="round"/>
