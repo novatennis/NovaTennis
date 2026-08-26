@@ -463,7 +463,13 @@ function CheckoutPage({ booking, onCancel, onConfirm }) {
 
       <div style={{display:"flex",gap:12}}>
         <button onClick={onCancel} style={{flex:1,padding:"14px",borderRadius:"var(--r)",border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:15,cursor:"pointer"}}>ยกเลิก</button>
-        <button disabled={!ok} onClick={() => onConfirm({name:name.trim(),phone,discount,finalPrice,discountAmount})} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:ok?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:ok?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:ok?"pointer":"not-allowed"}}>ยืนยัน ✓</button>
+        <button disabled={!ok} onClick={() => {
+          if (discount) {
+            const confirmed = window.confirm("การใช้โค้ดส่วนลด หากกดดำเนินการต่อแล้วจะไม่สามารถใช้โค้ดนี้ซ้ำได้อีก");
+            if (!confirmed) return;
+          }
+          onConfirm({name:name.trim(),phone,discount,finalPrice,discountAmount});
+        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:ok?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:ok?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:ok?"pointer":"not-allowed"}}>ยืนยัน ✓</button>
       </div>
     </div>
   );
