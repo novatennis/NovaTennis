@@ -103,7 +103,61 @@ const CSS = `
   .fu { animation:fu .3s ease both; }
 `;
 
-function NovaLogo({ width = 160 }) {
+// ─── Translations ─────────────────────────────────────────────────────────────
+const T = {
+  th: {
+    bookNow: "จองสนามเลย →", home: "หน้าแรก", book: "จองสนาม",
+    selectDate: "เลือกวันที่", selectCourt: "เลือกสนาม", selectTime: "เลือกช่วงเวลา",
+    proceed: "ดำเนินการต่อ →", confirm: "ยืนยันการจอง", cancel: "ยกเลิก",
+    name: "ชื่อ-นามสกุล (ไม่เกิน 16 ตัว)", phone: "เบอร์โทรศัพท์",
+    discount: "🏷 รหัสส่วนลด (ถ้ามี)", useCode: "ใช้โค้ด",
+    payment: "ชำระเงิน", scanQR: "สแกน QR Code ชำระผ่าน PromptPay",
+    transfer: "โอนให้ถูกต้อง", bookingDetail: "รายละเอียดการจอง",
+    court: "สนาม", date: "วันที่", time: "เวลา", price: "ยอดชำระ",
+    total: "ยอดชำระ", payDone: "ชำระเงินแล้ว / กลับหน้าหลัก",
+    uploadSlip: "📎 แนบสลิปการโอนเงิน", selectSlip: "📷 เลือกรูปสลิป",
+    changeSlip: "🔄 เปลี่ยนรูปสลิป", sendSlip: "✅ ส่งสลิป",
+    sending: "⏳ กำลังส่ง...", slipSent: "✅ ส่งสลิปเรียบร้อยแล้ว",
+    slipSentDesc: "ทีมงานจะตรวจสอบและยืนยันการจองของท่าน",
+    noSlot: "😔 ไม่มีช่วงเวลาว่างในวันนี้",
+    selectDateFirst: "กรุณาเลือกวันที่และสนามก่อน",
+    confirmBooking: "ยืนยัน ✓", morningPrice: "ช่วงเช้า", eveningPrice: "ช่วงบ่าย-เย็น",
+    steps: "ขั้นตอนการชำระเงิน", contactUs: "ติดต่อเรา",
+    rules: "กฎระเบียบสนาม", cancelPolicy: "นโยบายการยกเลิก",
+    bookingCondition: "เงื่อนไขการจอง", priceTitle: "💰 ราคาค่าสนาม",
+    indoor: "สนามในร่ม • ปรับอากาศ", saveDiscount: "ประหยัดไป",
+    timeExpired: "หมดเวลา", payWithin: "กรุณาชำระภายใน",
+    invalidCode: "❌ รหัสส่วนลดไม่ถูกต้องหรือหมดอายุแล้ว",
+    contactLine: "กรุณาติดต่อยกเลิกผ่าน Line หรือโทรศัพท์",
+  },
+  en: {
+    bookNow: "Book Now →", home: "Home", book: "Book",
+    selectDate: "Select Date", selectCourt: "Select Court", selectTime: "Select Time Slot",
+    proceed: "Continue →", confirm: "Confirm Booking", cancel: "Cancel",
+    name: "Full Name (max 16 chars)", phone: "Phone Number",
+    discount: "🏷 Discount Code (optional)", useCode: "Apply",
+    payment: "Payment", scanQR: "Scan QR Code via PromptPay",
+    transfer: "Transfer exact amount", bookingDetail: "Booking Details",
+    court: "Court", date: "Date", time: "Time", price: "Total",
+    total: "Total", payDone: "Payment Done / Back to Home",
+    uploadSlip: "📎 Upload Payment Slip", selectSlip: "📷 Select Slip Image",
+    changeSlip: "🔄 Change Slip", sendSlip: "✅ Send Slip",
+    sending: "⏳ Sending...", slipSent: "✅ Slip Submitted Successfully",
+    slipSentDesc: "Our team will verify and confirm your booking.",
+    noSlot: "😔 No available slots today",
+    selectDateFirst: "Please select a date and court first",
+    confirmBooking: "Confirm ✓", morningPrice: "Morning", eveningPrice: "Afternoon-Evening",
+    steps: "Payment Steps", contactUs: "Contact Us",
+    rules: "Court Rules", cancelPolicy: "Cancellation Policy",
+    bookingCondition: "Booking Conditions", priceTitle: "💰 Court Rates",
+    indoor: "Indoor Court • Air-conditioned", saveDiscount: "You save",
+    timeExpired: "Time Expired", payWithin: "Please pay within",
+    invalidCode: "❌ Invalid or expired discount code",
+    contactLine: "Please contact us via Line or Phone to cancel",
+  }
+};
+
+function NovaLogo({ width }) {
   return (
     <svg width={width} viewBox="0 0 320 100" fill="none" xmlns="http://www.w3.org/2000/svg">
       <line x1="170" y1="22" x2="210" y2="13" stroke="#F47E1F" strokeWidth="3" strokeLinecap="round"/>
@@ -142,40 +196,42 @@ function TabBar({ tab, setTab }) {
   );
 }
 
-function HomePage({ goBook }) {
+function HomePage({ goBook, lang="th" }) {
+  const t = T[lang];
+  const cards = [
+    {icon:"📋",title:t.bookingCondition,items:lang==="th"?["จองล่วงหน้าได้สูงสุด 7 วัน","ชำระเงินภายใน 5 นาทีหลังยืนยัน","1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)"]:["Book up to 7 days in advance","Pay within 5 minutes after confirming","1 booking = 1 time slot (1 hour)"]},
+    {icon:"❌",title:t.cancelPolicy,items:lang==="th"?["ยกเลิกผ่าน Line หรือโทรศัพท์เท่านั้น","ยกเลิกก่อน 24 ชม. — คืนเงินเต็มจำนวน","ยกเลิกภายใน 24 ชม. — หักค่าธรรมเนียม 50%"]:["Cancel via Line or Phone only","Cancel 24h+ before — Full refund","Cancel within 24h — 50% fee"]},
+    {icon:"🎾",title:t.rules,items:lang==="th"?["แต่งกายด้วยชุดกีฬาเท่านั้น","ห้ามนำอาหารและเครื่องดื่มเข้าสนาม","กรุณาตรงต่อเวลา ไม่สามารถขยายเวลาได้"]:["Sportswear required","No food or drinks on court","Please be punctual, no time extension"]},
+    {icon:"📞",title:t.contactUs,items:["โทร: 063-146-5997","Map: novatennis",lang==="th"?"เปิดทำการ 06:00–22:00 น. ทุกวัน":"Open daily 06:00–22:00"]},
+  ];
   return (
     <div style={{paddingBottom:90}}>
       <div style={{background:"linear-gradient(160deg,#fff 0%,var(--cr) 55%,var(--cr2) 100%)",padding:"36px 24px 0",textAlign:"center"}}>
         <NovaLogo width={180} />
-        <p style={{color:"var(--mu)",fontSize:13.5,margin:"8px 0 4px"}}>สนามเทนนิสในร่ม • ระบบปรับอากาศ • พร้อมรองรับทุกระดับ</p>
+        <p style={{color:"var(--mu)",fontSize:13.5,margin:"8px 0 4px"}}>{lang==="th"?"สนามเทนนิสในร่ม • ระบบปรับอากาศ • พร้อมรองรับทุกระดับ":"Indoor Tennis Court • Air Conditioned • All Levels Welcome"}</p>
         <CourtLines />
       </div>
       <div style={{padding:"0 16px",marginTop:-2}}>
-        <button className="btn-primary" onClick={goBook}>จองสนามเลย →</button>
+        <button className="btn-primary" onClick={goBook}>{t.bookNow}</button>
       </div>
       <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
         <div className="card">
-          <div className="card-header"><p>💰 ราคาค่าสนาม</p></div>
+          <div className="card-header"><p>{t.priceTitle}</p></div>
           <div style={{display:"flex",padding:"16px 18px",gap:12}}>
             <div style={{flex:1,textAlign:"center"}}>
-              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>ช่วงเช้า</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>{t.morningPrice}</p>
               <p style={{fontSize:28,fontWeight:800,color:"var(--or)",lineHeight:1}}>฿490</p>
               <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>06:00–12:59</p>
             </div>
             <div style={{width:1,background:"var(--dv)"}} />
             <div style={{flex:1,textAlign:"center"}}>
-              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>ช่วงบ่าย-เย็น</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>{t.eveningPrice}</p>
               <p style={{fontSize:28,fontWeight:800,color:"var(--bl)",lineHeight:1}}>฿590</p>
               <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>13:00–22:59</p>
             </div>
           </div>
         </div>
-        {[
-          {icon:"📋",title:"เงื่อนไขการจอง",items:["จองล่วงหน้าได้สูงสุด 7 วัน","ชำระเงินภายใน 5 นาทีหลังยืนยัน","1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)"]},
-          {icon:"❌",title:"นโยบายการยกเลิก",items:["ยกเลิกก่อน 24 ชม. — คืนเงินเต็มจำนวน","ยกเลิกภายใน 24 ชม. — หักค่าธรรมเนียม 50%","No-show — ไม่คืนเงิน"]},
-          {icon:"🎾",title:"กฎระเบียบสนาม",items:["แต่งกายด้วยชุดกีฬาเท่านั้น","ห้ามนำอาหารและเครื่องดื่มเข้าสนาม","กรุณาตรงต่อเวลา ไม่สามารถขยายเวลาได้"]},
-          {icon:"📞",title:"ติดต่อเรา",items:["โทร: 063-146-5997","Map: novatennis","เปิดทำการ 06:00–22:00 น. ทุกวัน"]},
-        ].map(({icon,title,items}) => (
+        {cards.map(({icon,title,items}) => (
           <div key={title} className="card">
             <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
               <span style={{fontSize:17}}>{icon}</span>
@@ -407,7 +463,13 @@ function CheckoutPage({ booking, onCancel, onConfirm }) {
 
       <div style={{display:"flex",gap:12}}>
         <button onClick={onCancel} style={{flex:1,padding:"14px",borderRadius:"var(--r)",border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:15,cursor:"pointer"}}>ยกเลิก</button>
-        <button disabled={!ok} onClick={() => onConfirm({name:name.trim(),phone,discount,finalPrice,discountAmount})} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:ok?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:ok?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:ok?"pointer":"not-allowed"}}>ยืนยัน ✓</button>
+        <button disabled={!ok} onClick={() => {
+          if (discount) {
+            const confirmed = window.confirm("การใช้โค้ดส่วนลด หากกดดำเนินการต่อแล้วจะไม่สามารถใช้โค้ดนี้ซ้ำได้อีก");
+            if (!confirmed) return;
+          }
+          onConfirm({name:name.trim(),phone,discount,finalPrice,discountAmount});
+        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:ok?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:ok?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:ok?"pointer":"not-allowed"}}>ยืนยัน ✓</button>
       </div>
     </div>
   );
@@ -474,6 +536,19 @@ function PaymentPage({ booking, customer, onDone }) {
     if (url) {
       await db.updateSlip(bookingId, url);
       setUploaded(true);
+      // แจ้งเตือนแอดมินผ่าน LINE (ไม่บล็อกการทำงานหลักถ้าแจ้งเตือนล้มเหลว)
+      fetch("/api/notify-admin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          courtName: court.courtName,
+          date: fmtDate(date),
+          time: slot.label,
+          price: finalPrice,
+          name: customer.name,
+          phone: customer.phone,
+        }),
+      }).catch(() => {});
     }
     setUploading(false);
   };
@@ -531,14 +606,10 @@ function PaymentPage({ booking, customer, onDone }) {
                 <img src={slipPreview} alt="slip" style={{width:"100%",borderRadius:10,marginBottom:12,maxHeight:200,objectFit:"cover"}} />
               )}
               <input ref={fileRef} type="file" accept="image/*" onChange={handleSlipChange} style={{display:"none"}} />
-              <button onClick={() => fileRef.current.click()} style={{width:"100%",padding:"12px",borderRadius:10,border:"1.5px dashed var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:600,fontSize:14,cursor:"pointer",marginBottom:slip?10:0,fontFamily:"'Noto Sans Thai',sans-serif"}}>
+              <button onClick={() => fileRef.current.click()} style={{width:"100%",padding:"12px",borderRadius:10,border:"1.5px dashed var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:600,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
                 {slip ? "🔄 เปลี่ยนรูปสลิป" : "📷 เลือกรูปสลิป"}
               </button>
-              {slip && (
-                <button onClick={handleUpload} disabled={uploading} style={{width:"100%",padding:"12px",borderRadius:10,border:"none",background:uploading?"var(--cr2)":"var(--br)",color:uploading?"var(--mu)":"var(--or)",fontWeight:700,fontSize:14,cursor:uploading?"not-allowed":"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
-                  {uploading ? "⏳ กำลังส่ง..." : "✅ ส่งสลิป"}
-                </button>
-              )}
+              {!slip && <p style={{fontSize:12,color:"var(--mu)",marginTop:8,textAlign:"center"}}>กรุณาเลือกรูปสลิปก่อนกดปุ่ม "ส่งสลิป" ด้านล่าง</p>}
             </>
           )}
         </div>
@@ -559,7 +630,13 @@ function PaymentPage({ booking, customer, onDone }) {
         </div>
       </div>
 
-      <button className="btn-primary" onClick={onDone}>กลับหน้าหลัก</button>
+      {uploaded ? (
+        <button className="btn-primary" onClick={onDone}>กลับหน้าหลัก</button>
+      ) : (
+        <button className="btn-primary" disabled={!slip || uploading} onClick={handleUpload} style={{opacity:(!slip||uploading)?0.6:1,cursor:(!slip||uploading)?"not-allowed":"pointer"}}>
+          {uploading ? "⏳ กำลังส่ง..." : "✅ ส่งสลิป"}
+        </button>
+      )}
     </div>
   );
 }
@@ -663,8 +740,8 @@ function CancelPage() {
 
   const statusLabel = (s) => {
     if (s === "cancelled") return { text: "ยกเลิกแล้ว", color: "#c0392b" };
-    if (s === "reviewing") return { text: "รอตรวจสอบสลิป", color: "#e67e22" };
-    if (s === "confirmed") return { text: "ยืนยันแล้ว", color: "#2d7a4f" };
+    if (s === "reviewing") return { text: "รอการตรวจสอบ", color: "#e67e22" };
+    if (s === "confirmed") return { text: "การจองสำเร็จ", color: "#2d7a4f" };
     return { text: "รอชำระเงิน", color: "var(--mu)" };
   };
 
@@ -739,6 +816,7 @@ export default function AppV2() {
   const [adminPw, setAdminPw] = useState("");
   const [adminErr, setAdminErr] = useState(false);
   const [logoTaps, setLogoTaps] = useState(0);
+  const [lang, setLang] = useState("th");
   const ADMIN_PW = import.meta.env.VITE_ADMIN_PASSWORD || "nova2024";
   const goTab = (id) => { setTab(id); if(id==="book") setPage("booking"); };
 
@@ -786,22 +864,29 @@ export default function AppV2() {
     <>
       <style>{CSS}</style>
       <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)"}}>
-        <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px",cursor:"pointer"}} onClick={handleLogoTap}>
+        <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={handleLogoTap}>
           <NovaLogo width={100} />
+          <div onClick={e=>e.stopPropagation()} style={{display:"flex",gap:4}}>
+            {["th","en"].map(l => (
+              <button key={l} onClick={()=>setLang(l)} style={{padding:"5px 10px",borderRadius:8,border:"1.5px solid var(--dv)",background:lang===l?"var(--br)":"#fff",color:lang===l?"var(--or)":"var(--mu)",fontWeight:lang===l?700:400,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {l==="th"?"🇹🇭 TH":"🇬🇧 EN"}
+              </button>
+            ))}
+          </div>
         </header>
         <main>
-          {tab==="home" && <HomePage goBook={() => goTab("book")} />}
-          {tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} />}
+          {tab==="home" && <HomePage goBook={() => goTab("book")} lang={lang} />}
+          {tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} lang={lang} />}
           {tab==="book" && page==="checkout" && booking && (
-            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} />
+            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} lang={lang} />
           )}
           {tab==="book" && page==="payment" && booking && customer && (
-            <PaymentPage booking={booking} customer={customer} onDone={() => { setBooking(null); setCustomer(null); setPage("booking"); goTab("home"); }} />
+            <PaymentPage booking={booking} customer={customer} onDone={() => { setBooking(null); setCustomer(null); setPage("booking"); goTab("home"); }} lang={lang} />
           )}
           {tab==="cancel" && <CancelPage />}
         </main>
         <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:200,backgroundColor:"#fff",borderTop:"1px solid var(--dv)",display:"flex",boxShadow:"0 -3px 16px rgba(102,57,36,0.07)"}}>
-          {[["home","🏠","หน้าแรก"],["book","📅","จองสนาม"],["cancel","🔍","การจองของฉัน"]].map(([id,icon,label]) => (
+          {[["home","🏠",lang==="th"?"หน้าแรก":"Home"],["book","📅",lang==="th"?"จองสนาม":"Book"]].map(([id,icon,label]) => (
             <button key={id} onClick={() => goTab(id)} style={{flex:1,padding:"11px 0 8px",background:"none",border:"none",borderTop:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
               <span style={{fontSize:19}}>{icon}</span>
               <span style={{fontSize:10,fontWeight:tab===id?700:400}}>{label}</span>
@@ -848,6 +933,11 @@ function AdminDashboard({ onLogout }) {
   useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); }, [tab]);
 
   const updateStatus = async (id, status) => {
+    const msg = status === "confirmed"
+      ? "ยืนยันการจองนี้ใช่หรือไม่? สถานะจะเปลี่ยนเป็น \"การจองสำเร็จ\""
+      : "ยกเลิกการจองนี้ใช่หรือไม่? การกระทำนี้ไม่สามารถย้อนกลับได้";
+    const confirmed = window.confirm(msg);
+    if (!confirmed) return;
     await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${id}`, {
       method: "PATCH",
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
@@ -881,9 +971,9 @@ function AdminDashboard({ onLogout }) {
   };
 
   const stInfo = (s) => {
-    if(s==="confirmed") return {text:"✅ ยืนยัน", color:"#2d7a4f"};
+    if(s==="confirmed") return {text:"✅ การจองสำเร็จ", color:"#2d7a4f"};
     if(s==="cancelled") return {text:"❌ ยกเลิก", color:"#c0392b"};
-    if(s==="reviewing") return {text:"🔍 รอตรวจสลิป", color:"#e67e22"};
+    if(s==="reviewing") return {text:"🔍 รอการตรวจสอบ", color:"#e67e22"};
     return {text:"⏳ รอชำระ", color:"var(--mu)"};
   };
 
