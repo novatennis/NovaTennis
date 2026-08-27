@@ -536,6 +536,19 @@ function PaymentPage({ booking, customer, onDone }) {
     if (url) {
       await db.updateSlip(bookingId, url);
       setUploaded(true);
+      // แจ้งเตือนแอดมินผ่าน LINE (ไม่บล็อกการทำงานหลักถ้าแจ้งเตือนล้มเหลว)
+      fetch("/api/notify-admin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          courtName: court.courtName,
+          date: fmtDate(date),
+          time: slot.label,
+          price: finalPrice,
+          name: customer.name,
+          phone: customer.phone,
+        }),
+      }).catch(() => {});
     }
     setUploading(false);
   };
@@ -593,14 +606,10 @@ function PaymentPage({ booking, customer, onDone }) {
                 <img src={slipPreview} alt="slip" style={{width:"100%",borderRadius:10,marginBottom:12,maxHeight:200,objectFit:"cover"}} />
               )}
               <input ref={fileRef} type="file" accept="image/*" onChange={handleSlipChange} style={{display:"none"}} />
-              <button onClick={() => fileRef.current.click()} style={{width:"100%",padding:"12px",borderRadius:10,border:"1.5px dashed var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:600,fontSize:14,cursor:"pointer",marginBottom:slip?10:0,fontFamily:"'Noto Sans Thai',sans-serif"}}>
+              <button onClick={() => fileRef.current.click()} style={{width:"100%",padding:"12px",borderRadius:10,border:"1.5px dashed var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:600,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
                 {slip ? "🔄 เปลี่ยนรูปสลิป" : "📷 เลือกรูปสลิป"}
               </button>
-              {slip && (
-                <button onClick={handleUpload} disabled={uploading} style={{width:"100%",padding:"12px",borderRadius:10,border:"none",background:uploading?"var(--cr2)":"var(--br)",color:uploading?"var(--mu)":"var(--or)",fontWeight:700,fontSize:14,cursor:uploading?"not-allowed":"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
-                  {uploading ? "⏳ กำลังส่ง..." : "✅ ส่งสลิป"}
-                </button>
-              )}
+              {!slip && <p style={{fontSize:12,color:"var(--mu)",marginTop:8,textAlign:"center"}}>กรุณาเลือกรูปสลิปก่อนกดปุ่ม "ส่งสลิป" ด้านล่าง</p>}
             </>
           )}
         </div>
@@ -621,7 +630,13 @@ function PaymentPage({ booking, customer, onDone }) {
         </div>
       </div>
 
-      <button className="btn-primary" onClick={onDone}>กลับหน้าหลัก</button>
+      {uploaded ? (
+        <button className="btn-primary" onClick={onDone}>กลับหน้าหลัก</button>
+      ) : (
+        <button className="btn-primary" disabled={!slip || uploading} onClick={handleUpload} style={{opacity:(!slip||uploading)?0.6:1,cursor:(!slip||uploading)?"not-allowed":"pointer"}}>
+          {uploading ? "⏳ กำลังส่ง..." : "✅ ส่งสลิป"}
+        </button>
+      )}
     </div>
   );
 }
@@ -725,8 +740,8 @@ function CancelPage() {
 
   const statusLabel = (s) => {
     if (s === "cancelled") return { text: "ยกเลิกแล้ว", color: "#c0392b" };
-    if (s === "reviewing") return { text: "รอตรวจสอบสลิป", color: "#e67e22" };
-    if (s === "confirmed") return { text: "ยืนยันแล้ว", color: "#2d7a4f" };
+    if (s === "reviewing") return { text: "รอการตรวจสอบ", color: "#e67e22" };
+    if (s === "confirmed") return { text: "การจองสำเร็จ", color: "#2d7a4f" };
     return { text: "รอชำระเงิน", color: "var(--mu)" };
   };
 
@@ -918,6 +933,11 @@ function AdminDashboard({ onLogout }) {
   useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); }, [tab]);
 
   const updateStatus = async (id, status) => {
+    const msg = status === "confirmed"
+      ? "ยืนยันการจองนี้ใช่หรือไม่? สถานะจะเปลี่ยนเป็น \"การจองสำเร็จ\""
+      : "ยกเลิกการจองนี้ใช่หรือไม่? การกระทำนี้ไม่สามารถย้อนกลับได้";
+    const confirmed = window.confirm(msg);
+    if (!confirmed) return;
     await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${id}`, {
       method: "PATCH",
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
@@ -951,9 +971,9 @@ function AdminDashboard({ onLogout }) {
   };
 
   const stInfo = (s) => {
-    if(s==="confirmed") return {text:"✅ ยืนยัน", color:"#2d7a4f"};
+    if(s==="confirmed") return {text:"✅ การจองสำเร็จ", color:"#2d7a4f"};
     if(s==="cancelled") return {text:"❌ ยกเลิก", color:"#c0392b"};
-    if(s==="reviewing") return {text:"🔍 รอตรวจสลิป", color:"#e67e22"};
+    if(s==="reviewing") return {text:"🔍 รอการตรวจสอบ", color:"#e67e22"};
     return {text:"⏳ รอชำระ", color:"var(--mu)"};
   };
 
