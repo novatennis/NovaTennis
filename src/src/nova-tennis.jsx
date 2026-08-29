@@ -79,7 +79,15 @@ const TIME_SLOTS = Array.from({ length: 17 }, (_, i) => {
   return { hour: h, label: `${String(h).padStart(2,"0")}:00 – ${String(h).padStart(2,"0")}:59`, price: h < 13 ? 490 : 590, peak: h >= 13 };
 });
 
-const toIso = (d) => d ? d.toISOString().split("T")[0] : "";
+// ใช้วันที่ตามเวลาท้องถิ่น (ไม่ใช่ UTC) เพื่อไม่ให้วันที่คลาดเคลื่อนตอนใกล้เที่ยงคืน
+// (toISOString() แปลงเป็น UTC ก่อน ซึ่งประเทศไทย (+7) จะทำให้วันที่เพี้ยนไป 1 วันได้)
+const toIso = (d) => {
+  if (!d) return "";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+};
 const fmtDate = (d, lang="th") => d ? d.toLocaleDateString(lang==="th"?"th-TH":"en-GB", { weekday: "short", year: "numeric", month: "short", day: "numeric" }) : "";
 
 // ─── Payment info (ใช้ QR จริงของร้าน) ─────────────────────────────────────────
@@ -961,7 +969,7 @@ function AdminDashboard({ onLogout }) {
   const [discounts, setDiscounts] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [date, setDate] = useState(new Date().toISOString().split("T")[0]);
+  const [date, setDate] = useState(toIso(new Date()));
   const [newCode, setNewCode] = useState("");
   const [newAmt, setNewAmt] = useState("50");
   const [newMax, setNewMax] = useState("1");
@@ -969,9 +977,9 @@ function AdminDashboard({ onLogout }) {
   // รายงานสรุปยอด
   const [reportFrom, setReportFrom] = useState(() => {
     const d = new Date(); d.setDate(d.getDate()-6);
-    return d.toISOString().split("T")[0];
+    return toIso(d);
   });
-  const [reportTo, setReportTo] = useState(new Date().toISOString().split("T")[0]);
+  const [reportTo, setReportTo] = useState(toIso(new Date()));
   const [reportRows, setReportRows] = useState([]);
   const [reportLoading, setReportLoading] = useState(false);
 
