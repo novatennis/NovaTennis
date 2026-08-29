@@ -537,7 +537,7 @@ function PaymentPage({ booking, customer, onDone }) {
       await db.updateSlip(bookingId, url);
       setUploaded(true);
       // แจ้งเตือนแอดมินผ่าน LINE (ไม่บล็อกการทำงานหลักถ้าแจ้งเตือนล้มเหลว)
-      fetch("/api/notify-admin", {
+      fetch("/api/notify-admin-telegram", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
