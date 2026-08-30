@@ -303,7 +303,7 @@ function HomePage({ goBook, lang="th" }) {
               <span style={{fontSize:13}}>🔥</span>
               <span style={{fontSize:11.5,fontWeight:700,letterSpacing:.3}}>{lang==="th"?"โปรโมชั่นเปิดตัว · เดือนแรก":"Launch Promo · First Month"}</span>
             </div>
-            <p className="bb" style={{fontSize:26,lineHeight:1.15,marginBottom:4}}>{lang==="th"?"ลดพิเศษต้อนรับเปิดสนาม!":"Special Opening Discount!"}</p>
+            <p className="bb" style={{fontSize:30,lineHeight:1.1,marginBottom:6,letterSpacing:.3}}>{lang==="th"?"Promotion Soft Opening ราคาพิเศษ":"Promotion Soft Opening — Special Price"}</p>
             <p style={{fontSize:12.5,opacity:.85,marginBottom:16}}>{lang==="th"?"Soft Opening · 1 ก.ย. 2569 – 30 ก.ย. 2569 เท่านั้น":"Soft Opening · 1 Sep 2026 – 30 Sep 2026 only"}</p>
             <div style={{display:"flex",gap:10,marginBottom:14}}>
               <div style={{flex:1,background:"rgba(255,255,255,.14)",borderRadius:12,padding:"12px 10px",textAlign:"center"}}>
@@ -478,7 +478,9 @@ function BookingPage({ onProceed, lang="th" }) {
   // ตัดช่วงเวลาที่ถูกจองแล้วออก และตัดช่วงเวลาที่ผ่านไปแล้ว (ถ้าเป็นวันนี้)
   const isToday = date && toIso(date) === toIso(new Date());
   const currentHour = new Date().getHours();
-  const availableSlots = TIME_SLOT_HOURS
+  // ช่วง 1–4 ก.ย. 2569: Court 2 ยังไม่เปิดให้บริการจริง แต่แสดงผลเหมือนถูกจองเต็มแล้ว (ไม่แจ้งเหตุผลให้ลูกค้าเห็น)
+  const court2NotYetOpen = court?.courtId === 2 && isCourt2Restricted(date);
+  const availableSlots = court2NotYetOpen ? [] : TIME_SLOT_HOURS
     .filter(hour => {
       if (bookedHours.includes(hour)) return false;
       if (isToday && hour <= currentHour) return false;
@@ -493,12 +495,7 @@ function BookingPage({ onProceed, lang="th" }) {
     <div style={{padding:"20px 16px 100px",display:"flex",flexDirection:"column",gap:22}} className="fu">
       <section>
         <StepHead n="1" label={t.selectDate} />
-        <Calendar selected={date} onSelect={d => {
-          setDate(d);
-          setSlot(null);
-          // ถ้าเลือกวันที่ Court 2 ยังไม่เปิด และเคยเลือก Court 2 ไว้ ให้ล้างการเลือกสนามด้วย
-          if (isCourt2Restricted(d) && court?.courtId === 2) setCourt(null);
-        }} lang={lang} />
+        <Calendar selected={date} onSelect={d => { setDate(d); setSlot(null); }} lang={lang} />
         {date && (
           <div style={{marginTop:10,background:"var(--or-bg)",borderRadius:10,padding:"9px 14px",border:"1px solid rgba(244,126,31,.2)"}}>
             <p style={{fontSize:13,color:"var(--br)",fontWeight:600}}>📅 {fmtDate(date, lang)}</p>
@@ -507,13 +504,8 @@ function BookingPage({ onProceed, lang="th" }) {
       </section>
       <section>
         <StepHead n="2" label={t.selectCourt} />
-        {date && isCourt2Restricted(date) && (
-          <div style={{marginBottom:10,background:"var(--bl-bg)",borderRadius:10,padding:"9px 14px",border:"1px solid rgba(141,182,199,.35)"}}>
-            <p style={{fontSize:12.5,color:"var(--br)"}}>{lang==="th"?"ช่วง 1–4 ก.ย. 2569 เปิดให้บริการเฉพาะ Court 1 (Court 2 เริ่มเปิด 5 ก.ย. 2569)":"1–4 Sep 2026: Only Court 1 is available (Court 2 opens 5 Sep 2026)"}</p>
-          </div>
-        )}
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-          {COURTS.filter(c => !(date && isCourt2Restricted(date) && c.courtId === 2)).map(c => {
+          {COURTS.map(c => {
             const sel = court?.courtId === c.courtId;
             return (
               <button key={c.courtId} onClick={() => { setCourt(c); setSlot(null); }} style={{padding:0,borderRadius:"var(--r)",border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:"#fff",cursor:"pointer",textAlign:"center",boxShadow:sel?"0 2px 12px rgba(244,126,31,.18)":"var(--sh)",overflow:"hidden"}}>
