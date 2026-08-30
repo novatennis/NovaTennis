@@ -83,6 +83,12 @@ const TIME_SLOT_HOURS = Array.from({ length: 17 }, (_, i) => 6 + i);
 const PROMO_START = new Date(2026, 8, 1, 0, 0, 0);   // 1 ก.ย. 2569
 const PROMO_END = new Date(2026, 8, 30, 23, 59, 59); // 30 ก.ย. 2569
 
+// วันแรกที่เปิดให้จองได้ (ก่อนหน้านี้จองไม่ได้ แม้ปฏิทินจะเปิดดูได้)
+const BOOKING_OPEN_DATE = new Date(2026, 8, 1, 0, 0, 0); // 1 ก.ย. 2569
+// ช่วงที่ Court 2 ยังไม่เปิดให้บริการ (1–4 ก.ย. 2569 เปิดเฉพาะ Court 1)
+const COURT2_OPEN_DATE = new Date(2026, 8, 5, 0, 0, 0); // Court 2 เริ่มเปิด 5 ก.ย. 2569
+const isCourt2Restricted = (d) => d && d < COURT2_OPEN_DATE;
+
 function getSlotPrice(hour, dateObj) {
   const d = dateObj || new Date();
   const inPromo = d >= PROMO_START && d <= PROMO_END;
@@ -298,7 +304,7 @@ function HomePage({ goBook, lang="th" }) {
               <span style={{fontSize:11.5,fontWeight:700,letterSpacing:.3}}>{lang==="th"?"โปรโมชั่นเปิดตัว · เดือนแรก":"Launch Promo · First Month"}</span>
             </div>
             <p className="bb" style={{fontSize:26,lineHeight:1.15,marginBottom:4}}>{lang==="th"?"ลดพิเศษต้อนรับเปิดสนาม!":"Special Opening Discount!"}</p>
-            <p style={{fontSize:12.5,opacity:.85,marginBottom:16}}>{lang==="th"?"วันนี้ – 30 กันยายน 2569 เท่านั้น":"Today – 30 September 2026 only"}</p>
+            <p style={{fontSize:12.5,opacity:.85,marginBottom:16}}>{lang==="th"?"Soft Opening · 1 ก.ย. 2569 – 30 ก.ย. 2569 เท่านั้น":"Soft Opening · 1 Sep 2026 – 30 Sep 2026 only"}</p>
             <div style={{display:"flex",gap:10,marginBottom:14}}>
               <div style={{flex:1,background:"rgba(255,255,255,.14)",borderRadius:12,padding:"12px 10px",textAlign:"center"}}>
                 <p style={{fontSize:10.5,opacity:.8,marginBottom:4}}>Off Peak</p>
@@ -321,16 +327,26 @@ function HomePage({ goBook, lang="th" }) {
         )}
 
         <div className="card">
-          <div className="card-header"><p>{t.priceTitle}{inPromo ? (lang==="th" ? " · ราคาโปรโมชั่น" : " · Promo Price") : ""}</p></div>
+          <div className="card-header"><p>{t.priceTitle}</p></div>
+          {inPromo && (
+            <div style={{padding:"10px 18px",background:"var(--or-bg)",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
+              <span style={{fontSize:14}}>🔥</span>
+              <p style={{fontSize:12,color:"var(--br)",fontWeight:600}}>
+                {lang==="th" ? "โปรโมชั่น Soft Opening 1 เดือน · 1 ก.ย. 2569 – 30 ก.ย. 2569" : "Soft Opening Promo (1 Month) · 1 Sep 2026 – 30 Sep 2026"}
+              </p>
+            </div>
+          )}
           <div style={{display:"flex",padding:"16px 18px",gap:12}}>
             <div style={{flex:1,textAlign:"center"}}>
               <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>Off Peak</p>
+              {inPromo && <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿490</p>}
               <p style={{fontSize:28,fontWeight:800,color:"var(--or)",lineHeight:1}}>฿{offPeak.price}</p>
               <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>{lang==="th"?"จ.-ศ. 06:00–15:00":"Mon-Fri 06:00–15:00"}</p>
             </div>
             <div style={{width:1,background:"var(--dv)"}} />
             <div style={{flex:1,textAlign:"center"}}>
               <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>Peak</p>
+              {inPromo && <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿590</p>}
               <p style={{fontSize:28,fontWeight:800,color:"var(--bl)",lineHeight:1}}>฿{peak.price}</p>
               <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>{lang==="th"?"จ.-ศ. 16:00–22:00 / ส.-อา. ทั้งวัน":"Mon-Fri 16:00–22:00 / Sat-Sun all day"}</p>
             </div>
@@ -401,8 +417,10 @@ function HomePage({ goBook, lang="th" }) {
 
 function Calendar({ selected, onSelect, lang="th" }) {
   const today = new Date(); today.setHours(0,0,0,0);
-  const maxDate = new Date(today); maxDate.setDate(maxDate.getDate()+30);
-  const [view, setView] = useState(new Date(today.getFullYear(), today.getMonth(), 1));
+  // ห้ามจองก่อนวันเปิดจองจริง (BOOKING_OPEN_DATE) แม้ปฏิทินจะเปิดดูล่วงหน้าได้
+  const minDate = today > BOOKING_OPEN_DATE ? today : BOOKING_OPEN_DATE;
+  const maxDate = new Date(minDate); maxDate.setDate(maxDate.getDate()+30);
+  const [view, setView] = useState(new Date(minDate.getFullYear(), minDate.getMonth(), 1));
   const y = view.getFullYear(), m = view.getMonth();
   const firstDay = new Date(y, m, 1).getDay();
   const daysInMonth = new Date(y, m+1, 0).getDate();
@@ -429,7 +447,7 @@ function Calendar({ selected, onSelect, lang="th" }) {
           const iso = toIso(d);
           const isToday = iso === toIso(today);
           const isSel = iso === selIso;
-          const disabled = d < today || d > maxDate;
+          const disabled = d < minDate || d > maxDate;
           return (
             <button key={i} disabled={disabled} onClick={() => onSelect(new Date(d))} style={{aspectRatio:"1",borderRadius:8,border:"none",cursor:disabled?"default":"pointer",background:isSel?"var(--or)":isToday?"var(--or-bg)":"transparent",color:disabled?"#ccc":isSel?"#fff":isToday?"var(--or)":"var(--tx)",fontWeight:(isSel||isToday)?700:400,fontSize:13,outline:(isToday&&!isSel)?"1.5px solid var(--or)":"none"}}>{d.getDate()}</button>
           );
@@ -475,7 +493,12 @@ function BookingPage({ onProceed, lang="th" }) {
     <div style={{padding:"20px 16px 100px",display:"flex",flexDirection:"column",gap:22}} className="fu">
       <section>
         <StepHead n="1" label={t.selectDate} />
-        <Calendar selected={date} onSelect={d => { setDate(d); setSlot(null); }} lang={lang} />
+        <Calendar selected={date} onSelect={d => {
+          setDate(d);
+          setSlot(null);
+          // ถ้าเลือกวันที่ Court 2 ยังไม่เปิด และเคยเลือก Court 2 ไว้ ให้ล้างการเลือกสนามด้วย
+          if (isCourt2Restricted(d) && court?.courtId === 2) setCourt(null);
+        }} lang={lang} />
         {date && (
           <div style={{marginTop:10,background:"var(--or-bg)",borderRadius:10,padding:"9px 14px",border:"1px solid rgba(244,126,31,.2)"}}>
             <p style={{fontSize:13,color:"var(--br)",fontWeight:600}}>📅 {fmtDate(date, lang)}</p>
@@ -484,8 +507,13 @@ function BookingPage({ onProceed, lang="th" }) {
       </section>
       <section>
         <StepHead n="2" label={t.selectCourt} />
+        {date && isCourt2Restricted(date) && (
+          <div style={{marginBottom:10,background:"var(--bl-bg)",borderRadius:10,padding:"9px 14px",border:"1px solid rgba(141,182,199,.35)"}}>
+            <p style={{fontSize:12.5,color:"var(--br)"}}>{lang==="th"?"ช่วง 1–4 ก.ย. 2569 เปิดให้บริการเฉพาะ Court 1 (Court 2 เริ่มเปิด 5 ก.ย. 2569)":"1–4 Sep 2026: Only Court 1 is available (Court 2 opens 5 Sep 2026)"}</p>
+          </div>
+        )}
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-          {COURTS.map(c => {
+          {COURTS.filter(c => !(date && isCourt2Restricted(date) && c.courtId === 2)).map(c => {
             const sel = court?.courtId === c.courtId;
             return (
               <button key={c.courtId} onClick={() => { setCourt(c); setSlot(null); }} style={{padding:0,borderRadius:"var(--r)",border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:"#fff",cursor:"pointer",textAlign:"center",boxShadow:sel?"0 2px 12px rgba(244,126,31,.18)":"var(--sh)",overflow:"hidden"}}>
