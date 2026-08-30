@@ -252,13 +252,18 @@ function TabBar({ tab, setTab, lang="th" }) {
 
 function HomePage({ goBook, lang="th" }) {
   const t = T[lang];
-  // หาราคาปัจจุบันที่ใช้งานจริง (รองรับทั้งช่วงโปรโมชั่นและราคาปกติ) โดยไม่ขึ้นกับว่าวันนี้เป็นวันอะไร
+  // โชว์ป้ายโปรโมชั่นได้ตั้งแต่วันนี้จนถึงวันสุดท้ายของโปรฯ (ประกาศล่วงหน้าก่อนเปิดจริงได้ด้วย)
   const now = new Date();
-  const sampleWeekday = new Date(now);
-  while (sampleWeekday.getDay() === 0 || sampleWeekday.getDay() === 6) sampleWeekday.setDate(sampleWeekday.getDate()+1);
-  const offPeak = getSlotPrice(10, sampleWeekday);
-  const peak = getSlotPrice(18, sampleWeekday);
-  const inPromo = now >= PROMO_START && now <= PROMO_END;
+  const inPromo = now <= PROMO_END;
+  const promoStarted = now >= PROMO_START;
+  // คำนวณราคาช่วงโปรฯ โดยอ้างอิงวันธรรมดาที่แน่นอนภายในช่วงโปรโมชั่นเสมอ (ไม่ขึ้นกับว่าวันนี้คือวันที่เท่าไหร่จริงๆ)
+  const promoSampleWeekday = new Date(2026, 8, 2); // พุธที่ 2 ก.ย. 2569 — อยู่ในช่วงโปรฯ แน่นอน
+  const normalSampleWeekday = new Date(now);
+  while (normalSampleWeekday.getDay() === 0 || normalSampleWeekday.getDay() === 6) normalSampleWeekday.setDate(normalSampleWeekday.getDate()+1);
+  const priceSampleDate = inPromo ? promoSampleWeekday : normalSampleWeekday;
+  const offPeak = getSlotPrice(10, priceSampleDate);
+  const peak = getSlotPrice(18, priceSampleDate);
+  const daysUntilStart = Math.max(0, Math.ceil((PROMO_START - now) / (1000*60*60*24)));
   const daysLeft = Math.max(0, Math.ceil((PROMO_END - now) / (1000*60*60*24)));
 
   const bookingConditionItems = lang==="th"
@@ -317,12 +322,14 @@ function HomePage({ goBook, lang="th" }) {
                 <p className="bb" style={{fontSize:26,lineHeight:1}}>฿490</p>
               </div>
             </div>
-            {daysLeft > 0 && (
-              <div style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(0,0,0,.18)",borderRadius:20,padding:"5px 12px"}}>
-                <span style={{fontSize:12}}>⏳</span>
-                <span style={{fontSize:11.5,fontWeight:600}}>{lang==="th"?`เหลืออีก ${daysLeft} วันเท่านั้น`:`Only ${daysLeft} days left`}</span>
-              </div>
-            )}
+            <div style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(0,0,0,.18)",borderRadius:20,padding:"5px 12px"}}>
+              <span style={{fontSize:12}}>⏳</span>
+              <span style={{fontSize:11.5,fontWeight:600}}>
+                {promoStarted
+                  ? (lang==="th" ? `เหลืออีก ${daysLeft} วันเท่านั้น` : `Only ${daysLeft} days left`)
+                  : (lang==="th" ? `เปิดจอง 1 ก.ย. 69 · อีก ${daysUntilStart} วัน` : `Booking opens 1 Sep · in ${daysUntilStart} days`)}
+              </span>
+            </div>
           </div>
         )}
 
