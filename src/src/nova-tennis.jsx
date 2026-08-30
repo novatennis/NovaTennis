@@ -70,17 +70,16 @@ const db = {
 // ─── Constants ────────────────────────────────────────────────────────────────
 // Court 1 = ไม่มีหน้าต่าง, Court 2 = มีหน้าต่าง (ตามภาพจริงของสนาม)
 const COURTS = [
-  { courtId: 1, courtName: "Court 1", photo: "/court-1.png", descTh: "สนามในร่ม • ปรับอากาศ • ไม่ติดหน้าต่าง", descEn: "Indoor • Air-conditioned • No window" },
-  { courtId: 2, courtName: "Court 2", photo: "/court-2.png", descTh: "สนามในร่ม • ปรับอากาศ • ติดหน้าต่าง", descEn: "Indoor • Air-conditioned • Has window" },
+  { courtId: 1, courtName: "Court 1", photo: "/court-1.png", descTh: "สนามในร่ม • ปรับอากาศ", descEn: "Indoor • Air-conditioned" },
+  { courtId: 2, courtName: "Court 2", photo: "/court-2.png", descTh: "สนามในร่ม • ปรับอากาศ", descEn: "Indoor • Air-conditioned" },
 ];
 
 const TIME_SLOT_HOURS = Array.from({ length: 17 }, (_, i) => 6 + i);
 
 // ─── โครงสร้างราคา ─────────────────────────────────────────────────────────────
-// โปรโมชั่น 1–30 ก.ย. 2569:
-//   Off Peak (จ.-ศ. 06:00-14:59)                → 450 บาท
-//   Peak (จ.-ศ. 15:00-22:59 และ ส.-อา. ทั้งวัน)  → 490 บาท
-// นอกช่วงโปรฯ กลับไปใช้ราคาปกติ: ก่อน 13:00 = 490 บาท, ตั้งแต่ 13:00 = 590 บาท
+// ราคาปกติ: Off Peak (จ.-ศ. 06:00-15:59) = 490 บาท, Peak (จ.-ศ. 16:00-22:59 และ ส.-อา. ทั้งวัน) = 590 บาท
+// โปรโมชั่น Soft Opening 1–30 ก.ย. 2569: Off Peak = 450 บาท, Peak = 490 บาท (ช่วงเวลาเดียวกัน)
+// พ้นวันที่ 30 ก.ย. 2569 ระบบจะกลับไปใช้ราคาปกติให้อัตโนมัติ
 const PROMO_START = new Date(2026, 8, 1, 0, 0, 0);   // 1 ก.ย. 2569
 const PROMO_END = new Date(2026, 8, 30, 23, 59, 59); // 30 ก.ย. 2569
 
@@ -89,11 +88,10 @@ function getSlotPrice(hour, dateObj) {
   const inPromo = d >= PROMO_START && d <= PROMO_END;
   const day = d.getDay(); // 0 = อาทิตย์, 6 = เสาร์
   const isWeekend = day === 0 || day === 6;
-  if (inPromo) {
-    if (!isWeekend && hour < 15) return { price: 450, peak: false };
-    return { price: 490, peak: true };
-  }
-  return hour < 13 ? { price: 490, peak: false } : { price: 590, peak: true };
+  // Peak = เสาร์-อาทิตย์ทั้งวัน หรือ จ.-ศ. ตั้งแต่ 16:00 เป็นต้นไป
+  const isPeak = isWeekend || hour >= 16;
+  if (inPromo) return isPeak ? { price: 490, peak: true } : { price: 450, peak: false };
+  return isPeak ? { price: 590, peak: true } : { price: 490, peak: false };
 }
 
 // ใช้วันที่ตามเวลาท้องถิ่น (ไม่ใช่ UTC) เพื่อไม่ให้วันที่คลาดเคลื่อนตอนใกล้เที่ยงคืน
@@ -255,25 +253,28 @@ function HomePage({ goBook, lang="th" }) {
   const offPeak = getSlotPrice(10, sampleWeekday);
   const peak = getSlotPrice(18, sampleWeekday);
   const inPromo = now >= PROMO_START && now <= PROMO_END;
+  const daysLeft = Math.max(0, Math.ceil((PROMO_END - now) / (1000*60*60*24)));
 
-  const cards = [
-    {icon:"📋",title:t.bookingCondition,items:lang==="th"?["จองล่วงหน้าได้สูงสุด 1 เดือน","ชำระเงินภายใน 5 นาทีหลังยืนยัน","1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)"]:["Book up to 1 month in advance","Pay within 5 minutes after confirming","1 booking = 1 time slot (1 hour)"]},
-    {icon:"🎾",title:t.rules,items: lang==="th" ? [
-      "โปรดตรงต่อเวลา และเก็บลูกเทนนิสให้เรียบร้อยก่อนหมดเวลาการจองของท่าน เพื่อให้ลูกค้าในชั่วโมงถัดไปเข้ามาใช้บริการได้ทันที",
-      "กรุณาสวมรองเท้าเทนนิส รองเท้าวิ่งหรือรองเท้ายิมเท่านั้นในการเล่นภายในคอร์ต งดสวมรองเท้าแตะและรองเท้าที่ทำให้คอร์ตเสียหาย โปรดดูแลพื้นรองเท้าให้สะอาดก่อนเข้าใช้บริการ",
-      "งดใช้กริ๊ปเสื่อมสภาพ เพื่อป้องกันเศษยางและคราบกาวร่วงติดพื้นสนาม",
-      "งดสูบบุหรี่ และบุหรี่ไฟฟ้าทุกชนิด",
-      "งดนำสัตว์เลี้ยงเข้ามาใช้บริการ",
-      "งดนำอาหารเข้ามาทานในคอร์ต (อนุญาตเฉพาะน้ำดื่ม และเครื่องดื่มเท่านั้น)",
-    ] : [
-      "Please be punctual. Clear the court of all balls before your session ends for the next player.",
-      "Please wear tennis, running, or gym shoes. Use non-marking footwear and ensure soles are clean before entering.",
-      "No deteriorated overgrip — prevent rubber debris and stains on the court.",
-      "No smoking or vaping allowed.",
-      "No pets allowed.",
-      "No food allowed on the court. Water and beverages only.",
-    ]},
+  const bookingConditionItems = lang==="th"
+    ? ["จองล่วงหน้าได้สูงสุด 1 เดือน", "ชำระเงินภายใน 5 นาทีหลังยืนยัน", "1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)"]
+    : ["Book up to 1 month in advance", "Pay within 5 minutes after confirming", "1 booking = 1 time slot (1 hour)"];
+
+  const ruleItems = lang==="th" ? [
+    { icon:"⏰", text:"โปรดตรงต่อเวลา และเก็บลูกเทนนิสให้เรียบร้อยก่อนหมดเวลาการจองของท่าน เพื่อให้ลูกค้าในชั่วโมงถัดไปเข้ามาใช้บริการได้ทันที" },
+    { icon:"👟", text:"กรุณาสวมรองเท้าเทนนิส รองเท้าวิ่งหรือรองเท้ายิมเท่านั้น งดรองเท้าแตะและรองเท้าที่ทำให้คอร์ตเสียหาย โปรดดูแลพื้นรองเท้าให้สะอาดก่อนเข้าใช้บริการ" },
+    { icon:"🎾", text:"งดใช้กริ๊ปเสื่อมสภาพ เพื่อป้องกันเศษยางและคราบกาวร่วงติดพื้นสนาม" },
+    { icon:"🚭", text:"งดสูบบุหรี่ และบุหรี่ไฟฟ้าทุกชนิด" },
+    { icon:"🐾", text:"งดนำสัตว์เลี้ยงเข้ามาใช้บริการ" },
+    { icon:"🍽️", text:"งดนำอาหารเข้ามาทานในคอร์ต (อนุญาตเฉพาะน้ำดื่มและเครื่องดื่มเท่านั้น)" },
+  ] : [
+    { icon:"⏰", text:"Please be punctual. Clear the court of all balls before your session ends for the next player." },
+    { icon:"👟", text:"Please wear tennis, running, or gym shoes only. Use non-marking footwear and ensure soles are clean before entering." },
+    { icon:"🎾", text:"No deteriorated overgrip — prevent rubber debris and stains on the court." },
+    { icon:"🚭", text:"No smoking or vaping allowed." },
+    { icon:"🐾", text:"No pets allowed." },
+    { icon:"🍽️", text:"No food allowed on the court. Water and beverages only." },
   ];
+
   return (
     <div style={{paddingBottom:90}}>
       <div style={{background:"linear-gradient(160deg,#fff 0%,var(--cr) 55%,var(--cr2) 100%)",padding:"36px 24px 0",textAlign:"center"}}>
@@ -286,8 +287,41 @@ function HomePage({ goBook, lang="th" }) {
         <button className="btn-primary" onClick={goBook}>{t.bookNow}</button>
       </div>
       <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
+
+        {/* โปรโมชั่นเดือนแรก — การ์ดเด่น */}
+        {inPromo && (
+          <div style={{position:"relative",borderRadius:18,padding:"22px 20px",background:"linear-gradient(135deg,#663924 0%,#8a4a2a 55%,#F47E1F 130%)",boxShadow:"0 10px 34px rgba(102,57,36,.35)",overflow:"hidden",color:"#fff"}}>
+            <div style={{position:"absolute",top:-30,right:-30,width:120,height:120,borderRadius:"50%",background:"rgba(255,255,255,.08)"}} />
+            <div style={{position:"absolute",bottom:-40,left:-20,width:140,height:140,borderRadius:"50%",background:"rgba(255,255,255,.06)"}} />
+            <div style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(255,255,255,.18)",borderRadius:20,padding:"5px 12px",marginBottom:12}}>
+              <span style={{fontSize:13}}>🔥</span>
+              <span style={{fontSize:11.5,fontWeight:700,letterSpacing:.3}}>{lang==="th"?"โปรโมชั่นเปิดตัว · เดือนแรก":"Launch Promo · First Month"}</span>
+            </div>
+            <p className="bb" style={{fontSize:26,lineHeight:1.15,marginBottom:4}}>{lang==="th"?"ลดพิเศษต้อนรับเปิดสนาม!":"Special Opening Discount!"}</p>
+            <p style={{fontSize:12.5,opacity:.85,marginBottom:16}}>{lang==="th"?"วันนี้ – 30 กันยายน 2569 เท่านั้น":"Today – 30 September 2026 only"}</p>
+            <div style={{display:"flex",gap:10,marginBottom:14}}>
+              <div style={{flex:1,background:"rgba(255,255,255,.14)",borderRadius:12,padding:"12px 10px",textAlign:"center"}}>
+                <p style={{fontSize:10.5,opacity:.8,marginBottom:4}}>Off Peak</p>
+                <p style={{fontSize:12,opacity:.65,textDecoration:"line-through"}}>฿490</p>
+                <p className="bb" style={{fontSize:26,lineHeight:1}}>฿450</p>
+              </div>
+              <div style={{flex:1,background:"rgba(255,255,255,.14)",borderRadius:12,padding:"12px 10px",textAlign:"center"}}>
+                <p style={{fontSize:10.5,opacity:.8,marginBottom:4}}>Peak</p>
+                <p style={{fontSize:12,opacity:.65,textDecoration:"line-through"}}>฿590</p>
+                <p className="bb" style={{fontSize:26,lineHeight:1}}>฿490</p>
+              </div>
+            </div>
+            {daysLeft > 0 && (
+              <div style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(0,0,0,.18)",borderRadius:20,padding:"5px 12px"}}>
+                <span style={{fontSize:12}}>⏳</span>
+                <span style={{fontSize:11.5,fontWeight:600}}>{lang==="th"?`เหลืออีก ${daysLeft} วันเท่านั้น`:`Only ${daysLeft} days left`}</span>
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="card">
-          <div className="card-header"><p>{t.priceTitle}{inPromo ? (lang==="th" ? " · โปรโมชั่น 1–30 ก.ย. 69" : " · Promo 1–30 Sep") : ""}</p></div>
+          <div className="card-header"><p>{t.priceTitle}{inPromo ? (lang==="th" ? " · ราคาโปรโมชั่น" : " · Promo Price") : ""}</p></div>
           <div style={{display:"flex",padding:"16px 18px",gap:12}}>
             <div style={{flex:1,textAlign:"center"}}>
               <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>Off Peak</p>
@@ -298,26 +332,43 @@ function HomePage({ goBook, lang="th" }) {
             <div style={{flex:1,textAlign:"center"}}>
               <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>Peak</p>
               <p style={{fontSize:28,fontWeight:800,color:"var(--bl)",lineHeight:1}}>฿{peak.price}</p>
-              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>{lang==="th"?"จ.-ศ. 16:00–23:00 / ส.-อา. ทั้งวัน":"Mon-Fri 16:00–23:00 / Sat-Sun all day"}</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>{lang==="th"?"จ.-ศ. 16:00–22:00 / ส.-อา. ทั้งวัน":"Mon-Fri 16:00–22:00 / Sat-Sun all day"}</p>
             </div>
           </div>
         </div>
-        {cards.map(({icon,title,items}) => (
-          <div key={title} className="card">
-            <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
-              <span style={{fontSize:17}}>{icon}</span>
-              <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{title}</span>
-            </div>
-            <div style={{padding:"12px 18px",display:"flex",flexDirection:"column",gap:7}}>
-              {items.map((it,i) => (
-                <div key={i} style={{display:"flex",gap:10,alignItems:"flex-start"}}>
-                  <span style={{color:"var(--or)",fontSize:14,lineHeight:1.5,flexShrink:0}}>›</span>
-                  <span style={{fontSize:13.5,color:"var(--mu)",lineHeight:1.65}}>{it}</span>
-                </div>
-              ))}
-            </div>
+
+        {/* เงื่อนไขการจอง — แบบขั้นตอนตัวเลข อ่านง่าย */}
+        <div className="card">
+          <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:17}}>📋</span>
+            <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{t.bookingCondition}</span>
           </div>
-        ))}
+          <div style={{padding:"14px 18px",display:"flex",flexDirection:"column",gap:12}}>
+            {bookingConditionItems.map((txt,i) => (
+              <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+                <div style={{width:22,height:22,borderRadius:"50%",flexShrink:0,background:"var(--or-bg)",color:"var(--or)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800}}>{i+1}</div>
+                <p style={{fontSize:13.5,color:"var(--tx)",lineHeight:1.6}}>{txt}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* กฎระเบียบสนาม — แต่ละข้อมีไอคอนของตัวเอง อ่านง่ายขึ้น */}
+        <div className="card">
+          <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:17}}>🎾</span>
+            <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{t.rules}</span>
+          </div>
+          <div style={{display:"flex",flexDirection:"column"}}>
+            {ruleItems.map((r,i) => (
+              <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start",padding:"12px 18px",background:i%2===1?"rgba(102,57,36,.03)":"transparent",borderTop:i===0?"none":"1px solid rgba(102,57,36,.06)"}}>
+                <span style={{fontSize:18,flexShrink:0,marginTop:1}}>{r.icon}</span>
+                <p style={{fontSize:13,color:"var(--mu)",lineHeight:1.65}}>{r.text}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
         {/* ติดต่อเรา — โทร / Line / แผนที่ */}
         <div className="card">
           <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
