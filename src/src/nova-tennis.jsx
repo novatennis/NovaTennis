@@ -255,7 +255,6 @@ function HomePage({ goBook, lang="th" }) {
   // โชว์ป้ายโปรโมชั่นได้ตั้งแต่วันนี้จนถึงวันสุดท้ายของโปรฯ (ประกาศล่วงหน้าก่อนเปิดจริงได้ด้วย)
   const now = new Date();
   const inPromo = now <= PROMO_END;
-  const promoStarted = now >= PROMO_START;
   // คำนวณราคาช่วงโปรฯ โดยอ้างอิงวันธรรมดาที่แน่นอนภายในช่วงโปรโมชั่นเสมอ (ไม่ขึ้นกับว่าวันนี้คือวันที่เท่าไหร่จริงๆ)
   const promoSampleWeekday = new Date(2026, 8, 2); // พุธที่ 2 ก.ย. 2569 — อยู่ในช่วงโปรฯ แน่นอน
   const normalSampleWeekday = new Date(now);
@@ -263,8 +262,6 @@ function HomePage({ goBook, lang="th" }) {
   const priceSampleDate = inPromo ? promoSampleWeekday : normalSampleWeekday;
   const offPeak = getSlotPrice(10, priceSampleDate);
   const peak = getSlotPrice(18, priceSampleDate);
-  const daysUntilStart = Math.max(0, Math.ceil((PROMO_START - now) / (1000*60*60*24)));
-  const daysLeft = Math.max(0, Math.ceil((PROMO_END - now) / (1000*60*60*24)));
 
   const bookingConditionItems = lang==="th"
     ? ["จองล่วงหน้าได้สูงสุด 1 เดือน", "ชำระเงินภายใน 5 นาทีหลังยืนยัน", "1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)"]
@@ -294,23 +291,24 @@ function HomePage({ goBook, lang="th" }) {
         <img src="/court-photo.png" alt="NOVA Tennis Court" style={{width:"100%",maxWidth:520,borderRadius:16,boxShadow:"0 8px 30px rgba(102,57,36,.18)",display:"block",margin:"0 auto"}} />
         <div style={{height:16}} />
       </div>
-      <div style={{padding:"0 16px",marginTop:-2}}>
-        <button className="btn-primary" onClick={goBook}>{t.bookNow}</button>
-      </div>
-      <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
 
-        {/* โปรโมชั่นเดือนแรก — การ์ดเด่น */}
+      <div style={{padding:"18px 16px 0"}}>
+        {/* โปรโมชั่นเดือนแรก — การ์ดเด่น (แสดงก่อนปุ่มจองสนาม) */}
         {inPromo && (
-          <div style={{position:"relative",borderRadius:18,padding:"22px 20px",background:"linear-gradient(135deg,#663924 0%,#8a4a2a 55%,#F47E1F 130%)",boxShadow:"0 10px 34px rgba(102,57,36,.35)",overflow:"hidden",color:"#fff"}}>
+          <div style={{position:"relative",borderRadius:18,padding:"22px 20px",marginBottom:14,background:"linear-gradient(135deg,#663924 0%,#8a4a2a 55%,#F47E1F 130%)",boxShadow:"0 10px 34px rgba(102,57,36,.35)",overflow:"hidden",color:"#fff"}}>
             <div style={{position:"absolute",top:-30,right:-30,width:120,height:120,borderRadius:"50%",background:"rgba(255,255,255,.08)"}} />
             <div style={{position:"absolute",bottom:-40,left:-20,width:140,height:140,borderRadius:"50%",background:"rgba(255,255,255,.06)"}} />
             <div style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(255,255,255,.18)",borderRadius:20,padding:"5px 12px",marginBottom:12}}>
               <span style={{fontSize:13}}>🔥</span>
               <span style={{fontSize:11.5,fontWeight:700,letterSpacing:.3}}>{lang==="th"?"โปรโมชั่นเปิดตัว · เดือนแรก":"Launch Promo · First Month"}</span>
             </div>
-            <p className="bb" style={{fontSize:30,lineHeight:1.1,marginBottom:6,letterSpacing:.3}}>{lang==="th"?"Promotion Soft Opening ราคาพิเศษ":"Promotion Soft Opening — Special Price"}</p>
+            <p style={{lineHeight:1.15,marginBottom:6}}>
+              <span className="bb" style={{fontSize:30,letterSpacing:.3}}>Promotion Soft Opening</span>
+              {lang==="th" && <span style={{fontSize:22,fontWeight:700,fontFamily:"'Noto Sans Thai',sans-serif",marginLeft:8}}>ราคาพิเศษ</span>}
+              {lang!=="th" && <span className="bb" style={{fontSize:30,letterSpacing:.3}}> — Special Price</span>}
+            </p>
             <p style={{fontSize:12.5,opacity:.85,marginBottom:16}}>{lang==="th"?"Soft Opening · 1 ก.ย. 2569 – 30 ก.ย. 2569 เท่านั้น":"Soft Opening · 1 Sep 2026 – 30 Sep 2026 only"}</p>
-            <div style={{display:"flex",gap:10,marginBottom:14}}>
+            <div style={{display:"flex",gap:10}}>
               <div style={{flex:1,background:"rgba(255,255,255,.14)",borderRadius:12,padding:"12px 10px",textAlign:"center"}}>
                 <p style={{fontSize:10.5,opacity:.8,marginBottom:4}}>Off Peak</p>
                 <p style={{fontSize:12,opacity:.65,textDecoration:"line-through"}}>฿490</p>
@@ -322,16 +320,12 @@ function HomePage({ goBook, lang="th" }) {
                 <p className="bb" style={{fontSize:26,lineHeight:1}}>฿490</p>
               </div>
             </div>
-            <div style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(0,0,0,.18)",borderRadius:20,padding:"5px 12px"}}>
-              <span style={{fontSize:12}}>⏳</span>
-              <span style={{fontSize:11.5,fontWeight:600}}>
-                {promoStarted
-                  ? (lang==="th" ? `เหลืออีก ${daysLeft} วันเท่านั้น` : `Only ${daysLeft} days left`)
-                  : (lang==="th" ? `เปิดจอง 1 ก.ย. 69 · อีก ${daysUntilStart} วัน` : `Booking opens 1 Sep · in ${daysUntilStart} days`)}
-              </span>
-            </div>
           </div>
         )}
+        <button className="btn-primary" onClick={goBook}>{t.bookNow}</button>
+      </div>
+
+      <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
 
         <div className="card">
           <div className="card-header"><p>{t.priceTitle}</p></div>
