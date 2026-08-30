@@ -70,14 +70,31 @@ const db = {
 // ─── Constants ────────────────────────────────────────────────────────────────
 // Court 1 = ไม่มีหน้าต่าง, Court 2 = มีหน้าต่าง (ตามภาพจริงของสนาม)
 const COURTS = [
-  { courtId: 1, courtName: "Court 1", icon: "🚪", descTh: "สนามในร่ม • ปรับอากาศ • ไม่มีหน้าต่าง", descEn: "Indoor • Air-conditioned • No window" },
-  { courtId: 2, courtName: "Court 2", icon: "🪟", descTh: "สนามในร่ม • ปรับอากาศ • มีหน้าต่าง", descEn: "Indoor • Air-conditioned • Has window" },
+  { courtId: 1, courtName: "Court 1", photo: "/court-1.png", descTh: "สนามในร่ม • ปรับอากาศ • ไม่ติดหน้าต่าง", descEn: "Indoor • Air-conditioned • No window" },
+  { courtId: 2, courtName: "Court 2", photo: "/court-2.png", descTh: "สนามในร่ม • ปรับอากาศ • ติดหน้าต่าง", descEn: "Indoor • Air-conditioned • Has window" },
 ];
 
-const TIME_SLOTS = Array.from({ length: 17 }, (_, i) => {
-  const h = 6 + i;
-  return { hour: h, label: `${String(h).padStart(2,"0")}:00 – ${String(h).padStart(2,"0")}:59`, price: h < 13 ? 490 : 590, peak: h >= 13 };
-});
+const TIME_SLOT_HOURS = Array.from({ length: 17 }, (_, i) => 6 + i);
+
+// ─── โครงสร้างราคา ─────────────────────────────────────────────────────────────
+// โปรโมชั่น 1–30 ก.ย. 2569:
+//   Off Peak (จ.-ศ. 06:00-14:59)                → 450 บาท
+//   Peak (จ.-ศ. 15:00-22:59 และ ส.-อา. ทั้งวัน)  → 490 บาท
+// นอกช่วงโปรฯ กลับไปใช้ราคาปกติ: ก่อน 13:00 = 490 บาท, ตั้งแต่ 13:00 = 590 บาท
+const PROMO_START = new Date(2026, 8, 1, 0, 0, 0);   // 1 ก.ย. 2569
+const PROMO_END = new Date(2026, 8, 30, 23, 59, 59); // 30 ก.ย. 2569
+
+function getSlotPrice(hour, dateObj) {
+  const d = dateObj || new Date();
+  const inPromo = d >= PROMO_START && d <= PROMO_END;
+  const day = d.getDay(); // 0 = อาทิตย์, 6 = เสาร์
+  const isWeekend = day === 0 || day === 6;
+  if (inPromo) {
+    if (!isWeekend && hour < 15) return { price: 450, peak: false };
+    return { price: 490, peak: true };
+  }
+  return hour < 13 ? { price: 490, peak: false } : { price: 590, peak: true };
+}
 
 // ใช้วันที่ตามเวลาท้องถิ่น (ไม่ใช่ UTC) เพื่อไม่ให้วันที่คลาดเคลื่อนตอนใกล้เที่ยงคืน
 // (toISOString() แปลงเป็น UTC ก่อน ซึ่งประเทศไทย (+7) จะทำให้วันที่เพี้ยนไป 1 วันได้)
@@ -151,7 +168,7 @@ const T = {
     timeExpired: "หมดเวลา", payWithin: "กรุณาชำระภายใน",
     invalidCode: "❌ รหัสส่วนลดไม่ถูกต้องหรือหมดอายุแล้ว",
     contactLine: "กรุณาติดต่อยกเลิกผ่าน Line หรือโทรศัพท์",
-    noWindow: "ไม่มีหน้าต่าง", hasWindow: "มีหน้าต่าง",
+    noWindow: "ไม่ติดหน้าต่าง", hasWindow: "ติดหน้าต่าง",
     summaryTitle: "สรุปรายการจอง", accountName: "ชื่อบัญชี", loading: "⏳ กำลังโหลด...",
     backHome: "กลับหน้าหลัก", checkMyBooking: "การจองของฉัน",
     searchPlaceholder: "กรอกเบอร์โทรของคุณ", searchBtn: "ค้นหา",
@@ -231,10 +248,31 @@ function TabBar({ tab, setTab, lang="th" }) {
 
 function HomePage({ goBook, lang="th" }) {
   const t = T[lang];
+  // หาราคาปัจจุบันที่ใช้งานจริง (รองรับทั้งช่วงโปรโมชั่นและราคาปกติ) โดยไม่ขึ้นกับว่าวันนี้เป็นวันอะไร
+  const now = new Date();
+  const sampleWeekday = new Date(now);
+  while (sampleWeekday.getDay() === 0 || sampleWeekday.getDay() === 6) sampleWeekday.setDate(sampleWeekday.getDate()+1);
+  const offPeak = getSlotPrice(10, sampleWeekday);
+  const peak = getSlotPrice(18, sampleWeekday);
+  const inPromo = now >= PROMO_START && now <= PROMO_END;
+
   const cards = [
-    {icon:"📋",title:t.bookingCondition,items:lang==="th"?["จองล่วงหน้าได้สูงสุด 7 วัน","ชำระเงินภายใน 5 นาทีหลังยืนยัน","1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)"]:["Book up to 7 days in advance","Pay within 5 minutes after confirming","1 booking = 1 time slot (1 hour)"]},
-    {icon:"❌",title:t.cancelPolicy,items:lang==="th"?["ยกเลิกผ่าน Line หรือโทรศัพท์เท่านั้น","ยกเลิกก่อน 24 ชม. — คืนเงินเต็มจำนวน","ยกเลิกภายใน 24 ชม. — หักค่าธรรมเนียม 50%"]:["Cancel via Line or Phone only","Cancel 24h+ before — Full refund","Cancel within 24h — 50% fee"]},
-    {icon:"🎾",title:t.rules,items:lang==="th"?["แต่งกายด้วยชุดกีฬาเท่านั้น","ห้ามนำอาหารและเครื่องดื่มเข้าสนาม","กรุณาตรงต่อเวลา ไม่สามารถขยายเวลาได้"]:["Sportswear required","No food or drinks on court","Please be punctual, no time extension"]},
+    {icon:"📋",title:t.bookingCondition,items:lang==="th"?["จองล่วงหน้าได้สูงสุด 1 เดือน","ชำระเงินภายใน 5 นาทีหลังยืนยัน","1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)"]:["Book up to 1 month in advance","Pay within 5 minutes after confirming","1 booking = 1 time slot (1 hour)"]},
+    {icon:"🎾",title:t.rules,items: lang==="th" ? [
+      "โปรดตรงต่อเวลา และเก็บลูกเทนนิสให้เรียบร้อยก่อนหมดเวลาการจองของท่าน เพื่อให้ลูกค้าในชั่วโมงถัดไปเข้ามาใช้บริการได้ทันที",
+      "กรุณาสวมรองเท้าเทนนิส รองเท้าวิ่งหรือรองเท้ายิมเท่านั้นในการเล่นภายในคอร์ต งดสวมรองเท้าแตะและรองเท้าที่ทำให้คอร์ตเสียหาย โปรดดูแลพื้นรองเท้าให้สะอาดก่อนเข้าใช้บริการ",
+      "งดใช้กริ๊ปเสื่อมสภาพ เพื่อป้องกันเศษยางและคราบกาวร่วงติดพื้นสนาม",
+      "งดสูบบุหรี่ และบุหรี่ไฟฟ้าทุกชนิด",
+      "งดนำสัตว์เลี้ยงเข้ามาใช้บริการ",
+      "งดนำอาหารเข้ามาทานในคอร์ต (อนุญาตเฉพาะน้ำดื่ม และเครื่องดื่มเท่านั้น)",
+    ] : [
+      "Please be punctual. Clear the court of all balls before your session ends for the next player.",
+      "Please wear tennis, running, or gym shoes. Use non-marking footwear and ensure soles are clean before entering.",
+      "No deteriorated overgrip — prevent rubber debris and stains on the court.",
+      "No smoking or vaping allowed.",
+      "No pets allowed.",
+      "No food allowed on the court. Water and beverages only.",
+    ]},
   ];
   return (
     <div style={{paddingBottom:90}}>
@@ -249,18 +287,18 @@ function HomePage({ goBook, lang="th" }) {
       </div>
       <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
         <div className="card">
-          <div className="card-header"><p>{t.priceTitle}</p></div>
+          <div className="card-header"><p>{t.priceTitle}{inPromo ? (lang==="th" ? " · โปรโมชั่น 1–30 ก.ย. 69" : " · Promo 1–30 Sep") : ""}</p></div>
           <div style={{display:"flex",padding:"16px 18px",gap:12}}>
             <div style={{flex:1,textAlign:"center"}}>
-              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>{t.morningPrice}</p>
-              <p style={{fontSize:28,fontWeight:800,color:"var(--or)",lineHeight:1}}>฿490</p>
-              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>06:00–12:59</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>Off Peak</p>
+              <p style={{fontSize:28,fontWeight:800,color:"var(--or)",lineHeight:1}}>฿{offPeak.price}</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>{lang==="th"?"จ.-ศ. 06:00–15:00":"Mon-Fri 06:00–15:00"}</p>
             </div>
             <div style={{width:1,background:"var(--dv)"}} />
             <div style={{flex:1,textAlign:"center"}}>
-              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>{t.eveningPrice}</p>
-              <p style={{fontSize:28,fontWeight:800,color:"var(--bl)",lineHeight:1}}>฿590</p>
-              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>13:00–22:59</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>Peak</p>
+              <p style={{fontSize:28,fontWeight:800,color:"var(--bl)",lineHeight:1}}>฿{peak.price}</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>{lang==="th"?"จ.-ศ. 16:00–23:00 / ส.-อา. ทั้งวัน":"Mon-Fri 16:00–23:00 / Sat-Sun all day"}</p>
             </div>
           </div>
         </div>
@@ -312,7 +350,7 @@ function HomePage({ goBook, lang="th" }) {
 
 function Calendar({ selected, onSelect, lang="th" }) {
   const today = new Date(); today.setHours(0,0,0,0);
-  const maxDate = new Date(today); maxDate.setDate(maxDate.getDate()+7);
+  const maxDate = new Date(today); maxDate.setDate(maxDate.getDate()+30);
   const [view, setView] = useState(new Date(today.getFullYear(), today.getMonth(), 1));
   const y = view.getFullYear(), m = view.getMonth();
   const firstDay = new Date(y, m, 1).getDay();
@@ -371,11 +409,16 @@ function BookingPage({ onProceed, lang="th" }) {
   // ตัดช่วงเวลาที่ถูกจองแล้วออก และตัดช่วงเวลาที่ผ่านไปแล้ว (ถ้าเป็นวันนี้)
   const isToday = date && toIso(date) === toIso(new Date());
   const currentHour = new Date().getHours();
-  const availableSlots = TIME_SLOTS.filter(ts => {
-    if (bookedHours.includes(ts.hour)) return false;
-    if (isToday && ts.hour <= currentHour) return false;
-    return true;
-  });
+  const availableSlots = TIME_SLOT_HOURS
+    .filter(hour => {
+      if (bookedHours.includes(hour)) return false;
+      if (isToday && hour <= currentHour) return false;
+      return true;
+    })
+    .map(hour => {
+      const { price, peak } = getSlotPrice(hour, date || new Date());
+      return { hour, label: `${String(hour).padStart(2,"0")}:00 – ${String(hour).padStart(2,"0")}:59`, price, peak };
+    });
 
   return (
     <div style={{padding:"20px 16px 100px",display:"flex",flexDirection:"column",gap:22}} className="fu">
@@ -394,10 +437,12 @@ function BookingPage({ onProceed, lang="th" }) {
           {COURTS.map(c => {
             const sel = court?.courtId === c.courtId;
             return (
-              <button key={c.courtId} onClick={() => { setCourt(c); setSlot(null); }} style={{padding:"20px 12px 16px",borderRadius:"var(--r)",border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:sel?"var(--or-bg)":"#fff",cursor:"pointer",textAlign:"center",boxShadow:sel?"0 2px 12px rgba(244,126,31,.18)":"var(--sh)"}}>
-                <div style={{fontSize:30,marginBottom:7}}>{c.icon}</div>
-                <p style={{fontWeight:700,color:sel?"var(--or)":"var(--br)",fontSize:15}}>{c.courtName}</p>
-                <p style={{fontSize:11,color:"var(--mu)",marginTop:4}}>{lang==="th"?c.descTh:c.descEn}</p>
+              <button key={c.courtId} onClick={() => { setCourt(c); setSlot(null); }} style={{padding:0,borderRadius:"var(--r)",border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:"#fff",cursor:"pointer",textAlign:"center",boxShadow:sel?"0 2px 12px rgba(244,126,31,.18)":"var(--sh)",overflow:"hidden"}}>
+                <img src={c.photo} alt={c.courtName} style={{width:"100%",height:90,objectFit:"cover",display:"block"}} />
+                <div style={{padding:"10px 8px 12px"}}>
+                  <p style={{fontWeight:700,color:sel?"var(--or)":"var(--br)",fontSize:15}}>{c.courtName}</p>
+                  <p style={{fontSize:11,color:"var(--mu)",marginTop:4}}>{lang==="th"?c.descTh:c.descEn}</p>
+                </div>
               </button>
             );
           })}
@@ -420,8 +465,8 @@ function BookingPage({ onProceed, lang="th" }) {
         ) : (
           <div style={{display:"flex",flexDirection:"column",gap:6}}>
             <div style={{display:"flex",gap:14,marginBottom:8,flexWrap:"wrap"}}>
-              <Dot color="var(--or)" label={lang==="th"?"490 ฿ · ช่วงเช้า":"490 ฿ · Morning"} />
-              <Dot color="var(--bl)" label={lang==="th"?"590 ฿ · ช่วงบ่าย":"590 ฿ · Afternoon"} />
+              <Dot color="var(--or)" label={`฿${availableSlots.find(s=>!s.peak)?.price ?? "-"} · Off Peak`} />
+              <Dot color="var(--bl)" label={`฿${availableSlots.find(s=>s.peak)?.price ?? "-"} · Peak`} />
             </div>
             {availableSlots.map(ts => {
               const isSel = slot?.hour === ts.hour;
@@ -758,13 +803,11 @@ function CancelPage({ lang="th", initialPhone="" }) {
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
-  const [cancelling, setCancelling] = useState(null);
-  const [msg, setMsg] = useState("");
 
   const handleSearch = async (phoneToSearch) => {
     const p = phoneToSearch || phone;
     if (!/^[0-9]{9,10}$/.test(p)) return;
-    setLoading(true); setSearched(false); setMsg(""); setBookings([]);
+    setLoading(true); setSearched(false); setBookings([]);
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/bookings?customer_id=eq.${p}&select=*&order=booking_date.desc`,
       { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
@@ -781,25 +824,6 @@ function CancelPage({ lang="th", initialPhone="" }) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPhone]);
-
-  const handleCancel = async (b) => {
-    const bookingDate = new Date(b.booking_date + "T" + String(b.hour).padStart(2,"0") + ":00:00");
-    const now = new Date();
-    const diffHours = (bookingDate - now) / (1000 * 60 * 60);
-    if (diffHours < 0) { setMsg(t.cannotCancelPast); return; }
-    if (diffHours < 24) { setMsg(t.cannotCancel24h); return; }
-    const confirmed = window.confirm(t.confirmCancelPrompt);
-    if (!confirmed) return;
-    setCancelling(b.id);
-    await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${b.id}`, {
-      method: "PATCH",
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ status: "cancelled" }),
-    });
-    setBookings(prev => prev.map(x => x.id === b.id ? { ...x, status: "cancelled" } : x));
-    setCancelling(null);
-    setMsg(t.cancelSuccess);
-  };
 
   const statusLabel = (s) => {
     if (s === "cancelled") return { text: t.statusCancelled, color: "#c0392b" };
@@ -820,12 +844,6 @@ function CancelPage({ lang="th", initialPhone="" }) {
         </button>
       </div>
 
-      {msg && (
-        <div style={{background:msg.startsWith("✅")?"rgba(45,122,79,.1)":"rgba(192,57,43,.1)",borderRadius:10,padding:"10px 14px",marginBottom:16,border:`1px solid ${msg.startsWith("✅")?"#2d7a4f":"#c0392b"}`}}>
-          <p style={{fontSize:13,color:msg.startsWith("✅")?"#2d7a4f":"#c0392b",fontWeight:600}}>{msg}</p>
-        </div>
-      )}
-
       {searched && bookings.length === 0 && (
         <div style={{background:"#fff",borderRadius:"var(--r)",padding:"24px",textAlign:"center",border:"1px solid var(--dv)"}}>
           <p style={{color:"var(--mu)"}}>{t.notFound}</p>
@@ -835,10 +853,6 @@ function CancelPage({ lang="th", initialPhone="" }) {
       <div style={{display:"flex",flexDirection:"column",gap:12}}>
         {bookings.map(b => {
           const st = statusLabel(b.status);
-          const bookingDate = new Date(b.booking_date + "T" + String(b.hour).padStart(2,"0") + ":00:00");
-          const isPast = bookingDate < new Date();
-          const diffHours = (bookingDate - new Date()) / (1000 * 60 * 60);
-          const canCancel = b.status !== "cancelled" && !isPast && diffHours >= 24;
           return (
             <div key={b.id} className="card">
               <div style={{padding:"14px 16px"}}>
@@ -849,16 +863,6 @@ function CancelPage({ lang="th", initialPhone="" }) {
                 <Row label={`📅 ${t.date}`} val={new Date(b.booking_date).toLocaleDateString(lang==="th"?"th-TH":"en-GB",{year:"numeric",month:"long",day:"numeric"})} />
                 <Row label={`🕐 ${t.time}`} val={`${String(b.hour).padStart(2,"0")}:00 – ${String(b.hour).padStart(2,"0")}:59`} />
                 <Row label={t.rowPrice} val={`฿${b.price?.toLocaleString()}`} />
-                {canCancel && (
-                  <button onClick={() => handleCancel(b)} disabled={cancelling===b.id} style={{width:"100%",marginTop:10,padding:"11px",borderRadius:10,border:"1.5px solid #c0392b",background:"rgba(192,57,43,.08)",color:"#c0392b",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
-                    {cancelling===b.id ? t.cancellingBtn : t.cancelBookingBtn}
-                  </button>
-                )}
-                {b.status !== "cancelled" && !isPast && diffHours < 24 && diffHours >= 0 && (
-                  <div style={{marginTop:10,padding:"9px 12px",borderRadius:10,background:"rgba(230,126,34,.1)",border:"1px solid #e67e22"}}>
-                    <p style={{fontSize:12,color:"#e67e22",fontWeight:600}}>{t.warning24h}</p>
-                  </div>
-                )}
               </div>
             </div>
           );
@@ -1072,6 +1076,15 @@ function AdminDashboard({ onLogout }) {
   };
 
   const revenue = bookings.filter(b=>b.status==="confirmed").reduce((s,b)=>s+(b.price||0),0);
+  // เอารายการที่ยังต้องตรวจสอบ (รอชำระ/รอการยืนยัน) ขึ้นไว้บนสุดเสมอ เพื่อให้ admin ตรวจสอบได้ง่าย
+  // เรียงตามลำดับเวลาก่อน-หลังของการจองภายในกลุ่มเดียวกัน
+  const statusPriority = { pending: 0, reviewing: 0, confirmed: 1, cancelled: 2 };
+  const sortedBookings = [...bookings].sort((a, b) => {
+    const pa = statusPriority[a.status] ?? 0;
+    const pb = statusPriority[b.status] ?? 0;
+    if (pa !== pb) return pa - pb;
+    return a.hour - b.hour;
+  });
   const reportGrandTotal = reportRows.reduce((s,r)=>s+r.confirmedTotal,0);
   const reportGrandCount = reportRows.reduce((s,r)=>s+r.confirmedCount,0);
 
@@ -1131,7 +1144,7 @@ function AdminDashboard({ onLogout }) {
                   <table className="adm-table">
                     <thead><tr><th>สนาม</th><th>เวลา</th><th>เบอร์</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
                     <tbody>
-                      {bookings.map(b => {
+                      {sortedBookings.map(b => {
                         const st = stInfo(b.status);
                         return (
                           <tr key={b.id}>
