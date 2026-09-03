@@ -89,6 +89,10 @@ const BOOKING_OPEN_DATE = new Date(2026, 8, 1, 0, 0, 0); // 1 ก.ย. 2569
 const COURT2_OPEN_DATE = new Date(2026, 8, 5, 0, 0, 0); // Court 2 เริ่มเปิด 5 ก.ย. 2569
 const isCourt2Restricted = (d) => d && d < COURT2_OPEN_DATE;
 
+// วันที่เต็มทั้ง 2 สนามแบบกำหนดเอง (ไม่ได้มาจากยอดจองจริง) — เพิ่ม/ลบวันที่ในลิสต์นี้ได้ตามต้องการ
+const FULLY_BOOKED_DATES = ["2026-09-03"];
+const isFullyBookedDate = (d) => d && FULLY_BOOKED_DATES.includes(toIso(d));
+
 function getSlotPrice(hour, dateObj) {
   const d = dateObj || new Date();
   const inPromo = d >= PROMO_START && d <= PROMO_END;
@@ -152,7 +156,7 @@ const T = {
     bookNow: "จองสนามเลย →", home: "หน้าแรก", book: "จองสนาม", myBookings: "การจองของฉัน",
     selectDate: "เลือกวันที่", selectCourt: "เลือกสนาม", selectTime: "เลือกช่วงเวลา",
     proceed: "ดำเนินการต่อ →", confirm: "ยืนยันการจอง", cancel: "ยกเลิก",
-    name: "ชื่อ-นามสกุล (ไม่เกิน 16 ตัว)", phone: "เบอร์โทรศัพท์",
+    name: "ชื่อ (ไม่เกิน 16 ตัว)", phone: "เบอร์โทรศัพท์",
     discount: "🏷 รหัสส่วนลด (ถ้ามี)", useCode: "ใช้โค้ด",
     payment: "ชำระเงิน", scanQR: "สแกน QR Code ชำระผ่าน PromptPay",
     transfer: "โอนให้ถูกต้อง", bookingDetail: "รายละเอียดการจอง",
@@ -193,7 +197,7 @@ const T = {
     bookNow: "Book Now →", home: "Home", book: "Book", myBookings: "My Bookings",
     selectDate: "Select Date", selectCourt: "Select Court", selectTime: "Select Time Slot",
     proceed: "Continue →", confirm: "Confirm Booking", cancel: "Cancel",
-    name: "Full Name (max 16 chars)", phone: "Phone Number",
+    name: "Name (max 16 chars)", phone: "Phone Number",
     discount: "🏷 Discount Code (optional)", useCode: "Apply",
     payment: "Payment", scanQR: "Scan QR Code via PromptPay",
     transfer: "Transfer exact amount", bookingDetail: "Booking Details",
@@ -448,9 +452,13 @@ function Calendar({ selected, onSelect, lang="th" }) {
           const iso = toIso(d);
           const isToday = iso === toIso(today);
           const isSel = iso === selIso;
-          const disabled = d < minDate || d > maxDate;
+          const full = isFullyBookedDate(d);
+          const disabled = d < minDate || d > maxDate || full;
           return (
-            <button key={i} disabled={disabled} onClick={() => onSelect(new Date(d))} style={{aspectRatio:"1",borderRadius:8,border:"none",cursor:disabled?"default":"pointer",background:isSel?"var(--or)":isToday?"var(--or-bg)":"transparent",color:disabled?"#ccc":isSel?"#fff":isToday?"var(--or)":"var(--tx)",fontWeight:(isSel||isToday)?700:400,fontSize:13,outline:(isToday&&!isSel)?"1.5px solid var(--or)":"none"}}>{d.getDate()}</button>
+            <button key={i} disabled={disabled} onClick={() => onSelect(new Date(d))} style={{position:"relative",aspectRatio:"1",borderRadius:8,border:"none",cursor:disabled?"default":"pointer",background:isSel?"var(--or)":isToday?"var(--or-bg)":full?"rgba(192,57,43,.07)":"transparent",color:disabled?"#ccc":isSel?"#fff":isToday?"var(--or)":"var(--tx)",fontWeight:(isSel||isToday)?700:400,fontSize:13,outline:(isToday&&!isSel)?"1.5px solid var(--or)":"none",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1}}>
+              <span>{d.getDate()}</span>
+              {full && <span style={{fontSize:8,fontWeight:700,color:"#c0392b",lineHeight:1}}>{lang==="th"?"เต็ม":"Full"}</span>}
+            </button>
           );
         })}
       </div>
@@ -481,7 +489,8 @@ function BookingPage({ onProceed, lang="th" }) {
   const currentHour = new Date().getHours();
   // ช่วง 1–4 ก.ย. 2569: Court 2 ยังไม่เปิดให้บริการจริง แต่แสดงผลเหมือนถูกจองเต็มแล้ว (ไม่แจ้งเหตุผลให้ลูกค้าเห็น)
   const court2NotYetOpen = court?.courtId === 2 && isCourt2Restricted(date);
-  const availableSlots = court2NotYetOpen ? [] : TIME_SLOT_HOURS
+  const forcedFull = court2NotYetOpen || isFullyBookedDate(date); // isFullyBookedDate ครอบคลุมทั้ง 2 สนามในวันนั้น
+  const availableSlots = forcedFull ? [] : TIME_SLOT_HOURS
     .filter(hour => {
       if (bookedHours.includes(hour)) return false;
       if (isToday && hour <= currentHour) return false;
@@ -572,7 +581,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, lang="th" }) {
   const [discountMsg, setDiscountMsg] = useState("");
   const [checkingCode, setCheckingCode] = useState(false);
   const nameOk = name.trim().length >= 1 && name.length <= 16;
-  const phoneOk = /^[0-9]{9,10}$/.test(phone);
+  const phoneOk = /^[0-9]{10}$/.test(phone);
   const ok = nameOk && phoneOk;
 
   const calcDiscount = (d) => {
@@ -684,6 +693,7 @@ function PaymentPage({ booking, customer, onDone, lang="th" }) {
       const b = await db.addBooking({
         court_id: court.courtId,
         customer_id: customer.phone,
+        customer_name: customer.name,
         booking_date: toIso(date),
         hour: slot.hour,
         price: finalPrice,
@@ -878,7 +888,7 @@ function CancelPage({ lang="th", initialPhone="" }) {
 
   const handleSearch = async (phoneToSearch) => {
     const p = phoneToSearch || phone;
-    if (!/^[0-9]{9,10}$/.test(p)) return;
+    if (!/^[0-9]{10}$/.test(p)) return;
     setLoading(true); setSearched(false); setBookings([]);
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/bookings?customer_id=eq.${p}&select=*&order=booking_date.desc`,
@@ -891,7 +901,7 @@ function CancelPage({ lang="th", initialPhone="" }) {
 
   // ถ้ามาจากหน้าชำระเงินพร้อมเบอร์โทร ให้ค้นหาให้อัตโนมัติทันที
   useEffect(() => {
-    if (initialPhone && /^[0-9]{9,10}$/.test(initialPhone)) {
+    if (initialPhone && /^[0-9]{10}$/.test(initialPhone)) {
       handleSearch(initialPhone);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -911,7 +921,7 @@ function CancelPage({ lang="th", initialPhone="" }) {
         <input value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))}
           placeholder={t.searchPlaceholder} inputMode="numeric"
           style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
-        <button onClick={() => handleSearch()} disabled={loading || phone.length < 9} style={{padding:"0 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
+        <button onClick={() => handleSearch()} disabled={loading || phone.length < 10} style={{padding:"0 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
           {loading ? "..." : t.searchBtn}
         </button>
       </div>
@@ -1050,6 +1060,10 @@ function AdminDashboard({ onLogout }) {
   const [newAmt, setNewAmt] = useState("50");
   const [newMax, setNewMax] = useState("1");
 
+  // คิวรายการที่ยังต้องตรวจสอบ/ยืนยัน — รวมทุกวันที่ไว้หน้าเดียว ไม่ต้องไล่หาทีละวัน
+  const [queue, setQueue] = useState([]);
+  const [queueLoading, setQueueLoading] = useState(true);
+
   // รายงานสรุปยอด
   const [reportFrom, setReportFrom] = useState(() => {
     const d = new Date(); d.setDate(d.getDate()-6);
@@ -1058,6 +1072,16 @@ function AdminDashboard({ onLogout }) {
   const [reportTo, setReportTo] = useState(toIso(new Date()));
   const [reportRows, setReportRows] = useState([]);
   const [reportLoading, setReportLoading] = useState(false);
+
+  const loadQueue = async () => {
+    setQueueLoading(true);
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/bookings?status=in.(pending,reviewing)&select=*&order=booking_date.asc,hour.asc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    setQueue(await res.json() || []);
+    setQueueLoading(false);
+  };
 
   const loadBookings = async () => {
     setLoading(true);
@@ -1099,6 +1123,7 @@ function AdminDashboard({ onLogout }) {
     setReportLoading(false);
   };
 
+  useEffect(() => { loadQueue(); }, []);
   useEffect(() => { loadBookings(); }, [date]);
   useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); if(tab==="report") loadReport(); }, [tab]);
 
@@ -1114,6 +1139,7 @@ function AdminDashboard({ onLogout }) {
       body: JSON.stringify({ status }),
     });
     setBookings(prev => prev.map(b => b.id === id ? { ...b, status } : b));
+    setQueue(prev => prev.filter(b => b.id !== id)); // ยืนยัน/ยกเลิกแล้ว ให้หายจากคิวที่ต้องตรวจสอบทันที
   };
 
   const createCode = async () => {
@@ -1192,6 +1218,46 @@ function AdminDashboard({ onLogout }) {
         <div style={{padding:"20px",maxWidth:1000,margin:"0 auto"}}>
           {tab==="bookings" && (
             <div>
+              {/* คิวรายการที่ยังต้องตรวจสอบ/ยืนยัน — รวมทุกวันที่ไว้ที่เดียว เห็นง่าย ไม่ต้องไล่หาทีละวัน */}
+              <div style={{marginBottom:24}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                  <p style={{fontWeight:700,color:"var(--br)",fontSize:15}}>🔔 รายการที่ต้องตรวจสอบ/ยืนยัน {queue.length > 0 && `(${queue.length})`}</p>
+                  <button onClick={loadQueue} style={{padding:"6px 12px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontWeight:600,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
+                </div>
+                <div style={{background:"#fff",borderRadius:12,border:"1.5px solid #e67e22",overflow:"auto",boxShadow:"var(--sh)"}}>
+                  {queueLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                  queue.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>✅ ไม่มีรายการค้างตรวจสอบ</p> : (
+                    <table className="adm-table">
+                      <thead><tr><th>วันที่</th><th>สนาม</th><th>เวลา</th><th>ชื่อลูกค้า</th><th>เบอร์</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                      <tbody>
+                        {queue.map(b => {
+                          const st = stInfo(b.status);
+                          return (
+                            <tr key={b.id}>
+                              <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short"})}</td>
+                              <td style={{fontWeight:700}}>Court {b.court_id}</td>
+                              <td>{String(b.hour).padStart(2,"0")}:00</td>
+                              <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
+                              <td>{b.customer_id}</td>
+                              <td style={{fontWeight:700,color:"var(--or)"}}>฿{b.price?.toLocaleString()}</td>
+                              <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
+                              <td><span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 8px",borderRadius:20}}>{st.text}</span></td>
+                              <td>
+                                <div style={{display:"flex",gap:6}}>
+                                  <button onClick={()=>updateStatus(b.id,"confirmed")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>
+                                  <button onClick={()=>updateStatus(b.id,"cancelled")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+
+              <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:10}}>📅 ดูตามวันที่</p>
               <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:20}}>
                 {[
                   {label:"ทั้งหมด",val:bookings.length,color:"var(--br)"},
@@ -1214,7 +1280,7 @@ function AdminDashboard({ onLogout }) {
                 {loading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
                 bookings.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่มีการจองในวันนี้</p> : (
                   <table className="adm-table">
-                    <thead><tr><th>สนาม</th><th>เวลา</th><th>เบอร์</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                    <thead><tr><th>สนาม</th><th>เวลา</th><th>ชื่อลูกค้า</th><th>เบอร์</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
                     <tbody>
                       {sortedBookings.map(b => {
                         const st = stInfo(b.status);
@@ -1222,6 +1288,7 @@ function AdminDashboard({ onLogout }) {
                           <tr key={b.id}>
                             <td style={{fontWeight:700}}>Court {b.court_id}</td>
                             <td>{String(b.hour).padStart(2,"0")}:00</td>
+                            <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
                             <td>{b.customer_id}</td>
                             <td style={{fontWeight:700,color:"var(--or)"}}>฿{b.price?.toLocaleString()}</td>
                             <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
