@@ -1,17 +1,26 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, Fragment } from "react";
 
 // ─── Supabase ─────────────────────────────────────────────────────────────────
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 const db = {
-  // ไม่นับช่วงเวลาของการจองที่ถูกยกเลิกแล้ว (status=cancelled) เพื่อให้ช่วงเวลานั้นกลับมาให้จองใหม่ได้
+  // ดึงการจองที่ยังไม่ถูกยกเลิก พร้อมข้อมูลเวลา/ระยะเวลา/สถานะ/เวลาที่สร้าง
+  // (กรองรายการ "รอชำระ" ที่ค้างเกิน 5 นาทีออกฝั่ง client เพื่อให้ช่วงเวลานั้นกลับมาให้จองใหม่ได้อัตโนมัติ)
   async getBookings(date, courtId) {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/bookings?booking_date=eq.${date}&court_id=eq.${courtId}&status=neq.cancelled&select=hour`,
+      `${SUPABASE_URL}/rest/v1/bookings?booking_date=eq.${date}&court_id=eq.${courtId}&status=neq.cancelled&select=hour,start_minute,duration_minutes,status,created_time`,
       { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
     );
     return res.json();
+  },
+  async getBookingById(id) {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/bookings?id=eq.${id}&select=*`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    const rows = await res.json();
+    return rows[0] || null;
   },
   async addBooking(data) {
     const res = await fetch(`${SUPABASE_URL}/rest/v1/bookings`, {
@@ -68,20 +77,51 @@ const db = {
 };
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-// Court 1 = ไม่มีหน้าต่าง, Court 2 = มีหน้าต่าง (ตามภาพจริงของสนาม)
 const COURTS = [
   { courtId: 1, courtName: "Court 1", photo: "/court-1.png", descTh: "สนามในร่ม • ปรับอากาศ", descEn: "Indoor • Air-conditioned" },
   { courtId: 2, courtName: "Court 2", photo: "/court-2.png", descTh: "สนามในร่ม • ปรับอากาศ", descEn: "Indoor • Air-conditioned" },
 ];
 
-const TIME_SLOT_HOURS = Array.from({ length: 17 }, (_, i) => 6 + i);
+// ─── ระยะเวลาการจอง ─────────────────────────────────────────────────────────────
+const DURATION_OPTIONS = [30, 60, 90, 120]; // นาที
+const DAY_START_MIN = 6 * 60;   // 06:00
+const DAY_END_MIN = 23 * 60;    // 23:00 (เล่นได้ถึง 23:00 พอดี)
+const START_STEP = 30;          // เลือกเวลาเริ่มได้ทุกครึ่งชั่วโมง
+
+const minutesToLabel = (mins) => `${String(Math.floor(mins/60)).padStart(2,"0")}:${String(mins%60).padStart(2,"0")}`;
+
+function getCandidateStarts(durationMinutes) {
+  const starts = [];
+  for (let m = DAY_START_MIN; m + durationMinutes <= DAY_END_MIN; m += START_STEP) starts.push(m);
+  return starts;
+}
 
 // ─── โครงสร้างราคา ─────────────────────────────────────────────────────────────
-// ราคาปกติ: Off Peak (จ.-ศ. 06:00-15:59) = 490 บาท, Peak (จ.-ศ. 16:00-22:59 และ ส.-อา. ทั้งวัน) = 590 บาท
-// โปรโมชั่น Soft Opening 1–30 ก.ย. 2569: Off Peak = 450 บาท, Peak = 490 บาท (ช่วงเวลาเดียวกัน)
-// พ้นวันที่ 30 ก.ย. 2569 ระบบจะกลับไปใช้ราคาปกติให้อัตโนมัติ
+// ราคาแยกตามระยะเวลาจริง ไม่ใช่การคูณ/หารเท่ากันทุกช่วง (30 นาทีตั้งราคาเองต่างหาก)
+// 90 นาที = ราคา 60 นาที + ราคา 30 นาที, 120 นาที = ราคา 60 นาที x 2
+const RATE_TABLE = {
+  promo:  { offpeak: { 30: 300, 60: 450 }, peak: { 30: 325, 60: 490 } },
+  normal: { offpeak: { 30: 350, 60: 490 }, peak: { 30: 375, 60: 590 } },
+};
 const PROMO_START = new Date(2026, 8, 1, 0, 0, 0);   // 1 ก.ย. 2569
 const PROMO_END = new Date(2026, 8, 30, 23, 59, 59); // 30 ก.ย. 2569
+
+function getDurationPrice(startHour, dateObj, durationMinutes) {
+  const d = dateObj || new Date();
+  const inPromo = d >= PROMO_START && d <= PROMO_END;
+  const day = d.getDay(); // 0 = อาทิตย์, 6 = เสาร์
+  const isWeekend = day === 0 || day === 6;
+  // ระดับราคา (off-peak/peak) ตัดสินจาก "เวลาเริ่ม" ของการจอง — Peak = เสาร์-อาทิตย์ทั้งวัน หรือ จ.-ศ. ตั้งแต่ 16:00
+  const isPeak = isWeekend || startHour >= 16;
+  const tier = inPromo ? RATE_TABLE.promo : RATE_TABLE.normal;
+  const rate = isPeak ? tier.peak : tier.offpeak;
+  const numHours = Math.floor(durationMinutes / 60);
+  const remainder = durationMinutes % 60; // 0 หรือ 30 เท่านั้นตามตัวเลือกที่มี
+  const price = numHours * rate[60] + (remainder === 30 ? rate[30] : 0);
+  return { price, peak: isPeak };
+}
+// สำหรับจุดที่ต้องการราคาอ้างอิงต่อชั่วโมง (เช่น สรุปราคาหน้าแรก)
+function getSlotPrice(hour, dateObj) { return getDurationPrice(hour, dateObj, 60); }
 
 // วันแรกที่เปิดให้จองได้ (ก่อนหน้านี้จองไม่ได้ แม้ปฏิทินจะเปิดดูได้)
 const BOOKING_OPEN_DATE = new Date(2026, 8, 1, 0, 0, 0); // 1 ก.ย. 2569
@@ -93,19 +133,7 @@ const isCourt2Restricted = (d) => d && d < COURT2_OPEN_DATE;
 const FULLY_BOOKED_DATES = ["2026-09-03"];
 const isFullyBookedDate = (d) => d && FULLY_BOOKED_DATES.includes(toIso(d));
 
-function getSlotPrice(hour, dateObj) {
-  const d = dateObj || new Date();
-  const inPromo = d >= PROMO_START && d <= PROMO_END;
-  const day = d.getDay(); // 0 = อาทิตย์, 6 = เสาร์
-  const isWeekend = day === 0 || day === 6;
-  // Peak = เสาร์-อาทิตย์ทั้งวัน หรือ จ.-ศ. ตั้งแต่ 16:00 เป็นต้นไป
-  const isPeak = isWeekend || hour >= 16;
-  if (inPromo) return isPeak ? { price: 490, peak: true } : { price: 450, peak: false };
-  return isPeak ? { price: 590, peak: true } : { price: 490, peak: false };
-}
-
 // ใช้วันที่ตามเวลาท้องถิ่น (ไม่ใช่ UTC) เพื่อไม่ให้วันที่คลาดเคลื่อนตอนใกล้เที่ยงคืน
-// (toISOString() แปลงเป็น UTC ก่อน ซึ่งประเทศไทย (+7) จะทำให้วันที่เพี้ยนไป 1 วันได้)
 const toIso = (d) => {
   if (!d) return "";
   const y = d.getFullYear();
@@ -122,7 +150,6 @@ const LINE_OA_URL = "https://line.me/R/ti/p/@347mlhra";
 const MAP_URL = "https://maps.app.goo.gl/wbDULbGf8VtaLbiW7";
 
 // ─── Membership package (โครงไว้สำหรับอนาคต — ยังไม่เปิดใช้งาน) ────────────────
-// TODO: เปิดใช้งานระบบสมาชิกแบบเหมาจ่ายในอนาคต เมื่อกำหนดราคาชัดเจนแล้ว
 // eslint-disable-next-line no-unused-vars
 const MEMBERSHIP_PACKAGE = { sessions: 10, price: null, active: false };
 
@@ -154,13 +181,13 @@ const CSS = `
 const T = {
   th: {
     bookNow: "จองสนามเลย →", home: "หน้าแรก", book: "จองสนาม", myBookings: "การจองของฉัน",
-    selectDate: "เลือกวันที่", selectCourt: "เลือกสนาม", selectTime: "เลือกช่วงเวลา",
+    selectDate: "เลือกวันที่", selectCourt: "เลือกสนาม", selectDuration: "เลือกระยะเวลา", selectTime: "เลือกช่วงเวลา",
     proceed: "ดำเนินการต่อ →", confirm: "ยืนยันการจอง", cancel: "ยกเลิก",
     name: "ชื่อ (ไม่เกิน 16 ตัว)", phone: "เบอร์โทรศัพท์",
     discount: "🏷 รหัสส่วนลด (ถ้ามี)", useCode: "ใช้โค้ด",
     payment: "ชำระเงิน", scanQR: "สแกน QR Code ชำระผ่าน PromptPay",
     transfer: "โอนให้ถูกต้อง", bookingDetail: "รายละเอียดการจอง",
-    court: "สนาม", date: "วันที่", time: "เวลา", price: "ยอดชำระ",
+    court: "สนาม", date: "วันที่", time: "เวลา", duration: "ระยะเวลา", price: "ยอดชำระ",
     total: "ยอดชำระ", payDone: "ชำระเงินแล้ว / กลับหน้าหลัก",
     uploadSlip: "📎 แนบสลิปการโอนเงิน", selectSlip: "📷 เลือกรูปสลิป",
     changeSlip: "🔄 เปลี่ยนรูปสลิป", sendSlip: "✅ ส่งสลิป",
@@ -168,6 +195,7 @@ const T = {
     slipSentDesc: "สถานะ: รอการยืนยัน — กำลังนำท่านไปหน้าตรวจสอบการจอง...",
     noSlot: "😔 ไม่มีช่วงเวลาว่างในวันนี้",
     selectDateFirst: "กรุณาเลือกวันที่และสนามก่อน",
+    selectDurationFirst: "กรุณาเลือกระยะเวลาก่อน",
     confirmBooking: "ยืนยัน ✓", morningPrice: "ช่วงเช้า", eveningPrice: "ช่วงบ่าย-เย็น",
     steps: "ขั้นตอนการชำระเงิน", contactUs: "ติดต่อเรา",
     rules: "กฎระเบียบสนาม", cancelPolicy: "นโยบายการยกเลิก",
@@ -183,25 +211,20 @@ const T = {
     notFound: "ไม่พบการจองสำหรับเบอร์นี้",
     statusPending: "รอชำระเงิน", statusReviewing: "รอการยืนยัน",
     statusConfirmed: "การจองสำเร็จ", statusCancelled: "การจองถูกยกเลิกแล้ว",
-    cancelBookingBtn: "❌ ยกเลิกการจอง", cancellingBtn: "⏳ กำลังยกเลิก...",
-    cannotCancelPast: "❌ ไม่สามารถยกเลิกได้ เนื่องจากเลยเวลาแล้ว",
-    cannotCancel24h: "❌ ไม่สามารถยกเลิกได้ เนื่องจากเหลือเวลาน้อยกว่า 24 ชั่วโมง",
-    confirmCancelPrompt: "ยืนยันการยกเลิก?\nคุณจะได้รับเงินคืนเต็มจำนวน",
-    cancelSuccess: "✅ ยกเลิกการจองเรียบร้อยแล้ว",
-    warning24h: "⚠️ ไม่สามารถยกเลิกได้ เนื่องจากเหลือเวลาน้อยกว่า 24 ชั่วโมง",
     rowPrice: "💰 ราคา",
     stepsList: ["โอนเงินผ่าน QR Code ด้านบน","ถ่ายภาพสลิปการโอนเงิน","กด 'เลือกรูปสลิป' แล้วอัพโหลดสลิป","กด 'ส่งสลิป' เพื่อยืนยัน","รอทีมงานตรวจสอบและยืนยันการจอง"],
     lineLabel: "Line", mapLabel: "แผนที่ / Map",
+    minutesLabel: "นาที",
   },
   en: {
     bookNow: "Book Now →", home: "Home", book: "Book", myBookings: "My Bookings",
-    selectDate: "Select Date", selectCourt: "Select Court", selectTime: "Select Time Slot",
+    selectDate: "Select Date", selectCourt: "Select Court", selectDuration: "Select Duration", selectTime: "Select Time Slot",
     proceed: "Continue →", confirm: "Confirm Booking", cancel: "Cancel",
     name: "Name (max 16 chars)", phone: "Phone Number",
     discount: "🏷 Discount Code (optional)", useCode: "Apply",
     payment: "Payment", scanQR: "Scan QR Code via PromptPay",
     transfer: "Transfer exact amount", bookingDetail: "Booking Details",
-    court: "Court", date: "Date", time: "Time", price: "Total",
+    court: "Court", date: "Date", time: "Time", duration: "Duration", price: "Total",
     total: "Total", payDone: "Payment Done / Back to Home",
     uploadSlip: "📎 Upload Payment Slip", selectSlip: "📷 Select Slip Image",
     changeSlip: "🔄 Change Slip", sendSlip: "✅ Send Slip",
@@ -209,6 +232,7 @@ const T = {
     slipSentDesc: "Status: Awaiting confirmation — taking you to your bookings...",
     noSlot: "😔 No available slots today",
     selectDateFirst: "Please select a date and court first",
+    selectDurationFirst: "Please select a duration first",
     confirmBooking: "Confirm ✓", morningPrice: "Morning", eveningPrice: "Afternoon-Evening",
     steps: "Payment Steps", contactUs: "Contact Us",
     rules: "Court Rules", cancelPolicy: "Cancellation Policy",
@@ -224,15 +248,10 @@ const T = {
     notFound: "No bookings found for this number",
     statusPending: "Awaiting Payment", statusReviewing: "Awaiting Confirmation",
     statusConfirmed: "Booking Confirmed", statusCancelled: "Booking Cancelled",
-    cancelBookingBtn: "❌ Cancel Booking", cancellingBtn: "⏳ Cancelling...",
-    cannotCancelPast: "❌ Cannot cancel — this time has already passed",
-    cannotCancel24h: "❌ Cannot cancel — less than 24 hours remaining",
-    confirmCancelPrompt: "Confirm cancellation?\nYou will receive a full refund",
-    cancelSuccess: "✅ Booking cancelled successfully",
-    warning24h: "⚠️ Cannot cancel — less than 24 hours remaining",
     rowPrice: "💰 Price",
     stepsList: ["Transfer via the QR Code above","Take a photo of the transfer slip","Tap 'Select Slip Image' and upload it","Tap 'Send Slip' to confirm","Wait for our team to verify and confirm your booking"],
     lineLabel: "Line", mapLabel: "Map",
+    minutesLabel: "min",
   }
 };
 
@@ -256,11 +275,9 @@ function TabBar({ tab, setTab, lang="th" }) {
 
 function HomePage({ goBook, lang="th" }) {
   const t = T[lang];
-  // โชว์ป้ายโปรโมชั่นได้ตั้งแต่วันนี้จนถึงวันสุดท้ายของโปรฯ (ประกาศล่วงหน้าก่อนเปิดจริงได้ด้วย)
   const now = new Date();
   const inPromo = now <= PROMO_END;
-  // คำนวณราคาช่วงโปรฯ โดยอ้างอิงวันธรรมดาที่แน่นอนภายในช่วงโปรโมชั่นเสมอ (ไม่ขึ้นกับว่าวันนี้คือวันที่เท่าไหร่จริงๆ)
-  const promoSampleWeekday = new Date(2026, 8, 2); // พุธที่ 2 ก.ย. 2569 — อยู่ในช่วงโปรฯ แน่นอน
+  const promoSampleWeekday = new Date(2026, 8, 2);
   const normalSampleWeekday = new Date(now);
   while (normalSampleWeekday.getDay() === 0 || normalSampleWeekday.getDay() === 6) normalSampleWeekday.setDate(normalSampleWeekday.getDate()+1);
   const priceSampleDate = inPromo ? promoSampleWeekday : normalSampleWeekday;
@@ -268,8 +285,8 @@ function HomePage({ goBook, lang="th" }) {
   const peak = getSlotPrice(18, priceSampleDate);
 
   const bookingConditionItems = lang==="th"
-    ? ["จองล่วงหน้าได้สูงสุด 1 เดือน", "ชำระเงินภายใน 5 นาทีหลังยืนยัน", "1 การจอง = 1 ช่วงเวลา (1 ชั่วโมง)"]
-    : ["Book up to 1 month in advance", "Pay within 5 minutes after confirming", "1 booking = 1 time slot (1 hour)"];
+    ? ["จองล่วงหน้าได้สูงสุด 1 เดือน", "ชำระเงินภายใน 5 นาทีหลังยืนยัน", "เลือกระยะเวลาเล่นได้ 30 / 60 / 90 / 120 นาที"]
+    : ["Book up to 1 month in advance", "Pay within 5 minutes after confirming", "Choose 30 / 60 / 90 / 120 minute sessions"];
 
   const ruleItems = lang==="th" ? [
     { icon:"⏰", text:"โปรดตรงต่อเวลา และเก็บลูกเทนนิสให้เรียบร้อยก่อนหมดเวลาการจองของท่าน เพื่อให้ลูกค้าในชั่วโมงถัดไปเข้ามาใช้บริการได้ทันที" },
@@ -291,13 +308,12 @@ function HomePage({ goBook, lang="th" }) {
     <div style={{paddingBottom:90}}>
       <div style={{background:"linear-gradient(160deg,#fff 0%,var(--cr) 55%,var(--cr2) 100%)",padding:"36px 24px 0",textAlign:"center"}}>
         <NovaLogo width={180} />
-        <p style={{color:"var(--mu)",fontSize:13.5,margin:"8px 0 16px"}}>{lang==="th"?"สนามเทนนิสในร่ม • ระบบปรับอากาศ • พร้อมรองรับทุกระดับ":"Indoor Tennis Court • Air Conditioned • All Levels Welcome"}</p>
+        <p style={{color:"var(--mu)",fontSize:13.5,margin:"8px 0 16px"}}>{lang==="th"?"สนามออโต้เทนนิสในร่ม • ระบบปรับอากาศ • พร้อมรองรับทุกระดับ":"Indoor auto Tennis • Air Conditioned • All Levels Welcome"}</p>
         <img src="/court-photo.png" alt="NOVA Tennis Court" style={{width:"100%",maxWidth:520,borderRadius:16,boxShadow:"0 8px 30px rgba(102,57,36,.18)",display:"block",margin:"0 auto"}} />
         <div style={{height:16}} />
       </div>
 
       <div style={{padding:"18px 16px 0"}}>
-        {/* โปรโมชั่นเดือนแรก — การ์ดเด่น (แสดงก่อนปุ่มจองสนาม) */}
         {inPromo && (
           <div style={{position:"relative",borderRadius:18,padding:"22px 20px",marginBottom:14,background:"linear-gradient(135deg,#663924 0%,#8a4a2a 55%,#F47E1F 130%)",boxShadow:"0 10px 34px rgba(102,57,36,.35)",overflow:"hidden",color:"#fff"}}>
             <div style={{position:"absolute",top:-30,right:-30,width:120,height:120,borderRadius:"50%",background:"rgba(255,255,255,.08)"}} />
@@ -324,6 +340,7 @@ function HomePage({ goBook, lang="th" }) {
                 <p className="bb" style={{fontSize:26,lineHeight:1}}>฿490</p>
               </div>
             </div>
+            <p style={{fontSize:10.5,opacity:.7,marginTop:10}}>{lang==="th"?"ราคาต่อ 60 นาที — เลือกระยะเวลาอื่นได้ในหน้าจอง":"Price per 60 min — other durations available when booking"}</p>
           </div>
         )}
         <button className="btn-primary" onClick={goBook}>{t.bookNow}</button>
@@ -332,7 +349,7 @@ function HomePage({ goBook, lang="th" }) {
       <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
 
         <div className="card">
-          <div className="card-header"><p>{t.priceTitle}</p></div>
+          <div className="card-header"><p>{t.priceTitle}{lang==="th"?" (60 นาที)":" (60 min)"}</p></div>
           {inPromo && (
             <div style={{padding:"10px 18px",background:"var(--or-bg)",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
               <span style={{fontSize:14}}>🔥</span>
@@ -358,7 +375,6 @@ function HomePage({ goBook, lang="th" }) {
           </div>
         </div>
 
-        {/* เงื่อนไขการจอง — แบบขั้นตอนตัวเลข อ่านง่าย */}
         <div className="card">
           <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
             <span style={{fontSize:17}}>📋</span>
@@ -374,7 +390,6 @@ function HomePage({ goBook, lang="th" }) {
           </div>
         </div>
 
-        {/* กฎระเบียบสนาม — แต่ละข้อมีไอคอนของตัวเอง อ่านง่ายขึ้น */}
         <div className="card">
           <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
             <span style={{fontSize:17}}>🎾</span>
@@ -390,7 +405,6 @@ function HomePage({ goBook, lang="th" }) {
           </div>
         </div>
 
-        {/* ติดต่อเรา — โทร / Line / แผนที่ */}
         <div className="card">
           <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
             <span style={{fontSize:17}}>📞</span>
@@ -411,7 +425,7 @@ function HomePage({ goBook, lang="th" }) {
             </div>
             <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
               <span style={{color:"var(--or)",fontSize:14,lineHeight:1.5}}>›</span>
-              <span style={{fontSize:13.5,color:"var(--mu)",lineHeight:1.65}}>{lang==="th"?"เปิดทำการ 06:00–22:00 น. ทุกวัน":"Open daily 06:00–22:00"}</span>
+              <span style={{fontSize:13.5,color:"var(--mu)",lineHeight:1.65}}>{lang==="th"?"เปิดทำการ 06:00–23:00 น. ทุกวัน":"Open daily 06:00–23:00"}</span>
             </div>
           </div>
         </div>
@@ -422,7 +436,6 @@ function HomePage({ goBook, lang="th" }) {
 
 function Calendar({ selected, onSelect, lang="th" }) {
   const today = new Date(); today.setHours(0,0,0,0);
-  // ห้ามจองก่อนวันเปิดจองจริง (BOOKING_OPEN_DATE) แม้ปฏิทินจะเปิดดูล่วงหน้าได้
   const minDate = today > BOOKING_OPEN_DATE ? today : BOOKING_OPEN_DATE;
   const maxDate = new Date(minDate); maxDate.setDate(maxDate.getDate()+30);
   const [view, setView] = useState(new Date(minDate.getFullYear(), minDate.getMonth(), 1));
@@ -470,35 +483,54 @@ function BookingPage({ onProceed, lang="th" }) {
   const t = T[lang];
   const [date, setDate] = useState(null);
   const [court, setCourt] = useState(null);
+  const [duration, setDuration] = useState(null);
   const [slot, setSlot] = useState(null);
-  const [bookedHours, setBookedHours] = useState([]);
+  const [bookedIntervals, setBookedIntervals] = useState([]);
   const [loading, setLoading] = useState(false);
-  const ready = date && court && slot;
+  const ready = date && court && duration && slot;
 
   useEffect(() => {
     if (!date || !court) return;
     setLoading(true);
     db.getBookings(toIso(date), court.courtId).then(data => {
-      setBookedHours((data||[]).map(b => b.hour));
+      const now = Date.now();
+      const active = (data || []).filter(b => {
+        // "รอชำระ" ที่ค้างเกิน 5 นาทีแล้ว ไม่นับว่าบล็อกช่วงเวลาอีกต่อไป (ปล่อยให้จองใหม่ได้)
+        if (b.status === "pending") {
+          const created = new Date(b.created_time).getTime();
+          return (now - created) < 5 * 60 * 1000;
+        }
+        return true;
+      });
+      setBookedIntervals(active.map(b => {
+        const startMin = (b.hour || 0) * 60 + (b.start_minute || 0);
+        const dur = b.duration_minutes || 60;
+        return [startMin, startMin + dur];
+      }));
       setLoading(false);
     });
   }, [date, court]);
 
-  // ตัดช่วงเวลาที่ถูกจองแล้วออก และตัดช่วงเวลาที่ผ่านไปแล้ว (ถ้าเป็นวันนี้)
   const isToday = date && toIso(date) === toIso(new Date());
-  const currentHour = new Date().getHours();
-  // ช่วง 1–4 ก.ย. 2569: Court 2 ยังไม่เปิดให้บริการจริง แต่แสดงผลเหมือนถูกจองเต็มแล้ว (ไม่แจ้งเหตุผลให้ลูกค้าเห็น)
+  const nowMinutes = new Date().getHours()*60 + new Date().getMinutes();
   const court2NotYetOpen = court?.courtId === 2 && isCourt2Restricted(date);
-  const forcedFull = court2NotYetOpen || isFullyBookedDate(date); // isFullyBookedDate ครอบคลุมทั้ง 2 สนามในวันนั้น
-  const availableSlots = forcedFull ? [] : TIME_SLOT_HOURS
-    .filter(hour => {
-      if (bookedHours.includes(hour)) return false;
-      if (isToday && hour <= currentHour) return false;
-      return true;
+  const forcedFull = court2NotYetOpen || isFullyBookedDate(date);
+
+  const availableSlots = (!duration || forcedFull) ? [] : getCandidateStarts(duration)
+    .filter(startMin => {
+      if (isToday && startMin <= nowMinutes) return false;
+      const endMin = startMin + duration;
+      return !bookedIntervals.some(([s,e]) => startMin < e && endMin > s);
     })
-    .map(hour => {
-      const { price, peak } = getSlotPrice(hour, date || new Date());
-      return { hour, label: `${String(hour).padStart(2,"0")}:00 – ${String(hour).padStart(2,"0")}:59`, price, peak };
+    .map(startMin => {
+      const startHour = Math.floor(startMin/60);
+      const { price, peak } = getDurationPrice(startHour, date || new Date(), duration);
+      return {
+        startMin, durationMinutes: duration,
+        hour: startHour, startMinute: startMin % 60,
+        label: `${minutesToLabel(startMin)} – ${minutesToLabel(startMin+duration)}`,
+        price, peak,
+      };
     });
 
   return (
@@ -530,10 +562,28 @@ function BookingPage({ onProceed, lang="th" }) {
         </div>
       </section>
       <section>
-        <StepHead n="3" label={t.selectTime} />
+        <StepHead n="3" label={t.selectDuration} />
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+          {DURATION_OPTIONS.map(min => {
+            const sel = duration === min;
+            return (
+              <button key={min} onClick={() => { setDuration(min); setSlot(null); }} style={{padding:"14px 6px",borderRadius:10,border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:sel?"var(--or-bg)":"#fff",cursor:"pointer",textAlign:"center"}}>
+                <p className="bb" style={{fontSize:22,color:sel?"var(--or)":"var(--br)",lineHeight:1}}>{min}</p>
+                <p style={{fontSize:10.5,color:"var(--mu)",marginTop:3}}>{t.minutesLabel}</p>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+      <section>
+        <StepHead n="4" label={t.selectTime} />
         {(!date||!court) ? (
           <div style={{background:"#fff",borderRadius:"var(--r)",padding:"22px",textAlign:"center",border:"1px solid var(--dv)"}}>
             <p style={{color:"var(--mu)",fontSize:14}}>{t.selectDateFirst}</p>
+          </div>
+        ) : !duration ? (
+          <div style={{background:"#fff",borderRadius:"var(--r)",padding:"22px",textAlign:"center",border:"1px solid var(--dv)"}}>
+            <p style={{color:"var(--mu)",fontSize:14}}>{t.selectDurationFirst}</p>
           </div>
         ) : loading ? (
           <div style={{background:"#fff",borderRadius:"var(--r)",padding:"22px",textAlign:"center",border:"1px solid var(--dv)"}}>
@@ -550,9 +600,9 @@ function BookingPage({ onProceed, lang="th" }) {
               <Dot color="var(--bl)" label={`฿${availableSlots.find(s=>s.peak)?.price ?? "-"} · Peak`} />
             </div>
             {availableSlots.map(ts => {
-              const isSel = slot?.hour === ts.hour;
+              const isSel = slot?.startMin === ts.startMin;
               return (
-                <button key={ts.hour} onClick={() => setSlot(ts)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"13px 16px",borderRadius:10,border:`1.5px solid ${isSel?"var(--or)":"var(--dv)"}`,background:isSel?"var(--or-bg)":"#fff",cursor:"pointer",boxShadow:isSel?"0 2px 10px rgba(244,126,31,.15)":"none"}}>
+                <button key={ts.startMin} onClick={() => setSlot(ts)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"13px 16px",borderRadius:10,border:`1.5px solid ${isSel?"var(--or)":"var(--dv)"}`,background:isSel?"var(--or-bg)":"#fff",cursor:"pointer",boxShadow:isSel?"0 2px 10px rgba(244,126,31,.15)":"none"}}>
                   <div style={{display:"flex",alignItems:"center",gap:10}}>
                     <div style={{width:8,height:8,borderRadius:"50%",background:ts.peak?"var(--bl)":"var(--or)"}} />
                     <span style={{fontSize:14}}>{ts.label}</span>
@@ -620,6 +670,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, lang="th" }) {
           <Row label={`🎾 ${t.court}`} val={court.courtName} />
           <Row label={`📅 ${t.date}`} val={fmtDate(date, lang)} />
           <Row label={`🕐 ${t.time}`} val={slot.label} />
+          <Row label={`⏱ ${t.duration}`} val={`${slot.durationMinutes} ${t.minutesLabel}`} />
           {discount && <Row label="🏷" val={`-฿${discountAmount.toLocaleString()}`} />}
           <div style={{borderTop:"1px solid var(--dv)",margin:"12px 0"}} />
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -671,19 +722,23 @@ function CheckoutPage({ booking, onCancel, onConfirm, lang="th" }) {
   );
 }
 
-function PaymentPage({ booking, customer, onDone, lang="th" }) {
+// resumeBooking (ถ้ามี) = { id, createdAt } ใช้ตอนกลับมาหน้านี้หลัง reload โดยไม่ต้องสร้างการจองใหม่ซ้ำ
+function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking }) {
   const t = T[lang];
   const { date, court, slot } = booking;
   const { finalPrice, discountAmount, discount } = customer;
-  const [secs, setSecs] = useState(300);
-  const [expired, setExpired] = useState(false);
+  const initialSecs = resumeBooking
+    ? Math.max(0, 300 - Math.floor((Date.now() - new Date(resumeBooking.createdAt).getTime())/1000))
+    : 300;
+  const [secs, setSecs] = useState(initialSecs);
+  const [expired, setExpired] = useState(initialSecs <= 0);
   const [slip, setSlip] = useState(null);
   const [slipPreview, setSlipPreview] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [uploaded, setUploaded] = useState(false);
-  const [bookingId, setBookingId] = useState(null);
+  const [bookingId, setBookingId] = useState(resumeBooking?.id || null);
   const fileRef = useRef();
-  const savedRef = useRef(false);
+  const savedRef = useRef(!!resumeBooking);
 
   useEffect(() => {
     const save = async () => {
@@ -696,6 +751,8 @@ function PaymentPage({ booking, customer, onDone, lang="th" }) {
         customer_name: customer.name,
         booking_date: toIso(date),
         hour: slot.hour,
+        start_minute: slot.startMinute || 0,
+        duration_minutes: slot.durationMinutes || 60,
         price: finalPrice,
         discount_code: discount?.code || null,
         discount_amount: discountAmount || 0,
@@ -703,6 +760,13 @@ function PaymentPage({ booking, customer, onDone, lang="th" }) {
       });
       if (b) {
         setBookingId(b.id);
+        // เก็บ bookingId ไว้ใน URL — ถ้าเบราว์เซอร์รีโหลดตอนออกไปสแกนจ่ายเงินแล้วกลับมา
+        // ระบบจะดึงการจองนี้กลับมาที่หน้าแนบสลิปได้ทันที ไม่หลุดกลับไปหน้าแรก
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.set("booking", b.id);
+          window.history.replaceState(null, "", url.toString());
+        } catch { /* no-op */ }
         if (discount) await db.useDiscount(discount.id, discount.used_count);
       }
     };
@@ -715,7 +779,6 @@ function PaymentPage({ booking, customer, onDone, lang="th" }) {
     return () => clearTimeout(timer);
   }, [secs]);
 
-  // หลังส่งสลิปสำเร็จ รอสักครู่แล้วพาไปหน้า "การจองของฉัน" อัตโนมัติ
   useEffect(() => {
     if (!uploaded) return;
     const timer = setTimeout(() => onDone(customer.phone), 1800);
@@ -741,7 +804,6 @@ function PaymentPage({ booking, customer, onDone, lang="th" }) {
     if (url) {
       await db.updateSlip(bookingId, url);
       setUploaded(true);
-      // แจ้งเตือนแอดมินผ่าน Telegram (ไม่บล็อกการทำงานหลักถ้าแจ้งเตือนล้มเหลว)
       fetch("/api/notify-admin-telegram", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -762,7 +824,6 @@ function PaymentPage({ booking, customer, onDone, lang="th" }) {
     <div style={{padding:"20px 16px 90px"}} className="fu">
       <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:18}}>{t.payment}</h2>
 
-      {/* Countdown */}
       <div style={{background:"#fff",borderRadius:"var(--r)",marginBottom:16,border:`1.5px solid ${expired?"#c0392b":urgent?"#e67e22":"var(--dv)"}`,padding:"16px 20px",textAlign:"center",boxShadow:"var(--sh)"}}>
         <p style={{fontSize:12,color:"var(--mu)",marginBottom:3}}>{expired?t.timeExpired:t.payWithin}</p>
         <p className="bb" style={{fontSize:54,lineHeight:1,color:expired?"#c0392b":urgent?"#e67e22":"var(--br)"}}>{mm}:{ss}</p>
@@ -771,7 +832,6 @@ function PaymentPage({ booking, customer, onDone, lang="th" }) {
         </div>
       </div>
 
-      {/* QR — ใช้ QR จริงของร้าน */}
       <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",boxShadow:"0 4px 24px rgba(102,57,36,.12)",marginBottom:16,border:"1px solid var(--dv)"}}>
         <p style={{fontSize:13,color:"var(--mu)",marginBottom:12}}>{t.scanQR}</p>
         <img src="/qr-payment.png" alt="PromptPay QR" style={{width:200,height:200,borderRadius:10,border:"1px solid var(--dv)"}} />
@@ -789,7 +849,6 @@ function PaymentPage({ booking, customer, onDone, lang="th" }) {
         )}
       </div>
 
-      {/* Booking detail */}
       <div className="card" style={{marginBottom:16}}>
         <div className="card-header"><p>{t.bookingDetail}</p></div>
         <div className="card-body">
@@ -801,7 +860,6 @@ function PaymentPage({ booking, customer, onDone, lang="th" }) {
         </div>
       </div>
 
-      {/* Upload slip */}
       <div className="card" style={{marginBottom:16}}>
         <div className="card-header"><p>{t.uploadSlip}</p></div>
         <div className="card-body">
@@ -825,7 +883,6 @@ function PaymentPage({ booking, customer, onDone, lang="th" }) {
         </div>
       </div>
 
-      {/* Steps */}
       <div className="card" style={{marginBottom:24}}>
         <div style={{padding:"11px 18px",borderBottom:"1px solid var(--dv)",background:"var(--bl-bg)"}}>
           <p style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{t.steps}</p>
@@ -899,7 +956,6 @@ function CancelPage({ lang="th", initialPhone="" }) {
     setLoading(false); setSearched(true);
   };
 
-  // ถ้ามาจากหน้าชำระเงินพร้อมเบอร์โทร ให้ค้นหาให้อัตโนมัติทันที
   useEffect(() => {
     if (initialPhone && /^[0-9]{10}$/.test(initialPhone)) {
       handleSearch(initialPhone);
@@ -935,6 +991,8 @@ function CancelPage({ lang="th", initialPhone="" }) {
       <div style={{display:"flex",flexDirection:"column",gap:12}}>
         {bookings.map(b => {
           const st = statusLabel(b.status);
+          const startMin = (b.hour||0)*60 + (b.start_minute||0);
+          const dur = b.duration_minutes || 60;
           return (
             <div key={b.id} className="card">
               <div style={{padding:"14px 16px"}}>
@@ -943,7 +1001,7 @@ function CancelPage({ lang="th", initialPhone="" }) {
                   <span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 10px",borderRadius:20}}>{st.text}</span>
                 </div>
                 <Row label={`📅 ${t.date}`} val={new Date(b.booking_date).toLocaleDateString(lang==="th"?"th-TH":"en-GB",{year:"numeric",month:"long",day:"numeric"})} />
-                <Row label={`🕐 ${t.time}`} val={`${String(b.hour).padStart(2,"0")}:00 – ${String(b.hour).padStart(2,"0")}:59`} />
+                <Row label={`🕐 ${t.time}`} val={`${minutesToLabel(startMin)} – ${minutesToLabel(startMin+dur)}`} />
                 <Row label={t.rowPrice} val={`฿${b.price?.toLocaleString()}`} />
               </div>
             </div>
@@ -960,6 +1018,7 @@ export default function AppV2() {
   const [page, setPage] = useState("booking");
   const [booking, setBooking] = useState(null);
   const [customer, setCustomer] = useState(null);
+  const [resumeBooking, setResumeBooking] = useState(null);
   const [adminLoggedIn, setAdminLoggedIn] = useState(false);
   const [adminMode, setAdminMode] = useState(false);
   const [adminPw, setAdminPw] = useState("");
@@ -968,9 +1027,48 @@ export default function AppV2() {
   const [lang, setLang] = useState("th");
   const [prefillPhone, setPrefillPhone] = useState("");
   const ADMIN_PW = import.meta.env.VITE_ADMIN_PASSWORD || "nova2024";
-  const goTab = (id) => { setTab(id); if(id==="book") setPage("booking"); };
 
-  // กดโลโก้ 5 ครั้งเปิด Admin
+  const clearResumeParam = () => {
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("booking");
+      window.history.replaceState(null, "", url.toString());
+    } catch { /* no-op */ }
+  };
+
+  const goTab = (id) => {
+    setTab(id);
+    if (id === "book") setPage("booking");
+    clearResumeParam();
+  };
+
+  // ตอนเปิดแอป เช็คว่ามี ?booking=<id> ค้างอยู่ใน URL ไหม (กรณีเบราว์เซอร์ reload ระหว่างออกไปสแกนจ่ายเงิน)
+  // ถ้ามีและยังเป็นสถานะ "รอชำระ" อยู่ ให้พาไปหน้าแนบสลิปของรายการนั้นต่อทันที ไม่ให้หลุดกลับหน้าแรก
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const bId = params.get("booking");
+    if (!bId) return;
+    db.getBookingById(bId).then(b => {
+      if (!b || b.status === "cancelled") { clearResumeParam(); return; }
+      if (b.status !== "pending") { clearResumeParam(); return; } // ยืนยัน/รอตรวจแล้ว ไม่ต้องพากลับหน้าชำระเงิน
+      const courtObj = COURTS.find(c => c.courtId === b.court_id);
+      if (!courtObj) { clearResumeParam(); return; }
+      const dateObj = new Date(b.booking_date + "T00:00:00");
+      const dur = b.duration_minutes || 60;
+      const startMin = (b.hour || 0) * 60 + (b.start_minute || 0);
+      const restoredSlot = {
+        startMin, durationMinutes: dur, hour: b.hour, startMinute: b.start_minute || 0,
+        label: `${minutesToLabel(startMin)} – ${minutesToLabel(startMin+dur)}`,
+        price: b.price, peak: false,
+      };
+      setBooking({ date: dateObj, court: courtObj, slot: restoredSlot });
+      setCustomer({ name: b.customer_name, phone: b.customer_id, finalPrice: b.price, discountAmount: b.discount_amount || 0, discount: null });
+      setResumeBooking({ id: b.id, createdAt: b.created_time });
+      setTab("book"); setPage("payment");
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleLogoTap = () => {
     const next = logoTaps + 1;
     setLogoTaps(next);
@@ -978,11 +1076,11 @@ export default function AppV2() {
     setTimeout(() => setLogoTaps(0), 3000);
   };
 
-  // หลังส่งสลิปสำเร็จ พาไปหน้า "การจองของฉัน" พร้อมค้นหาให้อัตโนมัติ
   const handlePaymentDone = (phone) => {
-    setBooking(null); setCustomer(null); setPage("booking");
+    setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
     setPrefillPhone(phone || "");
     setTab("cancel");
+    clearResumeParam();
   };
 
   if (adminMode && !adminLoggedIn) return (
@@ -1038,7 +1136,7 @@ export default function AppV2() {
             <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} lang={lang} />
           )}
           {tab==="book" && page==="payment" && booking && customer && (
-            <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} />
+            <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} resumeBooking={resumeBooking} />
           )}
           {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone} />}
         </main>
@@ -1060,11 +1158,9 @@ function AdminDashboard({ onLogout }) {
   const [newAmt, setNewAmt] = useState("50");
   const [newMax, setNewMax] = useState("1");
 
-  // คิวรายการที่ยังต้องตรวจสอบ/ยืนยัน — รวมทุกวันที่ไว้หน้าเดียว ไม่ต้องไล่หาทีละวัน
   const [queue, setQueue] = useState([]);
   const [queueLoading, setQueueLoading] = useState(true);
 
-  // รายงานสรุปยอด
   const [reportFrom, setReportFrom] = useState(() => {
     const d = new Date(); d.setDate(d.getDate()-6);
     return toIso(d);
@@ -1072,6 +1168,10 @@ function AdminDashboard({ onLogout }) {
   const [reportTo, setReportTo] = useState(toIso(new Date()));
   const [reportRows, setReportRows] = useState([]);
   const [reportLoading, setReportLoading] = useState(false);
+  // รายละเอียดของวันที่ admin กดดูเพิ่ม (ใครจอง จองวันไหน เวลาไหน โอนตอนกี่โมง)
+  const [expandedDay, setExpandedDay] = useState(null);
+  const [dayDetail, setDayDetail] = useState([]);
+  const [dayDetailLoading, setDayDetailLoading] = useState(false);
 
   const loadQueue = async () => {
     setQueueLoading(true);
@@ -1100,10 +1200,9 @@ function AdminDashboard({ onLogout }) {
     setCustomers(await res.json() || []);
   };
 
-  // สรุปยอดโอนเงินรายวัน — นับตามวันที่ "ทำรายการจอง/โอนเงินจริง" (created_time)
-  // ไม่ใช่วันที่จองสนามล่วงหน้า (booking_date) เพราะจะทำให้ยอดรายรับต่อวันคลาดเคลื่อน
   const loadReport = async () => {
     setReportLoading(true);
+    setExpandedDay(null);
     const fromIso = `${reportFrom}T00:00:00`;
     const toIso2 = `${reportTo}T23:59:59`;
     const res = await fetch(
@@ -1123,6 +1222,19 @@ function AdminDashboard({ onLogout }) {
     setReportLoading(false);
   };
 
+  // ดูรายละเอียดว่าวันนั้น "ใครจอง จองวันไหน เวลาไหน โอนเงินตอนกี่โมง"
+  const toggleDayDetail = async (day) => {
+    if (expandedDay === day) { setExpandedDay(null); return; }
+    setExpandedDay(day);
+    setDayDetailLoading(true);
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/bookings?created_time=gte.${day}T00:00:00&created_time=lte.${day}T23:59:59&select=*&order=created_time.asc`,
+      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+    );
+    setDayDetail(await res.json() || []);
+    setDayDetailLoading(false);
+  };
+
   useEffect(() => { loadQueue(); }, []);
   useEffect(() => { loadBookings(); }, [date]);
   useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); if(tab==="report") loadReport(); }, [tab]);
@@ -1139,7 +1251,7 @@ function AdminDashboard({ onLogout }) {
       body: JSON.stringify({ status }),
     });
     setBookings(prev => prev.map(b => b.id === id ? { ...b, status } : b));
-    setQueue(prev => prev.filter(b => b.id !== id)); // ยืนยัน/ยกเลิกแล้ว ให้หายจากคิวที่ต้องตรวจสอบทันที
+    setQueue(prev => prev.filter(b => b.id !== id));
   };
 
   const createCode = async () => {
@@ -1173,9 +1285,18 @@ function AdminDashboard({ onLogout }) {
     return {text:"⏳ รอชำระ", color:"var(--mu)"};
   };
 
+  const fmtTime = (b) => {
+    const startMin = (b.hour||0)*60 + (b.start_minute||0);
+    const dur = b.duration_minutes || 60;
+    return `${minutesToLabel(startMin)}–${minutesToLabel(startMin+dur)}`;
+  };
+  const fmtCreatedTime = (iso) => {
+    if (!iso) return "-";
+    const d = new Date(iso);
+    return d.toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"});
+  };
+
   const revenue = bookings.filter(b=>b.status==="confirmed").reduce((s,b)=>s+(b.price||0),0);
-  // เอารายการที่ยังต้องตรวจสอบ (รอชำระ/รอการยืนยัน) ขึ้นไว้บนสุดเสมอ เพื่อให้ admin ตรวจสอบได้ง่าย
-  // เรียงตามลำดับเวลาก่อน-หลังของการจองภายในกลุ่มเดียวกัน
   const statusPriority = { pending: 0, reviewing: 0, confirmed: 1, cancelled: 2 };
   const sortedBookings = [...bookings].sort((a, b) => {
     const pa = statusPriority[a.status] ?? 0;
@@ -1191,6 +1312,7 @@ function AdminDashboard({ onLogout }) {
     .adm-table th { background:#663924; color:#F47E1F; padding:9px 12px; text-align:left; }
     .adm-table td { padding:9px 12px; border-bottom:1px solid rgba(102,57,36,.1); }
     .adm-table tr:hover td { background:rgba(244,126,31,.04); }
+    .adm-table-sub th { background:#8a7060; }
   `;
 
   return (
@@ -1218,7 +1340,6 @@ function AdminDashboard({ onLogout }) {
         <div style={{padding:"20px",maxWidth:1000,margin:"0 auto"}}>
           {tab==="bookings" && (
             <div>
-              {/* คิวรายการที่ยังต้องตรวจสอบ/ยืนยัน — รวมทุกวันที่ไว้ที่เดียว เห็นง่าย ไม่ต้องไล่หาทีละวัน */}
               <div style={{marginBottom:24}}>
                 <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
                   <p style={{fontWeight:700,color:"var(--br)",fontSize:15}}>🔔 รายการที่ต้องตรวจสอบ/ยืนยัน {queue.length > 0 && `(${queue.length})`}</p>
@@ -1236,7 +1357,7 @@ function AdminDashboard({ onLogout }) {
                             <tr key={b.id}>
                               <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short"})}</td>
                               <td style={{fontWeight:700}}>Court {b.court_id}</td>
-                              <td>{String(b.hour).padStart(2,"0")}:00</td>
+                              <td>{fmtTime(b)}</td>
                               <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
                               <td>{b.customer_id}</td>
                               <td style={{fontWeight:700,color:"var(--or)"}}>฿{b.price?.toLocaleString()}</td>
@@ -1287,7 +1408,7 @@ function AdminDashboard({ onLogout }) {
                         return (
                           <tr key={b.id}>
                             <td style={{fontWeight:700}}>Court {b.court_id}</td>
-                            <td>{String(b.hour).padStart(2,"0")}:00</td>
+                            <td>{fmtTime(b)}</td>
                             <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
                             <td>{b.customer_id}</td>
                             <td style={{fontWeight:700,color:"var(--or)"}}>฿{b.price?.toLocaleString()}</td>
@@ -1315,7 +1436,7 @@ function AdminDashboard({ onLogout }) {
             <div>
               <div style={{background:"#fff",borderRadius:12,padding:20,marginBottom:20,border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
                 <p style={{fontWeight:700,color:"var(--br)",marginBottom:6}}>📊 รายงานสรุปรายรับต่อวัน</p>
-                <p style={{fontSize:12,color:"var(--mu)",marginBottom:14}}>นับตามวันที่ลูกค้าทำรายการโอนเงินจริง (ไม่ใช่วันที่จองล่วงหน้า) — รวมเฉพาะรายการที่สถานะ "การจองสำเร็จ"</p>
+                <p style={{fontSize:12,color:"var(--mu)",marginBottom:14}}>นับตามวันที่ลูกค้าทำรายการโอนเงินจริง (ไม่ใช่วันที่จองล่วงหน้า) — กดที่แถววันที่เพื่อดูรายละเอียดว่าใครจองบ้าง</p>
                 <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
                   <div>
                     <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:4}}>จากวันที่</label>
@@ -1346,15 +1467,46 @@ function AdminDashboard({ onLogout }) {
                 {reportLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
                 reportRows.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่มีข้อมูลในช่วงวันที่เลือก</p> : (
                   <table className="adm-table">
-                    <thead><tr><th>วันที่</th><th>รายการสำเร็จ</th><th>รายรับ</th><th>รายการอื่นๆ (รอ/ยกเลิก)</th></tr></thead>
+                    <thead><tr><th></th><th>วันที่</th><th>รายการสำเร็จ</th><th>รายรับ</th><th>รายการอื่นๆ (รอ/ยกเลิก)</th></tr></thead>
                     <tbody>
                       {reportRows.map(r => (
-                        <tr key={r.day}>
-                          <td style={{fontWeight:700}}>{new Date(r.day).toLocaleDateString("th-TH",{year:"numeric",month:"short",day:"numeric"})}</td>
-                          <td>{r.confirmedCount}</td>
-                          <td style={{fontWeight:700,color:"var(--or)"}}>฿{r.confirmedTotal.toLocaleString()}</td>
-                          <td style={{color:"var(--mu)"}}>{r.otherCount}</td>
-                        </tr>
+                        <Fragment key={r.day}>
+                          <tr onClick={()=>toggleDayDetail(r.day)} style={{cursor:"pointer"}}>
+                            <td style={{width:20,color:"var(--mu)"}}>{expandedDay===r.day?"▾":"▸"}</td>
+                            <td style={{fontWeight:700}}>{new Date(r.day).toLocaleDateString("th-TH",{year:"numeric",month:"short",day:"numeric"})}</td>
+                            <td>{r.confirmedCount}</td>
+                            <td style={{fontWeight:700,color:"var(--or)"}}>฿{r.confirmedTotal.toLocaleString()}</td>
+                            <td style={{color:"var(--mu)"}}>{r.otherCount}</td>
+                          </tr>
+                          {expandedDay===r.day && (
+                            <tr>
+                              <td colSpan={5} style={{padding:0,background:"#faf7f2"}}>
+                                {dayDetailLoading ? (
+                                  <p style={{padding:16,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p>
+                                ) : (
+                                  <table className="adm-table adm-table-sub" style={{margin:"8px 12px",width:"calc(100% - 24px)"}}>
+                                    <thead><tr><th>โอนเงินตอน</th><th>ชื่อลูกค้า</th><th>สนาม</th><th>วันที่จอง</th><th>เวลาที่จอง</th><th>สถานะ</th></tr></thead>
+                                    <tbody>
+                                      {dayDetail.map(b => {
+                                        const st = stInfo(b.status);
+                                        return (
+                                          <tr key={b.id}>
+                                            <td>{fmtCreatedTime(b.created_time)}</td>
+                                            <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
+                                            <td>Court {b.court_id}</td>
+                                            <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short"})}</td>
+                                            <td>{fmtTime(b)}</td>
+                                            <td><span style={{fontSize:11,fontWeight:600,color:st.color}}>{st.text}</span></td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                )}
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
                       ))}
                     </tbody>
                   </table>
