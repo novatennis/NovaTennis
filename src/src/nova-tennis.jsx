@@ -126,6 +126,21 @@ const isCourt2Restricted = (d) => d && d < COURT2_OPEN_DATE;
 const FULLY_BOOKED_DATES = ["2026-09-03"];
 const isFullyBookedDate = (d) => d && FULLY_BOOKED_DATES.includes(toIso(d));
 
+// ปิดสนามเฉพาะบางช่วงเวลาแบบกำหนดเอง (ไม่ได้มาจากยอดจองจริง เช่น ปิดซ่อมบำรุง)
+// court: "both" = ปิดทั้ง 2 สนาม, หรือใส่ 1/2 เพื่อปิดเฉพาะสนามนั้น
+// เพิ่ม/ลบรายการในลิสต์นี้ได้ตามต้องการ (บอกวันที่/เวลา/สนามมาได้เลย แล้วผมจะเพิ่มให้)
+const MANUAL_CLOSURES = [
+  { date: "2026-09-10", startMin: 10*60, endMin: 22*60, court: "both" }, // 10 ก.ย. 69, 10:00–22:00, ทั้ง 2 สนาม
+];
+const isManuallyClosed = (dateObj, courtId, startMin, endMin) => {
+  const iso = toIso(dateObj);
+  return MANUAL_CLOSURES.some(c =>
+    c.date === iso &&
+    (c.court === "both" || Number(c.court) === Number(courtId)) &&
+    startMin < c.endMin && endMin > c.startMin
+  );
+};
+
 // ใช้วันที่ตามเวลาท้องถิ่น (ไม่ใช่ UTC) เพื่อไม่ให้วันที่คลาดเคลื่อนตอนใกล้เที่ยงคืน
 const toIso = (d) => {
   if (!d) return "";
@@ -513,6 +528,7 @@ function BookingPage({ onProceed, lang="th" }) {
     .filter(startMin => {
       if (isToday && startMin <= nowMinutes) return false;
       const endMin = startMin + duration;
+      if (isManuallyClosed(date, court?.courtId, startMin, endMin)) return false;
       return !bookedIntervals.some(([s,e]) => startMin < e && endMin > s);
     })
     .map(startMin => {
