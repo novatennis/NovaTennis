@@ -1,68 +1,51 @@
 import { useState, useEffect, useRef, Fragment } from "react";
 
-// ─── Supabase ─────────────────────────────────────────────────────────────────
+// ─── Supabase (เก็บไว้ใช้แค่สำหรับอัปโหลดสลิปขึ้น Storage เท่านั้น) ────────────
+// ตาราง bookings / customers / discount_codes ทั้งหมดเข้าถึงผ่าน /api/booking-actions
+// และ /api/admin-actions เท่านั้น ไม่มีการเรียก Supabase ตรงจากเบราว์เซอร์อีกต่อไป
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
+async function callBookingAction(action, payload) {
+  const res = await fetch("/api/booking-actions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, ...payload }),
+  });
+  return res.json();
+}
+
 const db = {
-  // ดึงการจองที่ยังไม่ถูกยกเลิก พร้อมข้อมูลเวลา/ระยะเวลา/สถานะ/เวลาที่สร้าง
-  // (กรองรายการ "รอชำระ" ที่ค้างเกิน 5 นาทีออกฝั่ง client เพื่อให้ช่วงเวลานั้นกลับมาให้จองใหม่ได้อัตโนมัติ)
+  // ดึงเวลาที่ถูกจองแล้ว ผ่านเซิร์ฟเวอร์ (ไม่เปิดตารางให้เบราว์เซอร์อ่านตรง)
   async getBookings(date, courtId) {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/bookings?booking_date=eq.${date}&court_id=eq.${courtId}&status=neq.cancelled&select=hour,start_minute,duration_minutes,status,created_time`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    return res.json();
+    const { bookings } = await callBookingAction("checkAvailability", { date, courtId });
+    return bookings || [];
   },
   async getBookingById(id) {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/bookings?id=eq.${id}&select=*`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    const rows = await res.json();
-    return rows[0] || null;
+    const { booking } = await callBookingAction("getBooking", { id });
+    return booking || null;
   },
-  async addBooking(data) {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/bookings`, {
-      method: "POST",
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "return=representation" },
-      body: JSON.stringify(data),
+  // สร้างการจอง — เซิร์ฟเวอร์เป็นคนคำนวณราคาสุดท้ายเองทั้งหมด (กันการแก้ไขราคาจากฝั่ง client)
+  async createBooking({ courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId }) {
+    const { booking, error } = await callBookingAction("createBooking", {
+      courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId,
     });
-    const json = await res.json();
-    return json[0];
+    if (error) return { error };
+    return { booking };
   },
   async updateSlip(id, slipUrl) {
-    await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${id}`, {
-      method: "PATCH",
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
-    });
-  },
-  async upsertCustomer(customerId, customerName) {
-    await fetch(`${SUPABASE_URL}/rest/v1/customers`, {
-      method: "POST",
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "resolution=merge-duplicates" },
-      body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
-    });
+    await callBookingAction("updateSlip", { bookingId: id, slipUrl });
   },
   async checkDiscount(code) {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/discount_codes?code=eq.${code.toUpperCase()}&active=eq.true&select=*`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    const data = await res.json();
-    if (!data || data.length === 0) return null;
-    const d = data[0];
-    if (d.used_count >= d.max_uses) return null;
-    return d;
+    const result = await callBookingAction("checkDiscount", { code });
+    if (!result.valid) return null;
+    return result; // { id, code, discount_amount, discount_percent }
   },
-  async useDiscount(id, currentCount) {
-    await fetch(`${SUPABASE_URL}/rest/v1/discount_codes?id=eq.${id}`, {
-      method: "PATCH",
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ used_count: currentCount + 1 }),
-    });
+  async myBookings(phone) {
+    const { bookings } = await callBookingAction("myBookings", { phone });
+    return bookings || [];
   },
+  // อัปโหลดไฟล์สลิปขึ้น Supabase Storage โดยตรง (คนละระบบสิทธิ์กับตารางข้อมูล ไม่กระทบความปลอดภัยของข้อมูลลูกค้า)
   async uploadSlip(file, bookingId) {
     const ext = file.name.split(".").pop();
     const path = `slips/${bookingId}_${Date.now()}.${ext}`;
@@ -75,6 +58,16 @@ const db = {
     return `${SUPABASE_URL}/storage/v1/object/public/slips/${path}`;
   },
 };
+
+// ─── Admin API helper ───────────────────────────────────────────────────────────
+async function callAdminAction(action, token, payload) {
+  const res = await fetch("/api/admin-actions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, token, ...payload }),
+  });
+  return res.json();
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const COURTS = [
@@ -744,20 +737,23 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking }) {
     const save = async () => {
       if (savedRef.current) return;
       savedRef.current = true;
-      await db.upsertCustomer(customer.phone, customer.name);
-      const b = await db.addBooking({
-        court_id: court.courtId,
-        customer_id: customer.phone,
-        customer_name: customer.name,
-        booking_date: toIso(date),
+      // สร้างการจอง — เซิร์ฟเวอร์เป็นคนตรวจสอบช่วงเวลาว่างและคำนวณราคาสุดท้ายเองทั้งหมด
+      const { booking: b, error } = await db.createBooking({
+        courtId: court.courtId,
+        customerId: customer.phone,
+        customerName: customer.name,
+        bookingDate: toIso(date),
         hour: slot.hour,
-        start_minute: slot.startMinute || 0,
-        duration_minutes: slot.durationMinutes || 60,
-        price: finalPrice,
-        discount_code: discount?.code || null,
-        discount_amount: discountAmount || 0,
-        status: "pending",
+        startMinute: slot.startMinute || 0,
+        durationMinutes: slot.durationMinutes || 60,
+        discountCodeId: discount?.id || null,
       });
+      if (error) {
+        // ช่วงเวลานี้เพิ่งถูกจองไปโดยคนอื่นพอดี (แข่งกันจองพร้อมกัน) — แจ้งแล้วพากลับหน้าจอง
+        alert(lang==="th" ? "ขออภัย ช่วงเวลานี้เพิ่งถูกจองไปแล้ว กรุณาเลือกช่วงเวลาใหม่" : "Sorry, this time slot was just booked. Please choose another time.");
+        onDone(customer.phone);
+        return;
+      }
       if (b) {
         setBookingId(b.id);
         // เก็บ bookingId ไว้ใน URL — ถ้าเบราว์เซอร์รีโหลดตอนออกไปสแกนจ่ายเงินแล้วกลับมา
@@ -767,7 +763,6 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking }) {
           url.searchParams.set("booking", b.id);
           window.history.replaceState(null, "", url.toString());
         } catch { /* no-op */ }
-        if (discount) await db.useDiscount(discount.id, discount.used_count);
       }
     };
     save();
@@ -947,11 +942,7 @@ function CancelPage({ lang="th", initialPhone="" }) {
     const p = phoneToSearch || phone;
     if (!/^[0-9]{10}$/.test(p)) return;
     setLoading(true); setSearched(false); setBookings([]);
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/bookings?customer_id=eq.${p}&select=*&order=booking_date.desc`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    const data = await res.json();
+    const data = await db.myBookings(p);
     setBookings(data || []);
     setLoading(false); setSearched(true);
   };
@@ -1019,14 +1010,16 @@ export default function AppV2() {
   const [booking, setBooking] = useState(null);
   const [customer, setCustomer] = useState(null);
   const [resumeBooking, setResumeBooking] = useState(null);
-  const [adminLoggedIn, setAdminLoggedIn] = useState(false);
+  const [adminToken, setAdminToken] = useState(() => {
+    try { return sessionStorage.getItem("nova_admin_token") || null; } catch { return null; }
+  });
   const [adminMode, setAdminMode] = useState(false);
   const [adminPw, setAdminPw] = useState("");
   const [adminErr, setAdminErr] = useState(false);
+  const [adminChecking, setAdminChecking] = useState(false);
   const [logoTaps, setLogoTaps] = useState(0);
   const [lang, setLang] = useState("th");
   const [prefillPhone, setPrefillPhone] = useState("");
-  const ADMIN_PW = import.meta.env.VITE_ADMIN_PASSWORD || "nova2024";
 
   const clearResumeParam = () => {
     try {
@@ -1042,15 +1035,13 @@ export default function AppV2() {
     clearResumeParam();
   };
 
-  // ตอนเปิดแอป เช็คว่ามี ?booking=<id> ค้างอยู่ใน URL ไหม (กรณีเบราว์เซอร์ reload ระหว่างออกไปสแกนจ่ายเงิน)
-  // ถ้ามีและยังเป็นสถานะ "รอชำระ" อยู่ ให้พาไปหน้าแนบสลิปของรายการนั้นต่อทันที ไม่ให้หลุดกลับหน้าแรก
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const bId = params.get("booking");
     if (!bId) return;
     db.getBookingById(bId).then(b => {
       if (!b || b.status === "cancelled") { clearResumeParam(); return; }
-      if (b.status !== "pending") { clearResumeParam(); return; } // ยืนยัน/รอตรวจแล้ว ไม่ต้องพากลับหน้าชำระเงิน
+      if (b.status !== "pending") { clearResumeParam(); return; }
       const courtObj = COURTS.find(c => c.courtId === b.court_id);
       if (!courtObj) { clearResumeParam(); return; }
       const dateObj = new Date(b.booking_date + "T00:00:00");
@@ -1083,7 +1074,40 @@ export default function AppV2() {
     clearResumeParam();
   };
 
-  if (adminMode && !adminLoggedIn) return (
+  // ตรวจรหัสผ่าน Admin ที่เซิร์ฟเวอร์เสมอ (ไม่มีการเก็บ/เทียบรหัสผ่านในโค้ดฝั่งเว็บอีกต่อไป)
+  const handleAdminLogin = async () => {
+    if (!adminPw.trim() || adminChecking) return;
+    setAdminChecking(true);
+    setAdminErr(false);
+    try {
+      const res = await fetch("/api/admin-actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "login", password: adminPw }),
+      });
+      const data = await res.json();
+      if (data.ok && data.token) {
+        setAdminToken(data.token);
+        try { sessionStorage.setItem("nova_admin_token", data.token); } catch { /* no-op */ }
+      } else {
+        setAdminErr(true);
+        setTimeout(() => setAdminErr(false), 2000);
+      }
+    } catch {
+      setAdminErr(true);
+      setTimeout(() => setAdminErr(false), 2000);
+    }
+    setAdminChecking(false);
+  };
+
+  const handleAdminLogout = () => {
+    setAdminToken(null);
+    setAdminMode(false);
+    setAdminPw("");
+    try { sessionStorage.removeItem("nova_admin_token"); } catch { /* no-op */ }
+  };
+
+  if (adminMode && !adminToken) return (
     <>
       <style>{CSS}</style>
       <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(135deg,#663924,#3a1a0a)"}}>
@@ -1091,13 +1115,13 @@ export default function AppV2() {
           <NovaLogo width={140} />
           <p style={{fontSize:13,color:"var(--mu)",margin:"12px 0 28px"}}>Admin Dashboard</p>
           <input type="password" value={adminPw} onChange={e=>setAdminPw(e.target.value)}
-            onKeyDown={e=>e.key==="Enter"&&(adminPw===ADMIN_PW?setAdminLoggedIn(true):(setAdminErr(true),setTimeout(()=>setAdminErr(false),2000)))}
+            onKeyDown={e=>e.key==="Enter"&&handleAdminLogin()}
             placeholder="รหัสผ่าน"
             style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1.5px solid ${adminErr?"#c0392b":"var(--dv)"}`,fontSize:15,marginBottom:12,outline:"none"}} />
           {adminErr && <p style={{color:"#c0392b",fontSize:12,marginBottom:8}}>รหัสผ่านไม่ถูกต้อง</p>}
-          <button onClick={()=>adminPw===ADMIN_PW?setAdminLoggedIn(true):(setAdminErr(true),setTimeout(()=>setAdminErr(false),2000))}
-            style={{width:"100%",padding:"13px",borderRadius:10,border:"none",background:"#663924",color:"#F47E1F",fontWeight:700,fontSize:15,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
-            เข้าสู่ระบบ
+          <button onClick={handleAdminLogin} disabled={adminChecking}
+            style={{width:"100%",padding:"13px",borderRadius:10,border:"none",background:"#663924",color:"#F47E1F",fontWeight:700,fontSize:15,cursor:adminChecking?"not-allowed":"pointer",fontFamily:"'Noto Sans Thai',sans-serif",opacity:adminChecking?0.7:1}}>
+            {adminChecking ? "⏳ กำลังตรวจสอบ..." : "เข้าสู่ระบบ"}
           </button>
           <button onClick={()=>{setAdminMode(false);setAdminPw("");}}
             style={{marginTop:10,background:"none",border:"none",color:"var(--mu)",fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
@@ -1108,10 +1132,10 @@ export default function AppV2() {
     </>
   );
 
-  if (adminMode && adminLoggedIn) return (
+  if (adminMode && adminToken) return (
     <>
       <style>{CSS}</style>
-      <AdminDashboard onLogout={()=>{setAdminLoggedIn(false);setAdminMode(false);setAdminPw("");}} />
+      <AdminDashboard token={adminToken} onLogout={handleAdminLogout} />
     </>
   );
 
@@ -1147,7 +1171,7 @@ export default function AppV2() {
 }
 
 // ─── Admin Dashboard (inline) ─────────────────────────────────────────────────
-function AdminDashboard({ onLogout }) {
+function AdminDashboard({ token, onLogout }) {
   const [tab, setTab] = useState("bookings");
   const [bookings, setBookings] = useState([]);
   const [discounts, setDiscounts] = useState([]);
@@ -1173,45 +1197,48 @@ function AdminDashboard({ onLogout }) {
   const [dayDetail, setDayDetail] = useState([]);
   const [dayDetailLoading, setDayDetailLoading] = useState(false);
 
+  // ปิดสนาม — เลือกวันที่/สนาม/ช่วงเวลาแล้วอัปเดตทีเดียว
+  const [blocks, setBlocks] = useState([]);
+  const [blocksLoading, setBlocksLoading] = useState(true);
+  const [closeDate, setCloseDate] = useState(toIso(new Date()));
+  const [closeCourt, setCloseCourt] = useState("both"); // "1" | "2" | "both"
+  const [closeStart, setCloseStart] = useState("06:00");
+  const [closeEnd, setCloseEnd] = useState("07:00");
+  const [closeReason, setCloseReason] = useState("");
+  const [closing, setClosing] = useState(false);
+  const CLOSE_TIME_OPTIONS = (() => {
+    const opts = [];
+    for (let m = 6*60; m <= 23*60; m += 30) opts.push(`${String(Math.floor(m/60)).padStart(2,"0")}:${String(m%60).padStart(2,"0")}`);
+    return opts;
+  })();
+
   const loadQueue = async () => {
     setQueueLoading(true);
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/bookings?status=in.(pending,reviewing)&select=*&order=booking_date.asc,hour.asc`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    setQueue(await res.json() || []);
+    const { bookings: rows } = await callAdminAction("queue", token, {});
+    setQueue(rows || []);
     setQueueLoading(false);
   };
 
   const loadBookings = async () => {
     setLoading(true);
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/bookings?booking_date=eq.${date}&select=*&order=hour.asc`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
-    setBookings(await res.json() || []); setLoading(false);
+    const { bookings: rows } = await callAdminAction("byDate", token, { date });
+    setBookings(rows || []); setLoading(false);
   };
   const loadDiscounts = async () => {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/discount_codes?select=*&order=created_at.desc`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
-    setDiscounts(await res.json() || []);
+    const { discounts: rows } = await callAdminAction("listDiscounts", token, {});
+    setDiscounts(rows || []);
   };
   const loadCustomers = async () => {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/customers?select=*`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } });
-    setCustomers(await res.json() || []);
+    const { customers: rows } = await callAdminAction("customers", token, {});
+    setCustomers(rows || []);
   };
 
   const loadReport = async () => {
     setReportLoading(true);
     setExpandedDay(null);
-    const fromIso = `${reportFrom}T00:00:00`;
-    const toIso2 = `${reportTo}T23:59:59`;
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/bookings?created_time=gte.${fromIso}&created_time=lte.${toIso2}&select=created_time,price,status&order=created_time.asc`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    const data = await res.json() || [];
+    const { bookings: data } = await callAdminAction("report", token, { from: reportFrom, to: reportTo });
     const map = {};
-    data.forEach(b => {
+    (data || []).forEach(b => {
       const day = (b.created_time || "").split("T")[0];
       if (!day) return;
       if (!map[day]) map[day] = { day, confirmedCount: 0, confirmedTotal: 0, otherCount: 0 };
@@ -1227,17 +1254,60 @@ function AdminDashboard({ onLogout }) {
     if (expandedDay === day) { setExpandedDay(null); return; }
     setExpandedDay(day);
     setDayDetailLoading(true);
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/bookings?created_time=gte.${day}T00:00:00&created_time=lte.${day}T23:59:59&select=*&order=created_time.asc`,
-      { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
-    );
-    setDayDetail(await res.json() || []);
+    const { bookings: rows } = await callAdminAction("reportDetail", token, { day });
+    setDayDetail(rows || []);
     setDayDetailLoading(false);
+  };
+
+  const loadBlocks = async () => {
+    setBlocksLoading(true);
+    const { blocks: rows } = await callAdminAction("listBlocks", token, {});
+    setBlocks(rows || []);
+    setBlocksLoading(false);
+  };
+
+  const timeToParts = (hhmm) => {
+    const [h, m] = hhmm.split(":").map(Number);
+    return { hour: h, minute: m };
+  };
+
+  const handleCloseCourt = async () => {
+    if (closing) return;
+    const start = timeToParts(closeStart);
+    const end = timeToParts(closeEnd);
+    const startTotal = start.hour*60 + start.minute;
+    const endTotal = end.hour*60 + end.minute;
+    if (endTotal <= startTotal) {
+      alert("เวลาสิ้นสุดต้องหลังเวลาเริ่มต้น");
+      return;
+    }
+    const durationMinutes = endTotal - startTotal;
+    const courtIds = closeCourt === "both" ? [1, 2] : [Number(closeCourt)];
+    const confirmed = window.confirm(
+      `ยืนยันปิดสนาม ${closeCourt === "both" ? "Court 1 และ Court 2" : `Court ${closeCourt}`}\nวันที่ ${closeDate} เวลา ${closeStart}–${closeEnd}\nลูกค้าจะจองช่วงเวลานี้ไม่ได้จนกว่าจะเปิดใช้งานอีกครั้ง`
+    );
+    if (!confirmed) return;
+    setClosing(true);
+    for (const courtId of courtIds) {
+      await callAdminAction("blockCourt", token, {
+        date: closeDate, courtId, hour: start.hour, startMinute: start.minute, durationMinutes, reason: closeReason.trim() || null,
+      });
+    }
+    setClosing(false);
+    setCloseReason("");
+    loadBlocks();
+  };
+
+  const handleUnblock = async (id) => {
+    const confirmed = window.confirm("เปิดใช้งานช่วงเวลานี้อีกครั้งใช่หรือไม่? ลูกค้าจะกลับมาจองได้ตามปกติ");
+    if (!confirmed) return;
+    await callAdminAction("unblockCourt", token, { id });
+    setBlocks(prev => prev.filter(b => b.id !== id));
   };
 
   useEffect(() => { loadQueue(); }, []);
   useEffect(() => { loadBookings(); }, [date]);
-  useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); if(tab==="report") loadReport(); }, [tab]);
+  useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); if(tab==="report") loadReport(); if(tab==="closures") loadBlocks(); }, [tab]);
 
   const updateStatus = async (id, status) => {
     const msg = status === "confirmed"
@@ -1245,22 +1315,14 @@ function AdminDashboard({ onLogout }) {
       : "ยกเลิกการจองนี้ใช่หรือไม่? การกระทำนี้ไม่สามารถย้อนกลับได้ และช่วงเวลานี้จะกลับมาให้ลูกค้าจองได้ใหม่";
     const confirmed = window.confirm(msg);
     if (!confirmed) return;
-    await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${id}`, {
-      method: "PATCH",
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ status }),
-    });
+    await callAdminAction("updateStatus", token, { id, status });
     setBookings(prev => prev.map(b => b.id === id ? { ...b, status } : b));
     setQueue(prev => prev.filter(b => b.id !== id));
   };
 
   const createCode = async () => {
     if (!newCode.trim()) return;
-    await fetch(`${SUPABASE_URL}/rest/v1/discount_codes`, {
-      method: "POST",
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ code: newCode.toUpperCase(), discount_amount: parseInt(newAmt), discount_percent: 0, max_uses: parseInt(newMax), active: true }),
-    });
+    await callAdminAction("createDiscount", token, { code: newCode, amount: newAmt, maxUses: newMax });
     setNewCode(""); loadDiscounts();
   };
 
@@ -1270,11 +1332,7 @@ function AdminDashboard({ onLogout }) {
   };
 
   const toggleDiscount = async (id, active) => {
-    await fetch(`${SUPABASE_URL}/rest/v1/discount_codes?id=eq.${id}`, {
-      method: "PATCH",
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ active }),
-    });
+    await callAdminAction("toggleDiscount", token, { id, active });
     loadDiscounts();
   };
 
@@ -1282,6 +1340,7 @@ function AdminDashboard({ onLogout }) {
     if(s==="confirmed") return {text:"✅ การจองสำเร็จ", color:"#2d7a4f"};
     if(s==="cancelled") return {text:"❌ การจองถูกยกเลิกแล้ว", color:"#c0392b"};
     if(s==="reviewing") return {text:"🔍 รอการยืนยัน", color:"#e67e22"};
+    if(s==="blocked") return {text:"🚫 ปิดสนาม", color:"#663924"};
     return {text:"⏳ รอชำระ", color:"var(--mu)"};
   };
 
@@ -1297,7 +1356,7 @@ function AdminDashboard({ onLogout }) {
   };
 
   const revenue = bookings.filter(b=>b.status==="confirmed").reduce((s,b)=>s+(b.price||0),0);
-  const statusPriority = { pending: 0, reviewing: 0, confirmed: 1, cancelled: 2 };
+  const statusPriority = { pending: 0, reviewing: 0, confirmed: 1, cancelled: 2, blocked: 3 };
   const sortedBookings = [...bookings].sort((a, b) => {
     const pa = statusPriority[a.status] ?? 0;
     const pb = statusPriority[b.status] ?? 0;
@@ -1330,7 +1389,7 @@ function AdminDashboard({ onLogout }) {
         </header>
 
         <div style={{background:"#fff",borderBottom:"1px solid var(--dv)",display:"flex",padding:"0 20px",overflowX:"auto"}}>
-          {[["bookings","📋 การจอง"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
+          {[["bookings","📋 การจอง"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
             <button key={id} onClick={() => setTab(id)} style={{padding:"13px 16px",background:"none",border:"none",borderBottom:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",fontWeight:tab===id?700:400,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
               {label}
             </button>
@@ -1381,7 +1440,7 @@ function AdminDashboard({ onLogout }) {
               <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:10}}>📅 ดูตามวันที่</p>
               <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:20}}>
                 {[
-                  {label:"ทั้งหมด",val:bookings.length,color:"var(--br)"},
+                  {label:"ทั้งหมด",val:bookings.filter(b=>b.status!=="blocked").length,color:"var(--br)"},
                   {label:"การจองสำเร็จ",val:bookings.filter(b=>b.status==="confirmed").length,color:"#2d7a4f"},
                   {label:"รอดำเนินการ",val:bookings.filter(b=>b.status==="reviewing"||b.status==="pending").length,color:"#e67e22"},
                   {label:"รายได้วันนี้",val:`฿${revenue.toLocaleString()}`,color:"var(--or)"},
@@ -1415,16 +1474,89 @@ function AdminDashboard({ onLogout }) {
                             <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
                             <td><span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 8px",borderRadius:20}}>{st.text}</span></td>
                             <td>
-                              {b.status!=="cancelled" && (
+                              {b.status!=="cancelled" && b.status!=="blocked" && (
                                 <div style={{display:"flex",gap:6}}>
                                   {b.status!=="confirmed" && <button onClick={()=>updateStatus(b.id,"confirmed")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>}
                                   <button onClick={()=>updateStatus(b.id,"cancelled")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
                                 </div>
                               )}
+                              {b.status==="blocked" && <span style={{fontSize:11,color:"var(--mu)"}}>จัดการที่แท็บ "ปิดสนาม"</span>}
                             </td>
                           </tr>
                         );
                       })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab==="closures" && (
+            <div>
+              <div style={{background:"#fff",borderRadius:12,padding:20,marginBottom:20,border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                <p style={{fontWeight:700,color:"var(--br)",marginBottom:6}}>🚫 ปิดสนาม</p>
+                <p style={{fontSize:12,color:"var(--mu)",marginBottom:16}}>เลือกวันที่ สนาม และช่วงเวลาที่ต้องการปิด (เช่น ปิดซ่อมบำรุง) ลูกค้าจะไม่สามารถจองช่วงเวลานี้ได้จนกว่าจะกดเปิดใช้งานอีกครั้ง</p>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:14}}>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>วันที่</label>
+                    <input type="date" value={closeDate} onChange={e=>setCloseDate(e.target.value)}
+                      style={{width:"100%",padding:"9px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>สนาม</label>
+                    <select value={closeCourt} onChange={e=>setCloseCourt(e.target.value)}
+                      style={{width:"100%",padding:"9px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}}>
+                      <option value="both">Court 1 และ 2</option>
+                      <option value="1">Court 1</option>
+                      <option value="2">Court 2</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>เวลาเริ่ม</label>
+                    <select value={closeStart} onChange={e=>setCloseStart(e.target.value)}
+                      style={{width:"100%",padding:"9px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}}>
+                      {CLOSE_TIME_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>เวลาสิ้นสุด</label>
+                    <select value={closeEnd} onChange={e=>setCloseEnd(e.target.value)}
+                      style={{width:"100%",padding:"9px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}}>
+                      {CLOSE_TIME_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div style={{marginBottom:14}}>
+                  <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>เหตุผล (ไม่บังคับ)</label>
+                  <input value={closeReason} onChange={e=>setCloseReason(e.target.value)} placeholder="เช่น ซ่อมบำรุง, ทำความสะอาด"
+                    style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                </div>
+                <button onClick={handleCloseCourt} disabled={closing} style={{padding:"11px 20px",borderRadius:8,border:"none",background:"#c0392b",color:"#fff",fontWeight:700,fontSize:14,cursor:closing?"not-allowed":"pointer",opacity:closing?0.7:1,fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                  {closing ? "⏳ กำลังปิด..." : "🚫 ปิดสนามตามที่เลือก"}
+                </button>
+              </div>
+
+              <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:10}}>รายการที่ปิดอยู่ตอนนี้ (จากวันนี้เป็นต้นไป)</p>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                {blocksLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                blocks.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่มีรายการปิดสนามที่กำลังจะมาถึง</p> : (
+                  <table className="adm-table">
+                    <thead><tr><th>วันที่</th><th>สนาม</th><th>เวลา</th><th>เหตุผล</th><th>จัดการ</th></tr></thead>
+                    <tbody>
+                      {blocks.map(b => (
+                        <tr key={b.id}>
+                          <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short",year:"numeric"})}</td>
+                          <td style={{fontWeight:700}}>Court {b.court_id}</td>
+                          <td>{fmtTime(b)}</td>
+                          <td style={{color:"var(--mu)"}}>{(b.customer_name||"").replace("🚫 ปิดสนาม","").replace(/[()]/g,"").trim() || "-"}</td>
+                          <td>
+                            <button onClick={()=>handleUnblock(b.id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>
+                              เปิดใช้งาน
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 )}
