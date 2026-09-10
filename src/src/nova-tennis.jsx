@@ -122,15 +122,13 @@ const BOOKING_OPEN_DATE = new Date(2026, 8, 1, 0, 0, 0); // 1 ก.ย. 2569
 const COURT2_OPEN_DATE = new Date(2026, 8, 5, 0, 0, 0); // Court 2 เริ่มเปิด 5 ก.ย. 2569
 const isCourt2Restricted = (d) => d && d < COURT2_OPEN_DATE;
 
-// วันที่เต็มทั้ง 2 สนามแบบกำหนดเอง (ไม่ได้มาจากยอดจองจริง) — เพิ่ม/ลบวันที่ในลิสต์นี้ได้ตามต้องการ
-const FULLY_BOOKED_DATES = ["2026-09-03"];
-const isFullyBookedDate = (d) => d && FULLY_BOOKED_DATES.includes(toIso(d));
-
 // ปิดสนามเฉพาะบางช่วงเวลาแบบกำหนดเอง (ไม่ได้มาจากยอดจองจริง เช่น ปิดซ่อมบำรุง)
 // court: "both" = ปิดทั้ง 2 สนาม, หรือใส่ 1/2 เพื่อปิดเฉพาะสนามนั้น
 // เพิ่ม/ลบรายการในลิสต์นี้ได้ตามต้องการ (บอกวันที่/เวลา/สนามมาได้เลย แล้วผมจะเพิ่มให้)
 const MANUAL_CLOSURES = [
   { date: "2026-09-10", startMin: 10*60, endMin: 22*60, court: "both" }, // 10 ก.ย. 69, 10:00–22:00, ทั้ง 2 สนาม
+  { date: "2026-09-11", startMin: DAY_START_MIN, endMin: DAY_END_MIN, court: "2" }, // 11 ก.ย. 69, Court 2 ปิดทั้งวัน
+  { date: "2026-09-11", startMin: 11*60, endMin: DAY_END_MIN, court: "1" }, // 11 ก.ย. 69, Court 1 ปิดหลัง 11:00
 ];
 const isManuallyClosed = (dateObj, courtId, startMin, endMin) => {
   const iso = toIso(dateObj);
@@ -139,6 +137,28 @@ const isManuallyClosed = (dateObj, courtId, startMin, endMin) => {
     (c.court === "both" || Number(c.court) === Number(courtId)) &&
     startMin < c.endMin && endMin > c.startMin
   );
+};
+
+// วันที่เต็มทั้ง 2 สนามแบบกำหนดเอง — คำนวณอัตโนมัติจาก MANUAL_CLOSURES (เช็คว่าทั้งวันของทั้ง 2 สนามถูกปิดหมดหรือยัง)
+// บวกกับลิสต์ FULLY_BOOKED_DATES เดิมไว้เผื่อใช้ระบุตรงๆ ก็ได้
+const FULLY_BOOKED_DATES = ["2026-09-03"];
+function isCourtFullyClosedForDate(dateObj, courtId) {
+  const iso = toIso(dateObj);
+  const intervals = MANUAL_CLOSURES
+    .filter(c => c.date === iso && (c.court === "both" || Number(c.court) === Number(courtId)))
+    .map(c => [c.startMin, c.endMin])
+    .sort((a, b) => a[0] - b[0]);
+  let cursor = DAY_START_MIN;
+  for (const [s, e] of intervals) {
+    if (s > cursor) return false; // มีช่วงที่ยังไม่ถูกปิด เหลือให้จองได้
+    cursor = Math.max(cursor, e);
+  }
+  return cursor >= DAY_END_MIN;
+}
+const isFullyBookedDate = (d) => {
+  if (!d) return false;
+  if (FULLY_BOOKED_DATES.includes(toIso(d))) return true;
+  return isCourtFullyClosedForDate(d, 1) && isCourtFullyClosedForDate(d, 2);
 };
 
 // ใช้วันที่ตามเวลาท้องถิ่น (ไม่ใช่ UTC) เพื่อไม่ให้วันที่คลาดเคลื่อนตอนใกล้เที่ยงคืน
