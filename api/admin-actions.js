@@ -138,7 +138,9 @@ export default async function handler(req, res) {
       }
       case "listBlocks": {
         // แสดงเฉพาะรายการปิดสนามที่ยังไม่ผ่านไปแล้ว (จากวันนี้เป็นต้นไป)
-        const todayIso = new Date().toISOString().split("T")[0];
+        // ใช้เวลาไทย (+7) แทน UTC ตรงๆ กันวันที่คลาดเคลื่อนตอนใกล้เที่ยงคืน
+        const nowBangkok = new Date(Date.now() + 7 * 60 * 60 * 1000);
+        const todayIso = nowBangkok.toISOString().split("T")[0];
         const { body } = await sb(`bookings?status=eq.blocked&booking_date=gte.${todayIso}&select=*&order=booking_date.asc,hour.asc`);
         res.status(200).json({ blocks: body || [] });
         return;
@@ -148,7 +150,7 @@ export default async function handler(req, res) {
         if (!date || !courtId || hour == null || !durationMinutes) {
           res.status(400).json({ error: "missing params" }); return;
         }
-        const { body } = await sb(`bookings`, {
+        const { ok, body } = await sb(`bookings`, {
           method: "POST",
           headers: { Prefer: "return=representation" },
           body: JSON.stringify({
@@ -158,6 +160,11 @@ export default async function handler(req, res) {
             price: 0, status: "blocked",
           }),
         });
+        if (!ok) {
+          console.error("blockCourt insert failed:", body);
+          res.status(500).json({ error: "insert_failed", detail: body });
+          return;
+        }
         res.status(200).json({ block: (body || [])[0] || null });
         return;
       }
