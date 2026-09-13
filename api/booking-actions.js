@@ -185,13 +185,20 @@ export default async function handler(req, res) {
       case "updateSlip": {
         const { bookingId, slipUrl } = p;
         if (!bookingId || !slipUrl) { res.status(400).json({ error: "missing params" }); return; }
-        // เงื่อนไข status=eq.pending กันไว้อีกชั้น: แก้ได้เฉพาะรายการที่ยังรอชำระอยู่เท่านั้น
-        const { body } = await sb(`bookings?id=eq.${bookingId}&status=eq.pending`, {
+        // เงื่อนไข status=in.(pending,reviewing) กันไว้อีกชั้น: แก้ได้เฉพาะรายการที่ยังไม่ถูกยืนยัน/ยกเลิกเท่านั้น
+        // (เผื่อกรณีลูกค้ากดส่งสลิปซ้ำ หรือกลับมาแนบสลิปใหม่หลัง resume session — ไม่ให้ค้างเหมือนก่อนหน้านี้)
+        const { ok, body } = await sb(`bookings?id=eq.${bookingId}&status=in.(pending,reviewing)`, {
           method: "PATCH",
           headers: { Prefer: "return=representation" },
           body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
         });
-        res.status(200).json({ booking: (body || [])[0] || null });
+        const row = (body || [])[0] || null;
+        if (!ok || !row) {
+          console.error("updateSlip failed or matched no row:", bookingId, body);
+          res.status(409).json({ error: "update_failed", detail: body });
+          return;
+        }
+        res.status(200).json({ booking: row });
         return;
       }
 
