@@ -34,7 +34,8 @@ const db = {
     return { booking };
   },
   async updateSlip(id, slipUrl) {
-    await callBookingAction("updateSlip", { bookingId: id, slipUrl });
+    const result = await callBookingAction("updateSlip", { bookingId: id, slipUrl });
+    return result?.booking || null; // null = อัปเดตไม่สำเร็จ (ไม่เจอแถวที่ตรงเงื่อนไข)
   },
   async checkDiscount(code) {
     const result = await callBookingAction("checkDiscount", { code });
@@ -129,6 +130,7 @@ const MANUAL_CLOSURES = [
   { date: "2026-09-10", startMin: 10*60, endMin: 22*60, court: "both" }, // 10 ก.ย. 69, 10:00–22:00, ทั้ง 2 สนาม
   { date: "2026-09-11", startMin: DAY_START_MIN, endMin: DAY_END_MIN, court: "2" }, // 11 ก.ย. 69, Court 2 ปิดทั้งวัน
   { date: "2026-09-11", startMin: 11*60, endMin: DAY_END_MIN, court: "1" }, // 11 ก.ย. 69, Court 1 ปิดหลัง 11:00
+  { date: "2026-09-12", startMin: 6*60, endMin: 16*60, court: "both" }, // 12 ก.ย. 69, 06:00–16:00, ทั้ง 2 สนาม
 ];
 const isManuallyClosed = (dateObj, courtId, startMin, endMin) => {
   const iso = toIso(dateObj);
@@ -833,7 +835,13 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking }) {
     setUploading(true);
     const url = await db.uploadSlip(slip, bookingId);
     if (url) {
-      await db.updateSlip(bookingId, url);
+      const updated = await db.updateSlip(bookingId, url);
+      if (!updated) {
+        // อัปเดตสถานะไม่สำเร็จจริง — ไม่ถือว่าส่งสลิปสำเร็จ ไม่แจ้งเตือนแอดมิน ให้ลูกค้าลองใหม่
+        setUploading(false);
+        alert(lang==="th" ? "ส่งสลิปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง หรือติดต่อร้านโดยตรง" : "Failed to submit slip. Please try again or contact us directly.");
+        return;
+      }
       setUploaded(true);
       fetch("/api/notify-admin-telegram", {
         method: "POST",
@@ -865,7 +873,7 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking }) {
 
       <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",boxShadow:"0 4px 24px rgba(102,57,36,.12)",marginBottom:16,border:"1px solid var(--dv)"}}>
         <p style={{fontSize:13,color:"var(--mu)",marginBottom:12}}>{t.scanQR}</p>
-        <img src="/qr-payment.png" alt="PromptPay QR" style={{width:200,height:200,borderRadius:10,border:"1px solid var(--dv)"}} />
+        <img src="/qr-payment.png" alt="PromptPay QR" style={{width:200,height:200,objectFit:"contain",borderRadius:10,border:"1px solid var(--dv)",background:"#fff"}} />
         <div style={{marginTop:14,display:"inline-flex",alignItems:"center",gap:8,background:"var(--or-bg)",borderRadius:20,padding:"8px 18px"}}>
           <span style={{fontSize:24,fontWeight:800,color:"var(--or)"}}>฿{finalPrice.toLocaleString()}</span>
           <span style={{fontSize:12,color:"var(--mu)"}}>{t.transfer}</span>
@@ -1324,13 +1332,19 @@ function AdminDashboard({ token, onLogout }) {
     );
     if (!confirmed) return;
     setClosing(true);
+    const errors = [];
     for (const courtId of courtIds) {
-      await callAdminAction("blockCourt", token, {
+      const result = await callAdminAction("blockCourt", token, {
         date: closeDate, courtId, hour: start.hour, startMinute: start.minute, durationMinutes, reason: closeReason.trim() || null,
       });
+      if (result?.error) errors.push(`Court ${courtId}: ${result.error}${result.detail ? " — " + JSON.stringify(result.detail) : ""}`);
     }
     setClosing(false);
-    setCloseReason("");
+    if (errors.length > 0) {
+      alert("ปิดสนามไม่สำเร็จบางส่วน:\n" + errors.join("\n"));
+    } else {
+      setCloseReason("");
+    }
     loadBlocks();
   };
 
