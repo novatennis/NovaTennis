@@ -9,6 +9,21 @@
 
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const ADMIN_TELEGRAM_CHAT_IDS = process.env.ADMIN_TELEGRAM_CHAT_IDS; // comma-separated
+
+async function notifyTelegram(text) {
+  if (!TELEGRAM_BOT_TOKEN || !ADMIN_TELEGRAM_CHAT_IDS) return;
+  const chatIds = ADMIN_TELEGRAM_CHAT_IDS.split(",").map(s => s.trim()).filter(Boolean);
+  await Promise.all(chatIds.map(chatId =>
+    fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+    }).catch(() => {})
+  ));
+}
+const minutesToLabel = (mins) => `${String(Math.floor(mins/60)).padStart(2,"0")}:${String(mins%60).padStart(2,"0")}`;
 
 async function sb(path, options = {}) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
@@ -199,6 +214,33 @@ export default async function handler(req, res) {
           return;
         }
         res.status(200).json({ booking: row });
+        return;
+      }
+
+      case "cancelPending": {
+        // ลูกค้ากดยกเลิกเองจากหน้าชำระเงิน (เช่นกดหมดเวลาแล้วไม่รอ) — ปล่อยช่วงเวลาคืนทันที + แจ้งเตือนแอดมิน
+        const { bookingId } = p;
+        if (!bookingId) { res.status(400).json({ error: "missing bookingId" }); return; }
+        const { ok, body } = await sb(`bookings?id=eq.${bookingId}&status=in.(pending,reviewing)`, {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({ status: "cancelled" }),
+        });
+        const row = (body || [])[0] || null;
+        if (ok && row) {
+          const startMin = (row.hour || 0) * 60 + (row.start_minute || 0);
+          const dur = row.duration_minutes || 60;
+          const text =
+            `❌ <b>ลูกค้ายกเลิกการจองเอง</b>\n\n` +
+            `👤 ${row.customer_name || "-"}\n` +
+            `📞 ${row.customer_id}\n` +
+            `🎾 Court ${row.court_id}\n` +
+            `📅 ${row.booking_date}\n` +
+            `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(startMin+dur)}\n` +
+            `💰 ฿${row.price?.toLocaleString?.() || row.price}`;
+          await notifyTelegram(text);
+        }
+        res.status(200).json({ ok: true });
         return;
       }
 
