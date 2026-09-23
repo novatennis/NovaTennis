@@ -794,12 +794,16 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking }) {
       }
       if (b) {
         setBookingId(b.id);
-        // เก็บ bookingId ไว้ใน URL — ถ้าเบราว์เซอร์รีโหลดตอนออกไปสแกนจ่ายเงินแล้วกลับมา
+        // เก็บ bookingId ไว้ทั้งใน URL และ localStorage — ถ้าเบราว์เซอร์รีโหลดตอนออกไปสแกนจ่ายเงินแล้วกลับมา
+        // (โดยเฉพาะ in-app browser บางตัวที่อาจล้าง query string ตอนโหลดใหม่)
         // ระบบจะดึงการจองนี้กลับมาที่หน้าแนบสลิปได้ทันที ไม่หลุดกลับไปหน้าแรก
         try {
           const url = new URL(window.location.href);
           url.searchParams.set("booking", b.id);
           window.history.replaceState(null, "", url.toString());
+        } catch { /* no-op */ }
+        try {
+          localStorage.setItem("nova_pending_booking", JSON.stringify({ id: b.id, createdAt: b.created_time }));
         } catch { /* no-op */ }
       }
     };
@@ -1057,7 +1061,9 @@ export default function AppV2() {
   const [adminToken, setAdminToken] = useState(() => {
     try { return sessionStorage.getItem("nova_admin_token") || null; } catch { return null; }
   });
-  const [adminMode, setAdminMode] = useState(false);
+  const [adminMode, setAdminMode] = useState(() => {
+    try { return window.location.pathname.replace(/\/$/, "") === "/admin"; } catch { return false; }
+  });
   const [adminPw, setAdminPw] = useState("");
   const [adminErr, setAdminErr] = useState(false);
   const [adminChecking, setAdminChecking] = useState(false);
@@ -1071,6 +1077,7 @@ export default function AppV2() {
       url.searchParams.delete("booking");
       window.history.replaceState(null, "", url.toString());
     } catch { /* no-op */ }
+    try { localStorage.removeItem("nova_pending_booking"); } catch { /* no-op */ }
   };
 
   const goTab = (id) => {
@@ -1080,8 +1087,15 @@ export default function AppV2() {
   };
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const bId = params.get("booking");
+    // เช็คก่อนจาก URL (?booking=...) ถ้าไม่มีค่อยเช็คจาก localStorage เป็นสำรอง
+    // (เผื่อ in-app browser บางตัวรีโหลดแล้วล้าง query string ทิ้ง)
+    let bId = new URLSearchParams(window.location.search).get("booking");
+    if (!bId) {
+      try {
+        const saved = JSON.parse(localStorage.getItem("nova_pending_booking") || "null");
+        if (saved?.id) bId = saved.id;
+      } catch { /* no-op */ }
+    }
     if (!bId) return;
     db.getBookingById(bId).then(b => {
       if (!b || b.status === "cancelled") { clearResumeParam(); return; }
@@ -1439,7 +1453,7 @@ function AdminDashboard({ token, onLogout }) {
         </header>
 
         <div style={{background:"#fff",borderBottom:"1px solid var(--dv)",display:"flex",padding:"0 20px",overflowX:"auto"}}>
-          {[["bookings","📋 การจอง"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
+          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
             <button key={id} onClick={() => setTab(id)} style={{padding:"13px 16px",background:"none",border:"none",borderBottom:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",fontWeight:tab===id?700:400,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
               {label}
             </button>
@@ -1447,6 +1461,68 @@ function AdminDashboard({ token, onLogout }) {
         </div>
 
         <div style={{padding:"20px",maxWidth:1000,margin:"0 auto"}}>
+          {tab==="availability" && (
+            <div>
+              <div style={{display:"flex",gap:10,marginBottom:6,alignItems:"center",flexWrap:"wrap"}}>
+                <input type="date" value={date} onChange={e=>setDate(e.target.value)}
+                  style={{padding:"9px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                <button onClick={loadBookings} style={{padding:"9px 16px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
+                <span style={{fontSize:12,color:"var(--mu)"}}>ดูภาพรวมว่าช่วงเวลาไหนว่าง/ไม่ว่างในวันที่เลือก อัปเดตตามข้อมูลจริงล่าสุด</span>
+              </div>
+              <div style={{display:"flex",gap:16,margin:"10px 0 14px",fontSize:12,color:"var(--mu)"}}>
+                <Dot color="#2d7a4f" label="ว่าง" />
+                <Dot color="#c0392b" label="ไม่ว่าง / มีคนจอง" />
+                <Dot color="#663924" label="ปิดสนาม" />
+              </div>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",padding:0,boxShadow:"var(--sh)",overflow:"auto",maxHeight:640}}>
+                {loading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> : (() => {
+                  const dateObj = new Date(date+"T00:00:00");
+                  const now = Date.now();
+                  const activeBookings = bookings.filter(b => {
+                    if (b.status === "cancelled" || b.status === "blocked") return false;
+                    if (b.status === "pending") {
+                      const created = new Date(b.created_time).getTime();
+                      return (now - created) < 5*60*1000;
+                    }
+                    return true;
+                  });
+                  const slots = [];
+                  for (let m = DAY_START_MIN; m < DAY_END_MIN; m += 30) slots.push(m);
+                  return (
+                    <table className="adm-table" style={{tableLayout:"fixed",width:"100%"}}>
+                      <thead><tr><th style={{width:90}}>เวลา</th><th>Court 1</th><th>Court 2</th></tr></thead>
+                      <tbody>
+                        {slots.map(startMin => {
+                          const endMin = startMin + 30;
+                          return (
+                            <tr key={startMin}>
+                              <td style={{fontWeight:600}}>{minutesToLabel(startMin)}–{minutesToLabel(endMin)}</td>
+                              {[1,2].map(courtId => {
+                                let state = "ว่าง", color = "#2d7a4f", bg = "rgba(45,122,79,.08)";
+                                if (isFullyBookedDate(dateObj) || isManuallyClosed(dateObj, courtId, startMin, endMin)) {
+                                  state = "ปิด"; color = "#663924"; bg = "rgba(102,57,36,.08)";
+                                } else {
+                                  const overlap = activeBookings.some(b => {
+                                    if (b.court_id !== courtId) return false;
+                                    const s = (b.hour||0)*60 + (b.start_minute||0);
+                                    const e = s + (b.duration_minutes||60);
+                                    return startMin < e && endMin > s;
+                                  });
+                                  if (overlap) { state = "ไม่ว่าง"; color = "#c0392b"; bg = "rgba(192,57,43,.08)"; }
+                                }
+                                return <td key={courtId} style={{textAlign:"center",background:bg,color,fontWeight:700,fontSize:12.5}}>{state}</td>;
+                              })}
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  );
+                })()}
+              </div>
+            </div>
+          )}
+
           {tab==="bookings" && (
             <div>
               <div style={{marginBottom:24}}>
