@@ -37,6 +37,9 @@ const db = {
     const result = await callBookingAction("updateSlip", { bookingId: id, slipUrl });
     return result?.booking || null; // null = อัปเดตไม่สำเร็จ (ไม่เจอแถวที่ตรงเงื่อนไข)
   },
+  async cancelPending(id) {
+    await callBookingAction("cancelPending", { bookingId: id });
+  },
   async checkDiscount(code) {
     const result = await callBookingAction("checkDiscount", { code });
     if (!result.valid) return null;
@@ -90,6 +93,14 @@ const DAY_END_MIN = 23 * 60;    // 23:00 (เล่นได้ถึง 23:00 �
 const START_STEP = 30;          // เลือกเวลาเริ่มได้ทุกครึ่งชั่วโมง
 
 const minutesToLabel = (mins) => `${String(Math.floor(mins/60)).padStart(2,"0")}:${String(mins%60).padStart(2,"0")}`;
+// Supabase/Postgres มักส่ง timestamp กลับมาแบบไม่มี "Z"/offset ต่อท้าย (เช่น "2026-09-24T10:15:23.456")
+// ซึ่ง JS จะตีความว่าเป็นเวลาท้องถิ่นของเบราว์เซอร์แทนที่จะเป็น UTC ทำให้เวลานับถอยหลังคลาดเคลื่อนได้มาก
+// (ประเทศไทย +7 ชม. ทำให้ดูเหมือนเวลาผ่านไปเยอะกว่าความจริง จนขึ้นว่า "หมดเวลา" ทันที) ฟังก์ชันนี้บังคับตีความเป็น UTC เสมอ
+const parseUtc = (str) => {
+  if (!str) return new Date(NaN);
+  const hasTz = /Z$|[+-]\d{2}:?\d{2}$/.test(str);
+  return new Date(hasTz ? str : `${str}Z`);
+};
 
 function getCandidateStarts(durationMinutes) {
   const starts = [];
@@ -312,10 +323,10 @@ function TabBar({ tab, setTab, lang="th" }) {
 
 // แถบลอยแจ้งว่ายังมีการจองที่รอชำระเงินค้างอยู่ (เผื่อเผลอกดแท็บอื่นออกมา) พร้อมปุ่มกลับไปหน้าชำระเงินทันที
 function PendingPaymentBanner({ createdAt, onResume, lang="th" }) {
-  const [secs, setSecs] = useState(() => Math.max(0, 300 - Math.floor((Date.now() - new Date(createdAt).getTime())/1000)));
+  const [secs, setSecs] = useState(() => Math.max(0, 300 - Math.floor((Date.now() - parseUtc(createdAt).getTime())/1000)));
   useEffect(() => {
     const timer = setInterval(() => {
-      setSecs(Math.max(0, 300 - Math.floor((Date.now() - new Date(createdAt).getTime())/1000)));
+      setSecs(Math.max(0, 300 - Math.floor((Date.now() - parseUtc(createdAt).getTime())/1000)));
     }, 1000);
     return () => clearInterval(timer);
   }, [createdAt]);
@@ -560,7 +571,7 @@ function BookingPage({ onProceed, lang="th" }) {
       const active = (data || []).filter(b => {
         // "รอชำระ" ที่ค้างเกิน 5 นาทีแล้ว ไม่นับว่าบล็อกช่วงเวลาอีกต่อไป (ปล่อยให้จองใหม่ได้)
         if (b.status === "pending") {
-          const created = new Date(b.created_time).getTime();
+          const created = parseUtc(b.created_time).getTime();
           return (now - created) < 5 * 60 * 1000;
         }
         return true;
@@ -792,7 +803,7 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
   const { date, court, slot } = booking;
   const { finalPrice, discountAmount, discount } = customer;
   const initialSecs = resumeBooking
-    ? Math.max(0, 300 - Math.floor((Date.now() - new Date(resumeBooking.createdAt).getTime())/1000))
+    ? Math.max(0, 300 - Math.floor((Date.now() - parseUtc(resumeBooking.createdAt).getTime())/1000))
     : 300;
   const [secs, setSecs] = useState(initialSecs);
   const [expired, setExpired] = useState(initialSecs <= 0);
@@ -1180,6 +1191,11 @@ export default function AppV2() {
 
   // ให้ลูกค้ายกเลิกการจองที่ค้าง (เช่นหมดเวลาแล้ว) แล้วเริ่มจองใหม่ได้เอง โดยไม่ต้องรอ/ติดอยู่ที่เดิม
   const resetBookingFlow = () => {
+    // แจ้งเตือนแอดมินและยกเลิกรายการนี้ในฐานข้อมูลจริงด้วย (ไม่ใช่แค่เคลียร์หน้าจอฝั่งลูกค้า)
+    // ทำแบบ fire-and-forget เพื่อไม่ให้ลูกค้าต้องรอ แต่ยังยิงคำขอไปแน่นอน
+    if (resumeBooking?.id) {
+      db.cancelPending(resumeBooking.id).catch(() => {});
+    }
     setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
     clearResumeParam();
   };
@@ -1470,8 +1486,8 @@ function AdminDashboard({ token, onLogout }) {
   };
   const fmtCreatedTime = (iso) => {
     if (!iso) return "-";
-    const d = new Date(iso);
-    return d.toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"});
+    const d = parseUtc(iso);
+    return d.toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit",timeZone:"Asia/Bangkok"});
   };
 
   const revenue = bookings.filter(b=>b.status==="confirmed").reduce((s,b)=>s+(b.price||0),0);
@@ -1536,7 +1552,7 @@ function AdminDashboard({ token, onLogout }) {
                   const activeBookings = bookings.filter(b => {
                     if (b.status === "cancelled" || b.status === "blocked") return false;
                     if (b.status === "pending") {
-                      const created = new Date(b.created_time).getTime();
+                      const created = parseUtc(b.created_time).getTime();
                       return (now - created) < 5*60*1000;
                     }
                     return true;
