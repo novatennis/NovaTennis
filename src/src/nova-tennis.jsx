@@ -67,6 +67,13 @@ async function callAdminAction(action, token, payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action, token, ...payload }),
   });
+  // token หมดอายุ/ไม่ถูกต้อง — ล้างค่าที่ค้างอยู่แล้วบังคับกลับไปหน้าใส่รหัสผ่านใหม่ทันที
+  // กันปัญหาหน้า Admin ค้างโชว์อยู่แบบไม่มีข้อมูล เพราะเข้าใจผิดว่ายัง login อยู่ทั้งที่ session หมดอายุแล้ว
+  if (res.status === 401) {
+    try { sessionStorage.removeItem("nova_admin_token"); } catch { /* no-op */ }
+    window.location.reload();
+    return new Promise(() => {}); // ค้างไว้เฉยๆ ระหว่างรอ reload ไม่ต้องส่งค่าอะไรกลับไปต่อ
+  }
   return res.json();
 }
 
