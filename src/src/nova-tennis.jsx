@@ -310,6 +310,32 @@ function TabBar({ tab, setTab, lang="th" }) {
   );
 }
 
+// แถบลอยแจ้งว่ายังมีการจองที่รอชำระเงินค้างอยู่ (เผื่อเผลอกดแท็บอื่นออกมา) พร้อมปุ่มกลับไปหน้าชำระเงินทันที
+function PendingPaymentBanner({ createdAt, onResume, lang="th" }) {
+  const [secs, setSecs] = useState(() => Math.max(0, 300 - Math.floor((Date.now() - new Date(createdAt).getTime())/1000)));
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setSecs(Math.max(0, 300 - Math.floor((Date.now() - new Date(createdAt).getTime())/1000)));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [createdAt]);
+  const expired = secs <= 0;
+  const mm = String(Math.floor(secs/60)).padStart(2,"0");
+  const ss = String(secs%60).padStart(2,"0");
+  return (
+    <div onClick={onResume} style={{position:"fixed",top:0,left:0,right:0,zIndex:250,maxWidth:480,margin:"0 auto",background:expired?"#c0392b":"var(--or)",color:"#fff",padding:"9px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer",boxShadow:"0 3px 10px rgba(0,0,0,.15)"}}>
+      <span style={{fontSize:12.5,fontWeight:600}}>
+        {expired
+          ? (lang==="th" ? "⏰ มีการจองที่ค้างอยู่ (หมดเวลาแล้ว)" : "⏰ You have a pending booking (expired)")
+          : (lang==="th" ? `⏰ รอชำระเงินอยู่ — เหลือ ${mm}:${ss}` : `⏰ Payment pending — ${mm}:${ss} left`)}
+      </span>
+      <span style={{fontSize:12.5,fontWeight:700,textDecoration:"underline",whiteSpace:"nowrap",marginLeft:10}}>
+        {lang==="th" ? "กลับไปชำระเงิน →" : "Resume →"}
+      </span>
+    </div>
+  );
+}
+
 function HomePage({ goBook, lang="th" }) {
   const t = T[lang];
   const now = new Date();
@@ -761,7 +787,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, lang="th" }) {
 }
 
 // resumeBooking (ถ้ามี) = { id, createdAt } ใช้ตอนกลับมาหน้านี้หลัง reload โดยไม่ต้องสร้างการจองใหม่ซ้ำ
-function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking }) {
+function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCreated, onStartOver }) {
   const t = T[lang];
   const { date, court, slot } = booking;
   const { finalPrice, discountAmount, discount } = customer;
@@ -812,6 +838,9 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking }) {
         try {
           localStorage.setItem("nova_pending_booking", JSON.stringify({ id: b.id, createdAt: b.created_time }));
         } catch { /* no-op */ }
+        // แจ้งขึ้นไปให้ AppV2 รู้จักการจองนี้ด้วย (แม้เป็นการจองใหม่ ไม่ใช่ resume) — เพื่อให้แถบ
+        // "กลับไปชำระเงิน" คำนวณเวลาที่เหลือได้ถูกต้อง ไม่ว่าจะออกจากหน้านี้ไปทางไหนก็ตาม
+        onCreated?.(b.id, b.created_time);
       }
     };
     save();
@@ -880,6 +909,11 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking }) {
         <div style={{height:4,background:"var(--cr2)",borderRadius:4,marginTop:12,overflow:"hidden"}}>
           <div style={{height:"100%",borderRadius:4,width:`${pct}%`,background:expired?"#c0392b":urgent?"#e67e22":"var(--or)",transition:"width 1s linear"}} />
         </div>
+        {expired && onStartOver && !uploaded && (
+          <button onClick={onStartOver} style={{marginTop:12,background:"none",border:"none",color:"#c0392b",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            {lang==="th" ? "ยกเลิกรายการนี้ แล้วเริ่มจองใหม่" : "Cancel this and start a new booking"}
+          </button>
+        )}
       </div>
 
       <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",boxShadow:"0 4px 24px rgba(102,57,36,.12)",marginBottom:16,border:"1px solid var(--dv)"}}>
@@ -1088,9 +1122,14 @@ export default function AppV2() {
   };
 
   const goTab = (id) => {
+    if (id === "book") {
+      // ถ้ามีการจองที่ยังค้างชำระเงินอยู่ (ยังไม่จบ ไม่ว่าจะสำเร็จหรือหมดเวลา) ให้กลับไปหน้าชำระเงินเดิมเลย
+      // แทนที่จะเริ่มจองใหม่ทับ — กันปัญหาเผลอกดแท็บอื่นแล้วหากลับไม่เจอ
+      setPage(booking && customer ? "payment" : "booking");
+    }
     setTab(id);
-    if (id === "book") setPage("booking");
-    clearResumeParam();
+    // ไม่ล้าง resume state ที่นี่ — จะล้างจริงๆ แค่ตอนจ่ายเงินสำเร็จ (handlePaymentDone) เท่านั้น
+    // เพื่อให้เผลอกดแท็บอื่นแล้วยังกลับมาจ่ายเงินต่อได้เสมอ
   };
 
   useEffect(() => {
@@ -1136,6 +1175,12 @@ export default function AppV2() {
     setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
     setPrefillPhone(phone || "");
     setTab("cancel");
+    clearResumeParam();
+  };
+
+  // ให้ลูกค้ายกเลิกการจองที่ค้าง (เช่นหมดเวลาแล้ว) แล้วเริ่มจองใหม่ได้เอง โดยไม่ต้องรอ/ติดอยู่ที่เดิม
+  const resetBookingFlow = () => {
+    setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
     clearResumeParam();
   };
 
@@ -1208,6 +1253,9 @@ export default function AppV2() {
     <>
       <style>{CSS}</style>
       <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)"}}>
+        {!(tab==="book" && page==="payment") && booking && customer && resumeBooking && (
+          <PendingPaymentBanner createdAt={resumeBooking.createdAt} lang={lang} onResume={() => { setTab("book"); setPage("payment"); }} />
+        )}
         <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={handleLogoTap}>
           <NovaLogo width={90} />
           <div onClick={e=>e.stopPropagation()} style={{display:"flex",gap:4}}>
@@ -1225,7 +1273,7 @@ export default function AppV2() {
             <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} lang={lang} />
           )}
           {tab==="book" && page==="payment" && booking && customer && (
-            <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} resumeBooking={resumeBooking} />
+            <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} resumeBooking={resumeBooking} onCreated={(id, createdAt) => setResumeBooking({ id, createdAt })} onStartOver={resetBookingFlow} />
           )}
           {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone} />}
         </main>
