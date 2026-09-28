@@ -240,7 +240,7 @@ const T = {
     uploadSlip: "📎 แนบสลิปการโอนเงิน", selectSlip: "📷 เลือกรูปสลิป",
     changeSlip: "🔄 เปลี่ยนรูปสลิป", sendSlip: "✅ ส่งสลิป",
     sending: "⏳ กำลังส่ง...", slipSent: "✅ ส่งสลิปเรียบร้อยแล้ว",
-    slipSentDesc: "สถานะ: รอการยืนยัน — กำลังนำท่านไปหน้าตรวจสอบการจอง...",
+    slipSentDesc: "สถานะ: รอการยืนยัน — ทีมงานกำลังตรวจสอบสลิปของท่าน",
     noSlot: "😔 ไม่มีช่วงเวลาว่างในวันนี้",
     selectDateFirst: "กรุณาเลือกวันที่และสนามก่อน",
     selectDurationFirst: "กรุณาเลือกระยะเวลาก่อน",
@@ -277,7 +277,7 @@ const T = {
     uploadSlip: "📎 Upload Payment Slip", selectSlip: "📷 Select Slip Image",
     changeSlip: "🔄 Change Slip", sendSlip: "✅ Send Slip",
     sending: "⏳ Sending...", slipSent: "✅ Slip Submitted Successfully",
-    slipSentDesc: "Status: Awaiting confirmation — taking you to your bookings...",
+    slipSentDesc: "Status: Awaiting confirmation — our team is verifying your slip",
     noSlot: "😔 No available slots today",
     selectDateFirst: "Please select a date and court first",
     selectDurationFirst: "Please select a duration first",
@@ -358,24 +358,50 @@ function HomePage({ goBook, lang="th" }) {
   const offPeak = getSlotPrice(10, priceSampleDate);
   const peak = getSlotPrice(18, priceSampleDate);
 
+  // เงื่อนไขการจองอย่างเป็นทางการของร้าน (แสดงเป็นข้อ 1–7)
+  const termsTitle = lang==="th" ? "เงื่อนไขการจองคอร์ท NOVA Tennis" : "NOVA Tennis Court Booking Conditions";
+  const termsItems = lang==="th" ? [
+    "ทางห้องซ้อมขออนุญาติสงวนสิทธิ์การเลื่อนจองทุกกรณี",
+    "กรณีไม่สะดวกมาใช้บริการ ทางสนามขอสงวนสิทธิ์ ไม่คืนค่าบริการทุกกรณี",
+    "กรุณามาถึงสนามก่อนเวลาใช้งานอย่างน้อย 10 นาที",
+    "ห้องซ้อมเป็นระบบไร้พนักงาน เมื่อถึงเวลาที่จองไว้สามารถเข้าใช้บริการได้เลย หากถึงก่อนเวลาสามารถนั่งรอที่โซฟาได้เลยค่ะ",
+    "สามารถดูวิธีการใช้เครื่องได้ที่ Manual ใน Line OA หรือภายในห้องซ้อม",
+    "กรุณาตรวจสอบทรัพย์สินของท่านก่อนออกจากห้องซ้อม",
+    "หากเกิดความเสียหายจากการใช้งานที่ไม่เหมาะสม ผู้ใช้บริการจะต้องรับผิดชอบค่าเสียหายตามมูลค่าความเสียหายที่เกิดขึ้นจริง",
+  ] : [
+    "The studio reserves the right not to reschedule bookings under any circumstances.",
+    "If you are unable to attend, the studio reserves the right not to refund the service fee under any circumstances.",
+    "Please arrive at least 10 minutes before your booking time.",
+    "This is a staff-free (self-service) practice room. You may enter as soon as your booked time begins. If you arrive early, you are welcome to wait on the sofa.",
+    "Instructions for using the machine are available in the Manual on our LINE OA or inside the practice room.",
+    "Please check your belongings before leaving the practice room.",
+    "If damage occurs from improper use, the user is responsible for the actual cost of the damage.",
+  ];
+  const termsFooter = lang==="th" ? "กรุณาปฏิบัติตามกฎและระเบียบของห้องซ้อมอย่างเคร่งครัด" : "Please strictly follow the rules and regulations of the practice room.";
+  const termsAccept = lang==="th"
+    ? "การกดยืนยันการจอง ถือว่าท่านรับทราบและยอมรับเงื่อนไขการใช้บริการทั้งหมดเรียบร้อยแล้ว"
+    : "By confirming your booking, you acknowledge and accept all of the terms of service.";
+  // ข้อมูลการจองออนไลน์ (ของเดิม เก็บไว้เป็นหมายเหตุเล็กๆ)
   const bookingConditionItems = lang==="th"
     ? ["จองล่วงหน้าได้สูงสุด 1 เดือน", "ชำระเงินภายใน 5 นาทีหลังยืนยัน", "เลือกระยะเวลาเล่นได้ 30 / 60 / 90 / 120 นาที"]
     : ["Book up to 1 month in advance", "Pay within 5 minutes after confirming", "Choose 30 / 60 / 90 / 120 minute sessions"];
 
   const ruleItems = lang==="th" ? [
-    { icon:"⏰", text:"โปรดตรงต่อเวลา และเก็บลูกเทนนิสให้เรียบร้อยก่อนหมดเวลาการจองของท่าน เพื่อให้ลูกค้าในชั่วโมงถัดไปเข้ามาใช้บริการได้ทันที" },
-    { icon:"👟", text:"กรุณาสวมรองเท้าเทนนิส รองเท้าวิ่งหรือรองเท้ายิมเท่านั้น งดรองเท้าแตะและรองเท้าที่ทำให้คอร์ตเสียหาย โปรดดูแลพื้นรองเท้าให้สะอาดก่อนเข้าใช้บริการ" },
+    { icon:"⏰", text:"โปรดตรงต่อเวลา และเก็บลูกเทนนิสให้เรียบร้อยก่อนหมดเวลาการจองของท่านและออกจากห้องตรงเวลา เพื่อให้ลูกค้าในชั่วโมงถัดไปเข้ามาใช้บริการได้ทันที" },
+    { icon:"👟", text:"กรุณาสวมรองเท้าเทนนิส รองเท้าวิ่งหรือรองเท้ายิมเท่านั้น ไม่อนุญาตรองเท้าแตะและรองเท้าที่ทำให้คอร์ตเสียหาย โปรดดูแลพื้นรองเท้าให้สะอาดก่อนเข้าใช้บริการ" },
     { icon:"🎾", text:"งดใช้กริ๊ปเสื่อมสภาพ เพื่อป้องกันเศษยางและคราบกาวร่วงติดพื้นสนาม" },
     { icon:"🚭", text:"งดสูบบุหรี่ และบุหรี่ไฟฟ้าทุกชนิด" },
     { icon:"🐾", text:"งดนำสัตว์เลี้ยงเข้ามาใช้บริการ" },
     { icon:"🍽️", text:"งดนำอาหารเข้ามาทานในคอร์ต (อนุญาตเฉพาะน้ำดื่มและเครื่องดื่มเท่านั้น)" },
+    { icon:"👥", text:"เข้าใช้สนามได้สูงสุด 4 คน ต่อห้องเท่านั้น" },
   ] : [
-    { icon:"⏰", text:"Please be punctual. Clear the court of all balls before your session ends for the next player." },
-    { icon:"👟", text:"Please wear tennis, running, or gym shoes only. Use non-marking footwear and ensure soles are clean before entering." },
+    { icon:"⏰", text:"Please be punctual. Clear the court of all balls before your session ends and leave the room on time so the next customer can enter immediately." },
+    { icon:"👟", text:"Please wear tennis, running, or gym shoes only. Sandals and shoes that may damage the court are not allowed. Please make sure your soles are clean before entering." },
     { icon:"🎾", text:"No deteriorated overgrip — prevent rubber debris and stains on the court." },
     { icon:"🚭", text:"No smoking or vaping allowed." },
     { icon:"🐾", text:"No pets allowed." },
     { icon:"🍽️", text:"No food allowed on the court. Water and beverages only." },
+    { icon:"👥", text:"A maximum of 4 people per room." },
   ];
 
   return (
@@ -455,12 +481,22 @@ function HomePage({ goBook, lang="th" }) {
             <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{t.bookingCondition}</span>
           </div>
           <div style={{padding:"14px 18px",display:"flex",flexDirection:"column",gap:12}}>
-            {bookingConditionItems.map((txt,i) => (
+            <p style={{fontSize:14,fontWeight:700,color:"var(--br)"}}>{termsTitle}</p>
+            {termsItems.map((txt,i) => (
               <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start"}}>
                 <div style={{width:22,height:22,borderRadius:"50%",flexShrink:0,background:"var(--or-bg)",color:"var(--or)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800}}>{i+1}</div>
                 <p style={{fontSize:13.5,color:"var(--tx)",lineHeight:1.6}}>{txt}</p>
               </div>
             ))}
+            <p style={{fontSize:13,color:"var(--mu)",lineHeight:1.6,marginTop:2}}>{termsFooter}</p>
+            <div style={{background:"var(--or-bg)",border:"1px solid rgba(244,126,31,.25)",borderRadius:10,padding:"10px 12px"}}>
+              <p style={{fontSize:13,fontWeight:700,color:"var(--br)",lineHeight:1.6}}>{termsAccept}</p>
+            </div>
+            <div style={{borderTop:"1px solid var(--dv)",paddingTop:10,display:"flex",flexDirection:"column",gap:4}}>
+              {bookingConditionItems.map((txt,i) => (
+                <p key={i} style={{fontSize:12,color:"var(--mu)",lineHeight:1.5}}>• {txt}</p>
+              ))}
+            </div>
           </div>
         </div>
 
@@ -863,12 +899,6 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
     return () => clearTimeout(timer);
   }, [secs]);
 
-  useEffect(() => {
-    if (!uploaded) return;
-    const timer = setTimeout(() => onDone(customer.phone), 1800);
-    return () => clearTimeout(timer);
-  }, [uploaded]);
-
   const mm = String(Math.floor(Math.max(secs,0)/60)).padStart(2,"0");
   const ss = String(Math.max(secs,0)%60).padStart(2,"0");
   const pct = (Math.max(secs,0)/300)*100;
@@ -998,6 +1028,30 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
         <button className="btn-primary" disabled={!slip || uploading} onClick={handleUpload} style={{opacity:(!slip||uploading)?0.6:1,cursor:(!slip||uploading)?"not-allowed":"pointer"}}>
           {uploading ? t.sending : t.sendSlip}
         </button>
+      )}
+
+      {/* popup แจ้งข้อควรเตรียมก่อนเข้าสนาม — ขึ้นหลังแนบสลิปสำเร็จ */}
+      {uploaded && (
+        <div style={{position:"fixed",inset:0,zIndex:400,background:"rgba(46,26,14,.55)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div className="fu" style={{background:"#fff",borderRadius:18,padding:"24px 22px",maxWidth:360,width:"100%",maxHeight:"85vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.35)"}}>
+            <p style={{fontSize:17,fontWeight:800,color:"var(--br)",marginBottom:6}}>{lang==="th" ? "✅ ส่งสลิปเรียบร้อยแล้ว" : "✅ Slip submitted"}</p>
+            <p style={{fontSize:12.5,color:"var(--mu)",marginBottom:16}}>{lang==="th" ? "สถานะ: รอการยืนยัน — ทีมงานกำลังตรวจสอบ" : "Status: awaiting confirmation"}</p>
+            <div style={{background:"var(--or-bg)",border:"1px solid rgba(244,126,31,.25)",borderRadius:12,padding:"14px 14px",marginBottom:12}}>
+              <p style={{fontSize:14,fontWeight:700,color:"var(--br)",lineHeight:1.7}}>
+                {lang==="th"
+                  ? "กรุณาเตรียมรองเท้ากีฬา รองเท้าเทนนิส รองเท้าวิ่ง หรือรองเท้ายิม มาให้เรียบร้อย รองเท้าประเภทอื่นไม่อนุญาตให้เดินในสนามทุกกรณี"
+                  : "Please bring your sports shoes — tennis, running, or gym shoes. Other types of footwear are not allowed on the court under any circumstances."}
+              </p>
+            </div>
+            <p style={{fontSize:13,color:"var(--tx)",lineHeight:1.7,marginBottom:6}}>
+              {lang==="th" ? "* หากต้องการเดินสามารถถอดรองเท้าเดินได้เลยค่ะ" : "* If you prefer, you may take your shoes off and walk on the court without them."}
+            </p>
+            <p style={{fontSize:13,fontWeight:700,color:"var(--br)",lineHeight:1.7,marginBottom:18}}>
+              {lang==="th" ? "** เข้าใช้สนามได้สูงสุด 4 คนต่อห้องเท่านั้น" : "** A maximum of 4 people per room."}
+            </p>
+            <button className="btn-primary" onClick={() => onDone(customer.phone)}>{lang==="th" ? "รับทราบ" : "Got it"}</button>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -1131,6 +1185,13 @@ export default function AppV2() {
     } catch { /* no-op */ }
     try { localStorage.removeItem("nova_pending_booking"); } catch { /* no-op */ }
   };
+
+  // เปลี่ยนแท็บ/หน้าไหนก็ตาม ให้เลื่อนขึ้นบนสุดเสมอ — กันปัญหาเข้าหน้าจองแล้วหน้าเด้งไปอยู่ตรงกลาง
+  // (ค่าตำแหน่งเลื่อนของหน้าแรกที่ยาวๆ ค้างมา) จนลูกค้าข้ามขั้น "เลือกวันที่" ไป
+  useEffect(() => {
+    try { window.scrollTo(0, 0); } catch { /* no-op */ }
+    try { document.documentElement.scrollTop = 0; document.body.scrollTop = 0; } catch { /* no-op */ }
+  }, [tab, page]);
 
   const goTab = (id) => {
     if (id === "book") {
