@@ -116,8 +116,57 @@ export default async function handler(req, res) {
         return;
       }
       case "updateStatus": {
-        const { id, status } = p;
-        await sb(`bookings?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status }) });
+        const { id, status, refundCredit } = p;
+        const { body } = await sb(`bookings?id=eq.${id}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({ status }),
+        });
+        const row = (body || [])[0];
+        // ยกเลิกการจองที่จ่ายด้วยสิทธิ์แพ็คเกจ + แอดมินเลือกคืนสิทธิ์ → บวกจำนวนครั้งกลับเข้าแพ็คเกจ (ไม่เกินจำนวนเต็มที่ซื้อไว้)
+        if (status === "cancelled" && refundCredit && row?.package_id) {
+          const { body: pkgRows } = await sb(`packages?id=eq.${row.package_id}&select=*`);
+          const pkg = (pkgRows || [])[0];
+          if (pkg && pkg.remaining_credits < pkg.total_credits) {
+            await sb(`packages?id=eq.${row.package_id}`, {
+              method: "PATCH",
+              body: JSON.stringify({ remaining_credits: pkg.remaining_credits + 1 }),
+            });
+          }
+        }
+        res.status(200).json({ ok: true });
+        return;
+      }
+      case "packagesQueue": {
+        const { body } = await sb(`packages?status=in.(pending,reviewing)&select=*&order=created_time.asc`);
+        res.status(200).json({ packages: body || [] });
+        return;
+      }
+      case "allPackages": {
+        const { body } = await sb(`packages?select=*&order=created_time.desc&limit=200`);
+        res.status(200).json({ packages: body || [] });
+        return;
+      }
+      case "confirmPackage": {
+        const { id } = p;
+        if (!id) { res.status(400).json({ error: "missing id" }); return; }
+        const now = new Date();
+        const { body: pkgRows } = await sb(`packages?id=eq.${id}&select=*`);
+        const pkg = (pkgRows || [])[0];
+        if (!pkg) { res.status(404).json({ error: "not_found" }); return; }
+        const expiry = new Date(now.getTime() + pkg.expiry_days * 24 * 60 * 60 * 1000);
+        const expiryDateStr = expiry.toISOString().split("T")[0];
+        await sb(`packages?id=eq.${id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "active", activated_at: now.toISOString(), expiry_date: expiryDateStr }),
+        });
+        res.status(200).json({ ok: true });
+        return;
+      }
+      case "cancelPackage": {
+        const { id } = p;
+        if (!id) { res.status(400).json({ error: "missing id" }); return; }
+        await sb(`packages?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "cancelled" }) });
         res.status(200).json({ ok: true });
         return;
       }
