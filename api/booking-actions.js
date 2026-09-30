@@ -48,6 +48,12 @@ const RATE_TABLE = {
 const PROMO_START = new Date(2026, 8, 1, 0, 0, 0);
 const PROMO_END = new Date(2026, 8, 30, 23, 59, 59);
 
+// ─── ราคาแพ็คเกจสมาชิก (ตายตัว เซิร์ฟเวอร์เป็นคนตัดสินเสมอ ไม่เชื่อราคาจาก client) ──
+const PACKAGE_PRICES = {
+  offpeak: { 2: { price: 950, days: 7 }, 5: { price: 2350, days: 60 }, 10: { price: 4600, days: 90 } },
+  peak:    { 2: { price: 1150, days: 7 }, 5: { price: 2750, days: 60 }, 10: { price: 5000, days: 90 } },
+};
+
 function getDurationPrice(startHour, dateObj, durationMinutes) {
   const inPromo = dateObj >= PROMO_START && dateObj <= PROMO_END;
   const day = dateObj.getDay();
@@ -134,7 +140,7 @@ export default async function handler(req, res) {
       }
 
       case "createBooking": {
-        const { courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId } = p;
+        const { courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId, packageId } = p;
         if (!courtId || !customerId || !customerName || !bookingDate || hour == null || !durationMinutes) {
           res.status(400).json({ error: "missing params" }); return;
         }
@@ -151,8 +157,53 @@ export default async function handler(req, res) {
         const overlap = activeIntervals.some(([s, e]) => startMin < e && endMin > s);
         if (overlap) { res.status(409).json({ error: "slot_taken" }); return; }
 
-        // เซิร์ฟเวอร์คำนวณราคาเองเสมอ ไม่เชื่อค่าใดๆ จากฝั่ง client
         const dateObj = new Date(bookingDate + "T00:00:00");
+        const day = dateObj.getDay();
+        const isWeekend = day === 0 || day === 6;
+        const isPeak = isWeekend || hour >= 16;
+
+        // ─── จองด้วยสิทธิ์แพ็คเกจ (จ่ายไว้ล่วงหน้าแล้ว ไม่ต้องโอน/แนบสลิปซ้ำ) ──────────
+        if (packageId) {
+          if (durationMinutes !== 60) { res.status(400).json({ error: "package_60min_only" }); return; }
+          const { body: pkgRows } = await sb(`packages?id=eq.${packageId}&customer_id=eq.${customerId}&select=*`);
+          const pkg = (pkgRows || [])[0];
+          if (!pkg || pkg.status !== "active") { res.status(400).json({ error: "package_not_active" }); return; }
+          if (pkg.remaining_credits <= 0) { res.status(400).json({ error: "package_no_credits" }); return; }
+          if (pkg.expiry_date && new Date(pkg.expiry_date + "T23:59:59") < new Date()) { res.status(400).json({ error: "package_expired" }); return; }
+          const pkgTier = isPeak ? "peak" : "offpeak";
+          if (pkg.tier !== pkgTier) { res.status(400).json({ error: "package_wrong_tier" }); return; }
+
+          await sb(`customers`, {
+            method: "POST",
+            headers: { Prefer: "resolution=merge-duplicates" },
+            body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
+          });
+
+          // หักสิทธิ์แบบกัน race condition: PATCH มีเงื่อนไข remaining_credits เท่ากับค่าที่เพิ่งอ่านมา
+          // ถ้ามีคนอื่นหักไปพร้อมกันจนค่าเปลี่ยนไปแล้ว คำสั่งนี้จะไม่ตรงเงื่อนไข ไม่หักซ้ำ
+          const { body: decRows } = await sb(`packages?id=eq.${packageId}&remaining_credits=eq.${pkg.remaining_credits}`, {
+            method: "PATCH",
+            headers: { Prefer: "return=representation" },
+            body: JSON.stringify({ remaining_credits: pkg.remaining_credits - 1 }),
+          });
+          if (!decRows || decRows.length === 0) { res.status(409).json({ error: "package_race_conflict" }); return; }
+
+          const { body: created } = await sb(`bookings`, {
+            method: "POST",
+            headers: { Prefer: "return=representation" },
+            body: JSON.stringify({
+              court_id: courtId, customer_id: customerId, customer_name: customerName,
+              booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: 60,
+              price: 0, package_id: packageId, status: "confirmed", // จ่ายไว้แล้วตอนซื้อแพ็ค ไม่ต้องรอตรวจสลิปซ้ำ
+            }),
+          });
+          const bookingRow = (created || [])[0];
+          if (!bookingRow) { res.status(500).json({ error: "insert_failed" }); return; }
+          res.status(200).json({ booking: bookingRow });
+          return;
+        }
+
+        // ─── จองจ่ายเงินสดตามปกติ ────────────────────────────────────────────────
         const basePrice = getDurationPrice(hour, dateObj, durationMinutes);
 
         let discountAmount = 0;
@@ -241,6 +292,82 @@ export default async function handler(req, res) {
           await notifyTelegram(text);
         }
         res.status(200).json({ ok: true });
+        return;
+      }
+
+      case "createPackage": {
+        // ซื้อแพ็คเกจใหม่ — เซิร์ฟเวอร์เป็นคนตัดสินราคา/วันหมดอายุเองเสมอ ไม่เชื่อค่าจาก client
+        const { tier, credits, customerId, customerName } = p;
+        if (!["offpeak", "peak"].includes(tier)) { res.status(400).json({ error: "invalid tier" }); return; }
+        const def = PACKAGE_PRICES[tier]?.[credits];
+        if (!def) { res.status(400).json({ error: "invalid credits" }); return; }
+        if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid phone" }); return; }
+        if (!customerName || String(customerName).trim().length < 1 || String(customerName).length > 16) {
+          res.status(400).json({ error: "invalid name" }); return;
+        }
+
+        await sb(`customers`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates" },
+          body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
+        });
+
+        const { body: created } = await sb(`packages`, {
+          method: "POST",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({
+            customer_id: customerId, customer_name: customerName, tier,
+            total_credits: credits, remaining_credits: credits,
+            price: def.price, expiry_days: def.days, status: "pending",
+          }),
+        });
+        const pkgRow = (created || [])[0];
+        if (!pkgRow) { res.status(500).json({ error: "insert_failed" }); return; }
+        res.status(200).json({ package: pkgRow });
+        return;
+      }
+
+      case "updatePackageSlip": {
+        const { packageId, slipUrl } = p;
+        if (!packageId || !slipUrl) { res.status(400).json({ error: "missing params" }); return; }
+        const { ok, body } = await sb(`packages?id=eq.${packageId}&status=in.(pending,reviewing)`, {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
+        });
+        const row = (body || [])[0] || null;
+        if (!ok || !row) { res.status(409).json({ error: "update_failed", detail: body }); return; }
+        res.status(200).json({ package: row });
+        return;
+      }
+
+      case "cancelPendingPackage": {
+        const { packageId } = p;
+        if (!packageId) { res.status(400).json({ error: "missing packageId" }); return; }
+        const { ok, body } = await sb(`packages?id=eq.${packageId}&status=in.(pending,reviewing)`, {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({ status: "cancelled" }),
+        });
+        const row = (body || [])[0] || null;
+        if (ok && row) {
+          const text =
+            `❌ <b>ลูกค้ายกเลิกการซื้อแพ็คเกจเอง</b>\n\n` +
+            `👤 ${row.customer_name || "-"}\n` +
+            `📞 ${row.customer_id}\n` +
+            `🎟 ${row.tier === "peak" ? "Peak" : "Off Peak"} × ${row.total_credits} ครั้ง\n` +
+            `💰 ฿${row.price?.toLocaleString?.() || row.price}`;
+          await notifyTelegram(text);
+        }
+        res.status(200).json({ ok: true });
+        return;
+      }
+
+      case "myPackages": {
+        const { phone } = p;
+        if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
+        const { body } = await sb(`packages?customer_id=eq.${phone}&select=*&order=created_time.desc`);
+        res.status(200).json({ packages: body || [] });
         return;
       }
 
