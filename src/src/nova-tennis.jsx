@@ -33,6 +33,29 @@ const db = {
     if (error) return { error };
     return { booking };
   },
+  async createBookingWithPackage({ courtId, customerId, customerName, bookingDate, hour, startMinute, packageId }) {
+    const { booking, error } = await callBookingAction("createBooking", {
+      courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes: 60, packageId,
+    });
+    if (error) return { error };
+    return { booking };
+  },
+  async createPackage({ tier, credits, customerId, customerName }) {
+    const { package: pkg, error } = await callBookingAction("createPackage", { tier, credits, customerId, customerName });
+    if (error) return { error };
+    return { package: pkg };
+  },
+  async updatePackageSlip(id, slipUrl) {
+    const result = await callBookingAction("updatePackageSlip", { packageId: id, slipUrl });
+    return result?.package || null;
+  },
+  async cancelPendingPackage(id) {
+    await callBookingAction("cancelPendingPackage", { packageId: id });
+  },
+  async myPackages(phone) {
+    const { packages } = await callBookingAction("myPackages", { phone });
+    return packages || [];
+  },
   async updateSlip(id, slipUrl) {
     const result = await callBookingAction("updateSlip", { bookingId: id, slipUrl });
     return result?.booking || null; // null = อัปเดตไม่สำเร็จ (ไม่เจอแถวที่ตรงเงื่อนไข)
@@ -134,6 +157,12 @@ function getDurationPrice(startHour, dateObj, durationMinutes) {
 }
 // สำหรับจุดที่ต้องการราคาอ้างอิงต่อชั่วโมง (เช่น สรุปราคาหน้าแรก)
 function getSlotPrice(hour, dateObj) { return getDurationPrice(hour, dateObj, 60); }
+
+// ราคาแพ็คเกจสำหรับแสดงผลเท่านั้น — เซิร์ฟเวอร์เป็นคนตัดสินราคาจริงเสมอ (ต้องแก้ให้ตรงกับ PACKAGE_PRICES ใน booking-actions.js ถ้าเปลี่ยนราคา)
+const PACKAGE_TIERS = {
+  offpeak: [ { credits: 2, price: 950, fullPrice: 980, days: 7 }, { credits: 5, price: 2350, fullPrice: 2450, days: 60 }, { credits: 10, price: 4600, fullPrice: 4900, days: 90 } ],
+  peak:    [ { credits: 2, price: 1150, fullPrice: 1180, days: 7 }, { credits: 5, price: 2750, fullPrice: 2950, days: 60 }, { credits: 10, price: 5000, fullPrice: 5900, days: 90 } ],
+};
 
 // วันแรกที่เปิดให้จองได้ (ก่อนหน้านี้จองไม่ได้ แม้ปฏิทินจะเปิดดูได้)
 const BOOKING_OPEN_DATE = new Date(2026, 8, 1, 0, 0, 0); // 1 ก.ย. 2569
@@ -311,7 +340,7 @@ function TabBar({ tab, setTab, lang="th" }) {
   const t = T[lang];
   return (
     <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:200,backgroundColor:"#fff",borderTop:"1px solid var(--dv)",display:"flex",boxShadow:"0 -3px 16px rgba(102,57,36,0.07)"}}>
-      {[["home","🏠",t.home],["book","📅",t.book],["cancel","🔍",t.myBookings]].map(([id,icon,label]) => (
+      {[["home","🏠",t.home],["book","📅",t.book],["package","🎟",lang==="th"?"แพ็คเกจ":"Packages"],["cancel","🔍",t.myBookings]].map(([id,icon,label]) => (
         <button key={id} onClick={() => setTab(id)} style={{flex:1,padding:"11px 0 8px",background:"none",border:"none",borderTop:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
           <span style={{fontSize:19}}>{icon}</span>
           <span style={{fontSize:10,fontWeight:tab===id?700:400}}>{label}</span>
@@ -732,7 +761,7 @@ function BookingPage({ onProceed, lang="th" }) {
   );
 }
 
-function CheckoutPage({ booking, onCancel, onConfirm, lang="th" }) {
+function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, lang="th" }) {
   const t = T[lang];
   const { date, court, slot } = booking;
   const [name, setName] = useState("");
@@ -744,6 +773,23 @@ function CheckoutPage({ booking, onCancel, onConfirm, lang="th" }) {
   const nameOk = name.trim().length >= 1 && name.length <= 16;
   const phoneOk = /^[0-9]{10}$/.test(phone);
   const ok = nameOk && phoneOk;
+
+  // เช็คว่ามีสิทธิ์แพ็คเกจที่ใช้กับช่วงเวลานี้ได้ไหม (ต้องจอง 60 นาทีพอดี + tier ตรงกัน + ยังไม่หมดอายุ)
+  const [matchedPkg, setMatchedPkg] = useState(null);
+  const [useCredit, setUseCredit] = useState(false);
+  const [checkingPkg, setCheckingPkg] = useState(false);
+  useEffect(() => {
+    setMatchedPkg(null); setUseCredit(false);
+    if (!phoneOk || slot.durationMinutes !== 60) return;
+    setCheckingPkg(true);
+    db.myPackages(phone).then(rows => {
+      const today = toIso(new Date());
+      const tier = slot.peak ? "peak" : "offpeak";
+      const found = (rows || []).find(p => p.status === "active" && p.tier === tier && p.remaining_credits > 0 && (!p.expiry_date || p.expiry_date >= today));
+      setMatchedPkg(found || null);
+      setCheckingPkg(false);
+    }).catch(() => setCheckingPkg(false));
+  }, [phone, phoneOk, slot.durationMinutes, slot.peak]);
 
   const calcDiscount = (d) => {
     if (!d) return 0;
@@ -782,13 +828,22 @@ function CheckoutPage({ booking, onCancel, onConfirm, lang="th" }) {
           <Row label={`📅 ${t.date}`} val={fmtDate(date, lang)} />
           <Row label={`🕐 ${t.time}`} val={slot.label} />
           <Row label={`⏱ ${t.duration}`} val={`${slot.durationMinutes} ${t.minutesLabel}`} />
-          {discount && <Row label="🏷" val={`-฿${discountAmount.toLocaleString()}`} />}
+          {discount && !useCredit && <Row label="🏷" val={`-฿${discountAmount.toLocaleString()}`} />}
           <div style={{borderTop:"1px solid var(--dv)",margin:"12px 0"}} />
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <span style={{fontWeight:700,color:"var(--br)",fontSize:15}}>{t.total}</span>
             <div style={{textAlign:"right"}}>
-              {discount && <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿{slot.price.toLocaleString()}</p>}
-              <span style={{fontSize:30,fontWeight:800,color:"var(--or)"}}>฿{finalPrice.toLocaleString()}</span>
+              {useCredit ? (
+                <>
+                  <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿{slot.price.toLocaleString()}</p>
+                  <span style={{fontSize:30,fontWeight:800,color:"#2d7a4f"}}>{lang==="th"?"ใช้สิทธิ์":"Credit"}</span>
+                </>
+              ) : (
+                <>
+                  {discount && <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿{slot.price.toLocaleString()}</p>}
+                  <span style={{fontSize:30,fontWeight:800,color:"var(--or)"}}>฿{finalPrice.toLocaleString()}</span>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -806,28 +861,43 @@ function CheckoutPage({ booking, onCancel, onConfirm, lang="th" }) {
           <input value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))} placeholder="0812345678" inputMode="numeric"
             style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:`1.5px solid ${phone&&!phoneOk?"#c0392b":"var(--dv)"}`,color:"var(--tx)",outline:"none"}} />
         </div>
-        <div>
-          <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.discount}</label>
-          <div style={{display:"flex",gap:8}}>
-            <input value={discountCode} onChange={e => setDiscountCode(e.target.value.toUpperCase())} placeholder="เช่น NOVA10"
-              style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
-            <button onClick={handleCheckCode} disabled={checkingCode || !discountCode.trim()} style={{padding:"0 16px",borderRadius:10,border:"none",background:"var(--br)",color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer",whiteSpace:"nowrap",fontFamily:"'Noto Sans Thai',sans-serif"}}>
-              {checkingCode ? "..." : t.useCode}
-            </button>
+        {matchedPkg && (
+          <div onClick={() => setUseCredit(v => !v)} style={{display:"flex",gap:10,alignItems:"flex-start",padding:"13px 14px",borderRadius:10,border:`1.5px solid ${useCredit?"var(--or)":"var(--dv)"}`,background:useCredit?"var(--or-bg)":"#fff",cursor:"pointer"}}>
+            <div style={{width:20,height:20,borderRadius:6,flexShrink:0,marginTop:1,border:`2px solid ${useCredit?"var(--or)":"var(--dv)"}`,background:useCredit?"var(--or)":"#fff",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,fontWeight:800}}>{useCredit?"✓":""}</div>
+            <div>
+              <p style={{fontSize:13.5,fontWeight:700,color:"var(--br)"}}>🎟 {lang==="th"?"ใช้สิทธิ์จากแพ็คเกจ":"Use package credit"}</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือ ${matchedPkg.remaining_credits} ครั้ง — ไม่ต้องชำระเงินเพิ่ม`:`${matchedPkg.remaining_credits} sessions left — no extra payment needed`}</p>
+            </div>
           </div>
-          {discountMsg && <p style={{fontSize:12,marginTop:6,color:discount?"#2d7a4f":"#c0392b"}}>{discountMsg}</p>}
-        </div>
+        )}
+        {!useCredit && (
+          <div>
+            <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.discount}</label>
+            <div style={{display:"flex",gap:8}}>
+              <input value={discountCode} onChange={e => setDiscountCode(e.target.value.toUpperCase())} placeholder="เช่น NOVA10"
+                style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
+              <button onClick={handleCheckCode} disabled={checkingCode || !discountCode.trim()} style={{padding:"0 16px",borderRadius:10,border:"none",background:"var(--br)",color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer",whiteSpace:"nowrap",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {checkingCode ? "..." : t.useCode}
+              </button>
+            </div>
+            {discountMsg && <p style={{fontSize:12,marginTop:6,color:discount?"#2d7a4f":"#c0392b"}}>{discountMsg}</p>}
+          </div>
+        )}
       </div>
 
       <div style={{display:"flex",gap:12}}>
         <button onClick={onCancel} style={{flex:1,padding:"14px",borderRadius:"var(--r)",border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:15,cursor:"pointer"}}>{t.cancel}</button>
         <button disabled={!ok} onClick={() => {
+          if (useCredit && matchedPkg) {
+            onConfirmWithPackage({ name: name.trim(), phone, packageId: matchedPkg.id });
+            return;
+          }
           if (discount) {
             const confirmed = window.confirm(lang==="th" ? "การใช้โค้ดส่วนลด หากกดดำเนินการต่อแล้วจะไม่สามารถใช้โค้ดนี้ซ้ำได้อีก" : "Once you proceed, this discount code cannot be used again.");
             if (!confirmed) return;
           }
           onConfirm({name:name.trim(),phone,discount,finalPrice,discountAmount});
-        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:ok?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:ok?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:ok?"pointer":"not-allowed"}}>{t.confirmBooking}</button>
+        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:ok?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:ok?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:ok?"pointer":"not-allowed"}}>{useCredit?(lang==="th"?"ยืนยันการจอง (ใช้สิทธิ์) ✓":"Confirm Booking (Use Credit) ✓"):t.confirmBooking}</button>
       </div>
     </div>
   );
@@ -1084,6 +1154,290 @@ function Dot({ color, label }) {
   );
 }
 
+// ─── Package (แพ็คเกจสมาชิก) ──────────────────────────────────────────────────
+function PackagePage({ lang="th" }) {
+  const t = T[lang];
+  const [selected, setSelected] = useState(null); // { tier, credits, price, days }
+  const [name, setName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [createErr, setCreateErr] = useState("");
+  const [pkg, setPkg] = useState(null); // แพ็คเกจที่สร้างแล้ว รอชำระเงิน
+
+  const [lookupPhone, setLookupPhone] = useState("");
+  const [myPkgs, setMyPkgs] = useState([]);
+  const [lookupLoading, setLookupLoading] = useState(false);
+  const [searched, setSearched] = useState(false);
+
+  const nameOk = name.trim().length >= 1 && name.length <= 16;
+  const phoneOk = /^[0-9]{10}$/.test(phone);
+
+  const handleLookup = async () => {
+    if (!/^[0-9]{10}$/.test(lookupPhone)) return;
+    setLookupLoading(true); setSearched(false);
+    const rows = await db.myPackages(lookupPhone);
+    setMyPkgs(rows || []); setLookupLoading(false); setSearched(true);
+  };
+
+  const handleBuy = async () => {
+    if (!selected || !nameOk || !phoneOk || creating) return;
+    setCreating(true); setCreateErr("");
+    const { package: pkgRow, error } = await db.createPackage({
+      tier: selected.tier, credits: selected.credits, customerId: phone, customerName: name.trim(),
+    });
+    setCreating(false);
+    if (error || !pkgRow) { setCreateErr(lang==="th" ? "สร้างรายการไม่สำเร็จ ลองใหม่อีกครั้ง" : "Failed to create order, please try again"); return; }
+    setPkg(pkgRow);
+  };
+
+  if (pkg) {
+    return <PackagePaymentView pkg={pkg} lang={lang} onDone={() => { setPkg(null); setSelected(null); setName(""); setPhone(""); }} />;
+  }
+
+  const pkgStatusInfo = (s) => {
+    if (s === "active") return { text: lang==="th"?"ใช้งานได้":"Active", color: "#2d7a4f" };
+    if (s === "reviewing") return { text: lang==="th"?"รอการยืนยัน":"Awaiting confirmation", color: "#e67e22" };
+    if (s === "cancelled") return { text: lang==="th"?"ยกเลิกแล้ว":"Cancelled", color: "#c0392b" };
+    return { text: lang==="th"?"รอชำระเงิน":"Awaiting payment", color: "var(--mu)" };
+  };
+
+  return (
+    <div style={{padding:"20px 16px 100px",display:"flex",flexDirection:"column",gap:22}} className="fu">
+      <section>
+        <h2 className="bb" style={{fontSize:26,color:"var(--br)",marginBottom:4}}>{lang==="th"?"แพ็คเกจสมาชิก":"Membership Packages"}</h2>
+        <p style={{fontSize:12.5,color:"var(--mu)"}}>{lang==="th"?"ซื้อจำนวนครั้งล่วงหน้า ถูกกว่าจ่ายเดี่ยว ใช้จองได้ภายในระยะเวลาที่กำหนด (จองได้ครั้งละ 60 นาทีเท่านั้น)":"Buy sessions in advance, cheaper than paying per visit. Each credit books a 60-minute session."}</p>
+      </section>
+
+      {/* ค้นหาแพ็คเกจของฉัน */}
+      <section>
+        <StepHead n="🔍" label={lang==="th"?"แพ็คเกจของฉัน":"My Packages"} />
+        <div style={{display:"flex",gap:8,marginBottom:12}}>
+          <input value={lookupPhone} onChange={e => setLookupPhone(e.target.value.replace(/\D/g,"").slice(0,10))}
+            placeholder={t.searchPlaceholder} inputMode="numeric"
+            style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
+          <button onClick={handleLookup} disabled={lookupLoading || lookupPhone.length < 10} style={{padding:"0 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
+            {lookupLoading ? "..." : t.searchBtn}
+          </button>
+        </div>
+        {searched && myPkgs.length === 0 && (
+          <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",border:"1px solid var(--dv)"}}>
+            <p style={{color:"var(--mu)",fontSize:13.5}}>{lang==="th"?"ไม่พบแพ็คเกจสำหรับเบอร์นี้":"No packages found for this number"}</p>
+          </div>
+        )}
+        {myPkgs.length > 0 && (
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {myPkgs.map(p => {
+              const st = pkgStatusInfo(p.status);
+              const expired = p.status==="active" && p.expiry_date && new Date(p.expiry_date+"T23:59:59") < new Date();
+              return (
+                <div key={p.id} className="card">
+                  <div style={{padding:"13px 16px"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                      <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{p.tier==="peak"?"Peak":"Off Peak"} × {p.total_credits} {lang==="th"?"ครั้ง":"sessions"}</span>
+                      <span style={{fontSize:11.5,fontWeight:600,color:expired?"#c0392b":st.color,background:`${expired?"#c0392b":st.color}18`,padding:"3px 9px",borderRadius:20}}>
+                        {expired ? (lang==="th"?"หมดอายุแล้ว":"Expired") : st.text}
+                      </span>
+                    </div>
+                    {p.status==="active" && !expired && (
+                      <>
+                        <Row label={lang==="th"?"เหลือ":"Remaining"} val={`${p.remaining_credits} / ${p.total_credits} ${lang==="th"?"ครั้ง":"sessions"}`} />
+                        <Row label={lang==="th"?"หมดอายุ":"Expires"} val={new Date(p.expiry_date).toLocaleDateString(lang==="th"?"th-TH":"en-GB",{year:"numeric",month:"short",day:"numeric"})} />
+                      </>
+                    )}
+                    <Row label={t.rowPrice} val={`฿${p.price?.toLocaleString()}`} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      {/* เลือกซื้อแพ็คเกจใหม่ */}
+      <section>
+        <StepHead n="🎟" label={lang==="th"?"ซื้อแพ็คเกจใหม่":"Buy a New Package"} />
+        {["offpeak","peak"].map(tier => (
+          <div key={tier} style={{marginBottom:14}}>
+            <p style={{fontSize:13,fontWeight:700,color:"var(--br)",marginBottom:8}}>
+              {tier==="peak" ? "Peak" : "Off Peak"}
+              <span style={{fontWeight:400,color:"var(--mu)",fontSize:11.5,marginLeft:6}}>
+                {tier==="peak" ? (lang==="th"?"(จ.-ศ. 16:00–22:00 / ส.-อา. ทั้งวัน)":"(Mon-Fri 16:00–22:00 / Sat-Sun all day)") : (lang==="th"?"(จ.-ศ. 06:00–16:00)":"(Mon-Fri 06:00–16:00)")}
+              </span>
+            </p>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+              {PACKAGE_TIERS[tier].map(opt => {
+                const sel = selected?.tier===tier && selected?.credits===opt.credits;
+                return (
+                  <button key={opt.credits} onClick={() => setSelected({ tier, ...opt })}
+                    style={{padding:"12px 6px",borderRadius:10,border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:sel?"var(--or-bg)":"#fff",cursor:"pointer",textAlign:"center"}}>
+                    <p className="bb" style={{fontSize:20,color:sel?"var(--or)":"var(--br)",lineHeight:1}}>{opt.credits}</p>
+                    <p style={{fontSize:10,color:"var(--mu)",marginTop:2}}>{lang==="th"?"ครั้ง":"sessions"}</p>
+                    <p style={{fontSize:10.5,color:"var(--mu)",textDecoration:"line-through",marginTop:4}}>฿{opt.fullPrice.toLocaleString()}</p>
+                    <p style={{fontSize:14,fontWeight:800,color:sel?"var(--or)":"var(--br)"}}>฿{opt.price.toLocaleString()}</p>
+                    <p style={{fontSize:9.5,color:"var(--mu)",marginTop:2}}>{opt.days} {lang==="th"?"วัน":"days"}</p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </section>
+
+      {selected && (
+        <section>
+          <StepHead n="📝" label={lang==="th"?"กรอกข้อมูลผู้ซื้อ":"Buyer Info"} />
+          <div className="card" style={{marginBottom:14}}>
+            <div className="card-body">
+              <Row label={lang==="th"?"แพ็คเกจที่เลือก":"Selected package"} val={`${selected.tier==="peak"?"Peak":"Off Peak"} × ${selected.credits} ${lang==="th"?"ครั้ง":"sessions"}`} />
+              <Row label={t.total} val={`฿${selected.price.toLocaleString()}`} />
+            </div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:15,marginBottom:16}}>
+            <div>
+              <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.name}</label>
+              <input value={name} onChange={e => setName(e.target.value)} maxLength={16} placeholder={lang==="th"?"กรอกชื่อของท่าน":"Enter your name"}
+                style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:`1.5px solid ${name&&!nameOk?"#c0392b":"var(--dv)"}`,color:"var(--tx)",outline:"none"}} />
+            </div>
+            <div>
+              <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.phone}</label>
+              <input value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))} placeholder="0812345678" inputMode="numeric"
+                style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:`1.5px solid ${phone&&!phoneOk?"#c0392b":"var(--dv)"}`,color:"var(--tx)",outline:"none"}} />
+            </div>
+          </div>
+          {createErr && <p style={{fontSize:12,color:"#c0392b",marginBottom:10}}>{createErr}</p>}
+          <button className="btn-primary" disabled={!nameOk || !phoneOk || creating} onClick={handleBuy} style={{opacity:(!nameOk||!phoneOk||creating)?0.6:1,cursor:(!nameOk||!phoneOk||creating)?"not-allowed":"pointer"}}>
+            {creating ? "..." : (lang==="th" ? "ดำเนินการชำระเงิน →" : "Proceed to Payment →")}
+          </button>
+        </section>
+      )}
+    </div>
+  );
+}
+
+// หน้าชำระเงินสำหรับแพ็คเกจ (QR + แนบสลิป) — คล้ายหน้าชำระเงินจองสนาม แต่เรียบง่ายกว่า
+function PackagePaymentView({ pkg, lang="th", onDone }) {
+  const t = T[lang];
+  const [secs, setSecs] = useState(300);
+  const [expired, setExpired] = useState(false);
+  const [slip, setSlip] = useState(null);
+  const [slipPreview, setSlipPreview] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploaded, setUploaded] = useState(false);
+  const fileRef = useRef();
+
+  useEffect(() => {
+    if (secs <= 0) { setExpired(true); return; }
+    const timer = setTimeout(() => setSecs(s => s-1), 1000);
+    return () => clearTimeout(timer);
+  }, [secs]);
+
+  const mm = String(Math.floor(Math.max(secs,0)/60)).padStart(2,"0");
+  const ss = String(Math.max(secs,0)%60).padStart(2,"0");
+
+  const handleSlipChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setSlip(file);
+    setSlipPreview(URL.createObjectURL(file));
+  };
+
+  const handleUpload = async () => {
+    if (!slip) return;
+    setUploading(true);
+    const url = await db.uploadSlip(slip, `pkg_${pkg.id}`);
+    if (url) {
+      const updated = await db.updatePackageSlip(pkg.id, url);
+      if (!updated) {
+        setUploading(false);
+        alert(lang==="th" ? "ส่งสลิปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง หรือติดต่อร้านโดยตรง" : "Failed to submit slip. Please try again or contact us directly.");
+        return;
+      }
+      setUploaded(true);
+      fetch("/api/notify-admin-telegram", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          courtName: `🎟 แพ็คเกจ ${pkg.tier==="peak"?"Peak":"Off Peak"} × ${pkg.total_credits} ครั้ง`,
+          date: "-", time: "-", price: pkg.price, name: pkg.customer_name, phone: pkg.customer_id,
+        }),
+      }).catch(() => {});
+    }
+    setUploading(false);
+  };
+
+  const handleStartOver = () => {
+    if (!expired) return;
+    db.cancelPendingPackage(pkg.id).catch(() => {});
+    onDone();
+  };
+
+  return (
+    <div style={{padding:"20px 16px 90px"}} className="fu">
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:18}}>{t.payment}</h2>
+
+      <div style={{background:"#fff",borderRadius:"var(--r)",marginBottom:16,border:`1.5px solid ${expired?"#c0392b":"var(--dv)"}`,padding:"16px 20px",textAlign:"center",boxShadow:"var(--sh)"}}>
+        <p style={{fontSize:12,color:"var(--mu)",marginBottom:3}}>{expired?t.timeExpired:t.payWithin}</p>
+        <p className="bb" style={{fontSize:54,lineHeight:1,color:expired?"#c0392b":"var(--br)"}}>{mm}:{ss}</p>
+        {expired && !uploaded && (
+          <button onClick={handleStartOver} style={{marginTop:12,background:"none",border:"none",color:"#c0392b",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            {lang==="th" ? "ยกเลิกรายการนี้" : "Cancel this order"}
+          </button>
+        )}
+      </div>
+
+      <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",boxShadow:"0 4px 24px rgba(102,57,36,.12)",marginBottom:16,border:"1px solid var(--dv)"}}>
+        <p style={{fontSize:13,color:"var(--mu)",marginBottom:12}}>{t.scanQR}</p>
+        <img src="/qr-payment.png" alt="PromptPay QR" style={{width:200,height:200,objectFit:"contain",borderRadius:10,border:"1px solid var(--dv)",background:"#fff"}} />
+        <div style={{marginTop:14,display:"inline-flex",alignItems:"center",gap:8,background:"var(--or-bg)",borderRadius:20,padding:"8px 18px"}}>
+          <span style={{fontSize:24,fontWeight:800,color:"var(--or)"}}>฿{pkg.price.toLocaleString()}</span>
+        </div>
+        <div style={{marginTop:12,padding:"10px 14px",background:"var(--cr)",borderRadius:10}}>
+          <p style={{fontSize:11,color:"var(--mu)"}}>{t.accountName}</p>
+          <p style={{fontSize:14,fontWeight:700,color:"var(--br)"}}>{PAYMENT_ACCOUNT_NAME}</p>
+          <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{PAYMENT_PHONE} (PromptPay)</p>
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div className="card-header"><p>{t.bookingDetail}</p></div>
+        <div className="card-body">
+          <Row label="👤" val={pkg.customer_name} />
+          <Row label="📞" val={pkg.customer_id} />
+          <Row label="🎟" val={`${pkg.tier==="peak"?"Peak":"Off Peak"} × ${pkg.total_credits} ${lang==="th"?"ครั้ง":"sessions"}`} />
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:24}}>
+        <div className="card-header"><p>{t.uploadSlip}</p></div>
+        <div className="card-body">
+          {uploaded ? (
+            <div style={{textAlign:"center",padding:"10px 0"}}>
+              <p style={{color:"#2d7a4f",fontWeight:700,fontSize:15}}>{t.slipSent}</p>
+              <p style={{color:"var(--mu)",fontSize:13,marginTop:4}}>{lang==="th"?"ทีมงานจะตรวจสอบและเปิดใช้งานแพ็คเกจให้ภายในไม่นาน":"Our team will verify and activate your package shortly."}</p>
+            </div>
+          ) : (
+            <>
+              {slipPreview && <img src={slipPreview} alt="slip" style={{width:"100%",borderRadius:10,marginBottom:12,maxHeight:200,objectFit:"cover"}} />}
+              <input ref={fileRef} type="file" accept="image/*" onChange={handleSlipChange} style={{display:"none"}} />
+              <button onClick={() => fileRef.current.click()} style={{width:"100%",padding:"12px",borderRadius:10,border:"1.5px dashed var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:600,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {slip ? t.changeSlip : t.selectSlip}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {uploaded ? (
+        <button className="btn-primary" onClick={onDone}>{lang==="th"?"เสร็จสิ้น":"Done"}</button>
+      ) : (
+        <button className="btn-primary" disabled={!slip || uploading} onClick={handleUpload} style={{opacity:(!slip||uploading)?0.6:1,cursor:(!slip||uploading)?"not-allowed":"pointer"}}>
+          {uploading ? t.sending : t.sendSlip}
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ─── Cancel / Check Booking Page ─────────────────────────────────────────────
 function CancelPage({ lang="th", initialPhone="" }) {
   const t = T[lang];
@@ -1250,6 +1604,34 @@ export default function AppV2() {
     clearResumeParam();
   };
 
+  // จองด้วยสิทธิ์แพ็คเกจ — จ่ายไว้ล่วงหน้าแล้ว ยืนยันทันทีไม่ต้องผ่านหน้า QR/แนบสลิปอีก
+  const [pkgBookingBusy, setPkgBookingBusy] = useState(false);
+  const handleConfirmWithPackage = async ({ name, phone, packageId }) => {
+    if (!booking || pkgBookingBusy) return;
+    setPkgBookingBusy(true);
+    const { slot, court, date } = booking;
+    const { error } = await db.createBookingWithPackage({
+      courtId: court.courtId, customerId: phone, customerName: name,
+      bookingDate: toIso(date), hour: slot.hour, startMinute: slot.startMinute, packageId,
+    });
+    setPkgBookingBusy(false);
+    if (error) {
+      const msg = {
+        slot_taken: lang==="th" ? "ช่วงเวลานี้เพิ่งถูกจองไปก่อนหน้าแล้ว กรุณาเลือกช่วงเวลาใหม่" : "This slot was just booked by someone else. Please choose another time.",
+        package_no_credits: lang==="th" ? "สิทธิ์ในแพ็คเกจหมดแล้ว" : "No credits left in this package",
+        package_expired: lang==="th" ? "แพ็คเกจหมดอายุแล้ว" : "This package has expired",
+        package_wrong_tier: lang==="th" ? "แพ็คเกจนี้ใช้กับช่วงเวลานี้ไม่ได้" : "This package cannot be used for this time slot",
+      }[error] || (lang==="th" ? "จองไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Booking failed, please try again");
+      alert(msg);
+      return;
+    }
+    alert(lang==="th" ? "✅ จองสำเร็จ! ใช้สิทธิ์จากแพ็คเกจเรียบร้อยแล้ว" : "✅ Booking confirmed using your package credit!");
+    setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
+    setPrefillPhone(phone || "");
+    setTab("cancel");
+    clearResumeParam();
+  };
+
   // ให้ลูกค้ายกเลิกการจองที่ค้าง (เช่นหมดเวลาแล้ว) แล้วเริ่มจองใหม่ได้เอง โดยไม่ต้องรอ/ติดอยู่ที่เดิม
   const resetBookingFlow = () => {
     // แจ้งเตือนแอดมินและยกเลิกรายการนี้ในฐานข้อมูลจริงด้วย (ไม่ใช่แค่เคลียร์หน้าจอฝั่งลูกค้า)
@@ -1347,11 +1729,12 @@ export default function AppV2() {
           {tab==="home" && <HomePage goBook={() => goTab("book")} lang={lang} />}
           {tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} lang={lang} />}
           {tab==="book" && page==="checkout" && booking && (
-            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} lang={lang} />
+            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} onConfirmWithPackage={handleConfirmWithPackage} lang={lang} />
           )}
           {tab==="book" && page==="payment" && booking && customer && (
             <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} resumeBooking={resumeBooking} onCreated={(id, createdAt) => setResumeBooking({ id, createdAt })} onStartOver={resetBookingFlow} />
           )}
+          {tab==="package" && <PackagePage lang={lang} />}
           {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone} />}
         </main>
         <TabBar tab={tab} setTab={goTab} lang={lang} />
@@ -1401,6 +1784,36 @@ function AdminDashboard({ token, onLogout }) {
     for (let m = 6*60; m <= 23*60; m += 30) opts.push(`${String(Math.floor(m/60)).padStart(2,"0")}:${String(m%60).padStart(2,"0")}`);
     return opts;
   })();
+
+  // แพ็คเกจสมาชิก
+  const [pkgQueue, setPkgQueue] = useState([]);
+  const [pkgQueueLoading, setPkgQueueLoading] = useState(true);
+  const [allPkgs, setAllPkgs] = useState([]);
+  const [allPkgsLoading, setAllPkgsLoading] = useState(true);
+  const loadPkgQueue = async () => {
+    setPkgQueueLoading(true);
+    const { packages: rows } = await callAdminAction("packagesQueue", token, {});
+    setPkgQueue(rows || []);
+    setPkgQueueLoading(false);
+  };
+  const loadAllPkgs = async () => {
+    setAllPkgsLoading(true);
+    const { packages: rows } = await callAdminAction("allPackages", token, {});
+    setAllPkgs(rows || []);
+    setAllPkgsLoading(false);
+  };
+  const confirmPackage = async (id) => {
+    if (!window.confirm("ยืนยันการซื้อแพ็คเกจนี้ใช่หรือไม่? จะเริ่มนับวันหมดอายุตั้งแต่ตอนนี้")) return;
+    await callAdminAction("confirmPackage", token, { id });
+    setPkgQueue(prev => prev.filter(p => p.id !== id));
+    loadAllPkgs();
+  };
+  const cancelPackage = async (id) => {
+    if (!window.confirm("ยกเลิกรายการซื้อแพ็คเกจนี้ใช่หรือไม่?")) return;
+    await callAdminAction("cancelPackage", token, { id });
+    setPkgQueue(prev => prev.filter(p => p.id !== id));
+    loadAllPkgs();
+  };
 
   const loadQueue = async () => {
     setQueueLoading(true);
@@ -1503,15 +1916,19 @@ function AdminDashboard({ token, onLogout }) {
 
   useEffect(() => { loadQueue(); }, []);
   useEffect(() => { loadBookings(); }, [date]);
-  useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); if(tab==="report") loadReport(); if(tab==="closures") loadBlocks(); }, [tab]);
+  useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); if(tab==="report") loadReport(); if(tab==="closures") loadBlocks(); if(tab==="packages") { loadPkgQueue(); loadAllPkgs(); } }, [tab]);
 
-  const updateStatus = async (id, status) => {
+  const updateStatus = async (id, status, packageId) => {
     const msg = status === "confirmed"
       ? "ยืนยันการจองนี้ใช่หรือไม่? สถานะจะเปลี่ยนเป็น \"การจองสำเร็จ\""
       : "ยกเลิกการจองนี้ใช่หรือไม่? การกระทำนี้ไม่สามารถย้อนกลับได้ และช่วงเวลานี้จะกลับมาให้ลูกค้าจองได้ใหม่";
     const confirmed = window.confirm(msg);
     if (!confirmed) return;
-    await callAdminAction("updateStatus", token, { id, status });
+    let refundCredit = false;
+    if (status === "cancelled" && packageId) {
+      refundCredit = window.confirm("การจองนี้จ่ายด้วยสิทธิ์แพ็คเกจ\n\nกด OK = คืนสิทธิ์ให้ลูกค้า (ปัญหาจากทางสนาม)\nกด Cancel = ไม่คืนสิทธิ์ (ลูกค้ายกเลิกเอง)");
+    }
+    await callAdminAction("updateStatus", token, { id, status, refundCredit });
     setBookings(prev => prev.map(b => b.id === id ? { ...b, status } : b));
     setQueue(prev => prev.filter(b => b.id !== id));
   };
@@ -1585,7 +2002,7 @@ function AdminDashboard({ token, onLogout }) {
         </header>
 
         <div style={{background:"#fff",borderBottom:"1px solid var(--dv)",display:"flex",padding:"0 20px",overflowX:"auto"}}>
-          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
+          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["packages","🎟 แพ็คเกจ"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
             <button key={id} onClick={() => setTab(id)} style={{padding:"13px 16px",background:"none",border:"none",borderBottom:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",fontWeight:tab===id?700:400,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
               {label}
             </button>
@@ -1677,13 +2094,13 @@ function AdminDashboard({ token, onLogout }) {
                               <td>{fmtTime(b)}</td>
                               <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
                               <td>{b.customer_id}</td>
-                              <td style={{fontWeight:700,color:"var(--or)"}}>฿{b.price?.toLocaleString()}</td>
+                              <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
                               <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
                               <td><span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 8px",borderRadius:20}}>{st.text}</span></td>
                               <td>
                                 <div style={{display:"flex",gap:6}}>
                                   <button onClick={()=>updateStatus(b.id,"confirmed")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>
-                                  <button onClick={()=>updateStatus(b.id,"cancelled")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                  <button onClick={()=>updateStatus(b.id,"cancelled",b.package_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
                                 </div>
                               </td>
                             </tr>
@@ -1728,17 +2145,81 @@ function AdminDashboard({ token, onLogout }) {
                             <td>{fmtTime(b)}</td>
                             <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
                             <td>{b.customer_id}</td>
-                            <td style={{fontWeight:700,color:"var(--or)"}}>฿{b.price?.toLocaleString()}</td>
+                            <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
                             <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
                             <td><span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 8px",borderRadius:20}}>{st.text}</span></td>
                             <td>
                               {b.status!=="cancelled" && b.status!=="blocked" && (
                                 <div style={{display:"flex",gap:6}}>
                                   {b.status!=="confirmed" && <button onClick={()=>updateStatus(b.id,"confirmed")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>}
-                                  <button onClick={()=>updateStatus(b.id,"cancelled")} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                  <button onClick={()=>updateStatus(b.id,"cancelled",b.package_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
                                 </div>
                               )}
                               {b.status==="blocked" && <span style={{fontSize:11,color:"var(--mu)"}}>จัดการที่แท็บ "ปิดสนาม"</span>}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab==="packages" && (
+            <div>
+              <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:10}}>🔔 รายการรอตรวจสอบ/ยืนยัน {pkgQueue.length > 0 && `(${pkgQueue.length})`}</p>
+              <div style={{background:"#fff",borderRadius:12,border:"1.5px solid #e67e22",overflow:"auto",boxShadow:"var(--sh)",marginBottom:24}}>
+                {pkgQueueLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                pkgQueue.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>✅ ไม่มีรายการค้างตรวจสอบ</p> : (
+                  <table className="adm-table">
+                    <thead><tr><th>ชื่อลูกค้า</th><th>เบอร์</th><th>แพ็คเกจ</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                    <tbody>
+                      {pkgQueue.map(pk => (
+                        <tr key={pk.id}>
+                          <td style={{fontWeight:600}}>{pk.customer_name || "-"}</td>
+                          <td>{pk.customer_id}</td>
+                          <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits} ครั้ง</td>
+                          <td style={{fontWeight:700,color:"var(--or)"}}>฿{pk.price?.toLocaleString()}</td>
+                          <td>{pk.slip_url ? <a href={pk.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
+                          <td><span style={{fontSize:12,fontWeight:600,color:pk.status==="reviewing"?"#e67e22":"var(--mu)"}}>{pk.status==="reviewing"?"🔍 รอการยืนยัน":"⏳ รอชำระ"}</span></td>
+                          <td>
+                            <div style={{display:"flex",gap:6}}>
+                              <button onClick={()=>confirmPackage(pk.id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>
+                              <button onClick={()=>cancelPackage(pk.id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                <p style={{fontWeight:700,color:"var(--br)",fontSize:15}}>📋 แพ็คเกจทั้งหมด (ล่าสุด 200 รายการ)</p>
+                <button onClick={loadAllPkgs} style={{padding:"6px 12px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontWeight:600,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
+              </div>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                {allPkgsLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                allPkgs.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ยังไม่มีแพ็คเกจ</p> : (
+                  <table className="adm-table">
+                    <thead><tr><th>ชื่อลูกค้า</th><th>เบอร์</th><th>แพ็คเกจ</th><th>คงเหลือ</th><th>หมดอายุ</th><th>สถานะ</th></tr></thead>
+                    <tbody>
+                      {allPkgs.map(pk => {
+                        const expired = pk.status==="active" && pk.expiry_date && new Date(pk.expiry_date+"T23:59:59") < new Date();
+                        return (
+                          <tr key={pk.id}>
+                            <td style={{fontWeight:600}}>{pk.customer_name || "-"}</td>
+                            <td>{pk.customer_id}</td>
+                            <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits}</td>
+                            <td>{pk.status==="active" ? `${pk.remaining_credits} / ${pk.total_credits}` : "-"}</td>
+                            <td>{pk.expiry_date ? new Date(pk.expiry_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short",year:"numeric"}) : "-"}</td>
+                            <td>
+                              <span style={{fontSize:11.5,fontWeight:600,color:expired?"#c0392b":pk.status==="active"?"#2d7a4f":pk.status==="cancelled"?"#c0392b":"var(--mu)"}}>
+                                {expired ? "หมดอายุแล้ว" : pk.status==="active" ? "ใช้งานได้" : pk.status==="cancelled" ? "ยกเลิกแล้ว" : pk.status==="reviewing" ? "รอการยืนยัน" : "รอชำระ"}
+                              </span>
                             </td>
                           </tr>
                         );
