@@ -25,6 +25,10 @@ export default async function handler(req, res) {
   try {
     const { courtName, date, time, price, name, phone } = req.body || {};
 
+    // เวลาที่ลูกค้าส่งสลิป/กดซื้อ (คำนวณฝั่งเซิร์ฟเวอร์ เชื่อถือได้กว่าพึ่งนาฬิกาเครื่องลูกค้า)
+    const nowBangkok = new Date(Date.now() + 7 * 60 * 60 * 1000);
+    const sentAtStr = nowBangkok.toISOString().substr(11, 5);
+
     const text =
       `🔔 มีลูกค้าส่งสลิปใหม่\n\n` +
       `🎾 สนาม: ${courtName || "-"}\n` +
@@ -32,7 +36,8 @@ export default async function handler(req, res) {
       `🕐 เวลา: ${time || "-"}\n` +
       `💰 ยอด: ฿${price ?? "-"}\n` +
       `👤 ชื่อ: ${name || "-"}\n` +
-      `📞 เบอร์: ${phone || "-"}\n\n` +
+      `📞 เบอร์: ${phone || "-"}\n` +
+      `🕓 ส่งสลิปเมื่อเวลา: ${sentAtStr} น. (ไทย)\n\n` +
       `สถานะ: รอการตรวจสอบ\nกรุณาเข้าไปตรวจสอบและยืนยันที่หน้า Admin Dashboard`;
 
     await Promise.all(
