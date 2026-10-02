@@ -117,21 +117,36 @@ export default async function handler(req, res) {
       }
       case "updateStatus": {
         const { id, status, refundCredit } = p;
-        const { body } = await sb(`bookings?id=eq.${id}`, {
-          method: "PATCH",
-          headers: { Prefer: "return=representation" },
-          body: JSON.stringify({ status }),
-        });
-        const row = (body || [])[0];
-        // ยกเลิกการจองที่จ่ายด้วยสิทธิ์แพ็คเกจ + แอดมินเลือกคืนสิทธิ์ → บวกจำนวนครั้งกลับเข้าแพ็คเกจ (ไม่เกินจำนวนเต็มที่ซื้อไว้)
-        if (status === "cancelled" && refundCredit && row?.package_id) {
-          const { body: pkgRows } = await sb(`packages?id=eq.${row.package_id}&select=*`);
-          const pkg = (pkgRows || [])[0];
-          if (pkg && pkg.remaining_credits < pkg.total_credits) {
-            await sb(`packages?id=eq.${row.package_id}`, {
-              method: "PATCH",
-              body: JSON.stringify({ remaining_credits: pkg.remaining_credits + 1 }),
-            });
+        // อ่านสถานะ "ก่อนหน้า" ก่อนแก้ไข เพื่อตัดสินใจเรื่องสิทธิ์แพ็คเกจให้ถูกต้องตามการเปลี่ยนสถานะจริง
+        const { body: beforeRows } = await sb(`bookings?id=eq.${id}&select=*`);
+        const before = (beforeRows || [])[0];
+
+        await sb(`bookings?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status }) });
+
+        if (before?.package_id) {
+          const wasConfirmed = before.status === "confirmed";
+          // ยืนยันครั้งแรก (ยังไม่เคยเป็น confirmed มาก่อน) → หักสิทธิ์จริงตอนนี้
+          if (status === "confirmed" && !wasConfirmed) {
+            const { body: pkgRows } = await sb(`packages?id=eq.${before.package_id}&select=*`);
+            const pkg = (pkgRows || [])[0];
+            if (pkg && pkg.remaining_credits > 0) {
+              await sb(`packages?id=eq.${before.package_id}&remaining_credits=eq.${pkg.remaining_credits}`, {
+                method: "PATCH",
+                body: JSON.stringify({ remaining_credits: pkg.remaining_credits - 1 }),
+              });
+            }
+          }
+          // ยกเลิกรายการที่ "เคยยืนยันแล้ว" (เคยหักสิทธิ์ไปจริง) + แอดมินเลือกคืนสิทธิ์ → บวกกลับ
+          // (ถ้ายกเลิกจากสถานะ "รอการยืนยัน" ที่ยังไม่เคยหักสิทธิ์เลย จะไม่คืนให้ ไม่ว่า refundCredit จะเป็นอะไร กันการคืนสิทธิ์ที่ไม่เคยถูกหัก)
+          if (status === "cancelled" && wasConfirmed && refundCredit) {
+            const { body: pkgRows } = await sb(`packages?id=eq.${before.package_id}&select=*`);
+            const pkg = (pkgRows || [])[0];
+            if (pkg && pkg.remaining_credits < pkg.total_credits) {
+              await sb(`packages?id=eq.${before.package_id}`, {
+                method: "PATCH",
+                body: JSON.stringify({ remaining_credits: pkg.remaining_credits + 1 }),
+              });
+            }
           }
         }
         res.status(200).json({ ok: true });
