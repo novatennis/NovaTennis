@@ -162,7 +162,9 @@ export default async function handler(req, res) {
         const isWeekend = day === 0 || day === 6;
         const isPeak = isWeekend || hour >= 16;
 
-        // ─── จองด้วยสิทธิ์แพ็คเกจ (จ่ายไว้ล่วงหน้าแล้ว ไม่ต้องโอน/แนบสลิปซ้ำ) ──────────
+        // ─── จองด้วยสิทธิ์แพ็คเกจ ──────────────────────────────────────────────────
+        // ไม่ตัดสิทธิ์ทันที — สร้างเป็นสถานะ "รอการยืนยัน" ก่อน แจ้งเตือนแอดมินทันที
+        // สิทธิ์จะถูกหักจริงก็ต่อเมื่อแอดมินกดยืนยัน (ป้องกันลูกค้ากดจองมั่ว/พลาด แล้วเสียสิทธิ์ฟรี)
         if (packageId) {
           if (durationMinutes !== 60) { res.status(400).json({ error: "package_60min_only" }); return; }
           const { body: pkgRows } = await sb(`packages?id=eq.${packageId}&customer_id=eq.${customerId}&select=*`);
@@ -179,26 +181,32 @@ export default async function handler(req, res) {
             body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
           });
 
-          // หักสิทธิ์แบบกัน race condition: PATCH มีเงื่อนไข remaining_credits เท่ากับค่าที่เพิ่งอ่านมา
-          // ถ้ามีคนอื่นหักไปพร้อมกันจนค่าเปลี่ยนไปแล้ว คำสั่งนี้จะไม่ตรงเงื่อนไข ไม่หักซ้ำ
-          const { body: decRows } = await sb(`packages?id=eq.${packageId}&remaining_credits=eq.${pkg.remaining_credits}`, {
-            method: "PATCH",
-            headers: { Prefer: "return=representation" },
-            body: JSON.stringify({ remaining_credits: pkg.remaining_credits - 1 }),
-          });
-          if (!decRows || decRows.length === 0) { res.status(409).json({ error: "package_race_conflict" }); return; }
-
           const { body: created } = await sb(`bookings`, {
             method: "POST",
             headers: { Prefer: "return=representation" },
             body: JSON.stringify({
               court_id: courtId, customer_id: customerId, customer_name: customerName,
               booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: 60,
-              price: 0, package_id: packageId, status: "confirmed", // จ่ายไว้แล้วตอนซื้อแพ็ค ไม่ต้องรอตรวจสลิปซ้ำ
+              price: 0, package_id: packageId, status: "reviewing", // รอแอดมินกดยืนยันก่อนถึงจะหักสิทธิ์จริง
             }),
           });
           const bookingRow = (created || [])[0];
           if (!bookingRow) { res.status(500).json({ error: "insert_failed" }); return; }
+
+          const nowBangkok = new Date(Date.now() + 7 * 60 * 60 * 1000);
+          const timeStr = nowBangkok.toISOString().substr(11, 5);
+          const text =
+            `🎟 <b>มีการจองด้วยสิทธิ์แพ็คเกจ</b>\n` +
+            `รอการยืนยันจากแอดมิน (จะหักสิทธิ์ก็ต่อเมื่อกดยืนยันแล้วเท่านั้น)\n\n` +
+            `👤 ${customerName}\n` +
+            `📞 ${customerId}\n` +
+            `🎾 Court ${courtId}\n` +
+            `📅 ${bookingDate}\n` +
+            `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n` +
+            `🎫 สิทธิ์เหลือก่อนจอง: ${pkg.remaining_credits} / ${pkg.total_credits} ครั้ง\n` +
+            `🕓 กดจองเมื่อเวลา ${timeStr} น. (ไทย)`;
+          await notifyTelegram(text);
+
           res.status(200).json({ booking: bookingRow });
           return;
         }
