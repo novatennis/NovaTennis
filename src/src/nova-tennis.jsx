@@ -376,7 +376,7 @@ function PendingPaymentBanner({ createdAt, onResume, lang="th" }) {
   );
 }
 
-function HomePage({ goBook, lang="th" }) {
+function HomePage({ goBook, goPackage, lang="th" }) {
   const t = T[lang];
   const now = new Date();
   const inPromo = now <= PROMO_END;
@@ -473,6 +473,20 @@ function HomePage({ goBook, lang="th" }) {
           </div>
         )}
         <button className="btn-primary" onClick={goBook}>{t.bookNow}</button>
+      </div>
+
+      {/* แบนเนอร์แนะนำแพ็คเกจสมาชิก — กดแล้วไปหน้าแพ็คเกจทันที */}
+      <div style={{padding:"14px 16px 0"}}>
+        <button onClick={goPackage} style={{width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,padding:"16px 18px",borderRadius:"var(--r)",border:"none",background:"linear-gradient(90deg,var(--bl),#6fa0b5)",cursor:"pointer",textAlign:"left",boxShadow:"0 4px 16px rgba(141,182,199,.35)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            <span style={{fontSize:28}}>🎟</span>
+            <div>
+              <p style={{fontSize:14.5,fontWeight:800,color:"#fff"}}>{lang==="th"?"ซื้อแพ็คเกจ คุ้มกว่าจ่ายเดี่ยว":"Buy a Package — Save More"}</p>
+              <p style={{fontSize:11.5,color:"rgba(255,255,255,.85)",marginTop:2}}>{lang==="th"?"จองล่วงหน้าหลายครั้ง ราคาถูกลง ใช้ได้ตามระยะเวลาที่กำหนด":"Pre-pay multiple sessions at a lower price"}</p>
+            </div>
+          </div>
+          <span style={{fontSize:22,color:"#fff"}}>›</span>
+        </button>
       </div>
 
       <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
@@ -867,6 +881,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, lang
             <div>
               <p style={{fontSize:13.5,fontWeight:700,color:"var(--br)"}}>🎟 {lang==="th"?"ใช้สิทธิ์จากแพ็คเกจ":"Use package credit"}</p>
               <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือ ${matchedPkg.remaining_credits} ครั้ง — ไม่ต้องชำระเงินเพิ่ม`:`${matchedPkg.remaining_credits} sessions left — no extra payment needed`}</p>
+              <p style={{fontSize:11,color:"var(--mu)",marginTop:3}}>{lang==="th"?"* รอแอดมินยืนยันก่อน ถึงจะหักสิทธิ์จริง (เหมือนการจองปกติ)":"* Admin confirmation required before a credit is actually deducted"}</p>
             </div>
           </div>
         )}
@@ -1208,6 +1223,32 @@ function PackagePage({ lang="th" }) {
         <p style={{fontSize:12.5,color:"var(--mu)"}}>{lang==="th"?"ซื้อจำนวนครั้งล่วงหน้า ถูกกว่าจ่ายเดี่ยว ใช้จองได้ภายในระยะเวลาที่กำหนด (จองได้ครั้งละ 60 นาทีเท่านั้น)":"Buy sessions in advance, cheaper than paying per visit. Each credit books a 60-minute session."}</p>
       </section>
 
+      <section>
+        <div style={{background:"var(--bl-bg)",border:"1px solid rgba(141,182,199,.4)",borderRadius:12,padding:"14px 16px"}}>
+          <p style={{fontSize:13,fontWeight:700,color:"var(--br)",marginBottom:8}}>{lang==="th"?"📌 วิธีใช้สิทธิ์แพ็คเกจ":"📌 How to use your package"}</p>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {(lang==="th" ? [
+              "เลือกและซื้อแพ็คเกจด้านล่าง แล้วโอนเงิน + แนบสลิป",
+              "รอแอดมินตรวจสอบและกดยืนยัน (แพ็คเกจจะเริ่มนับอายุการใช้งานตั้งแต่ตอนนั้น)",
+              "ไปที่แท็บ \"จองสนาม\" ตามปกติ เลือกวันที่/สนาม/เวลาให้ตรงกับช่วงของแพ็คเกจ (Off Peak หรือ Peak)",
+              "ตอนกรอกชื่อ-เบอร์โทร ถ้ามีสิทธิ์คงเหลือ ระบบจะโชว์ตัวเลือก \"ใช้สิทธิ์จากแพ็คเกจ\" ให้กดเลือกแทนการโอนเงิน",
+              "แอดมินจะกดยืนยันการจองนี้อีกครั้ง (เหมือนการจองปกติ) ถึงจะหักสิทธิ์จริง",
+            ] : [
+              "Choose and buy a package below, then transfer and upload your payment slip",
+              "Wait for admin to verify and confirm (the package's validity period starts from then)",
+              "Go to the \"Book\" tab as usual, select a date/court/time matching your package's tier (Off Peak or Peak)",
+              "When entering your name/phone, if you have credits left, you'll see an option to \"Use package credit\" instead of paying",
+              "Admin will confirm this booking (same as a normal booking) — only then is a credit actually deducted",
+            ]).map((txt,i) => (
+              <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start"}}>
+                <span style={{fontSize:11.5,fontWeight:800,color:"var(--br)",flexShrink:0}}>{i+1}.</span>
+                <p style={{fontSize:12,color:"var(--tx)",lineHeight:1.6}}>{txt}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
       {/* ค้นหาแพ็คเกจของฉัน */}
       <section>
         <StepHead n="🔍" label={lang==="th"?"แพ็คเกจของฉัน":"My Packages"} />
@@ -1244,6 +1285,9 @@ function PackagePage({ lang="th" }) {
                         <Row label={lang==="th"?"หมดอายุ":"Expires"} val={new Date(p.expiry_date).toLocaleDateString(lang==="th"?"th-TH":"en-GB",{year:"numeric",month:"short",day:"numeric"})} />
                       </>
                     )}
+                    {(p.status==="pending" || p.status==="reviewing") && (
+                      <Row label={lang==="th"?"อายุการใช้งาน":"Valid for"} val={lang==="th"?`${p.expiry_days} วัน นับจากวันที่ยืนยัน`:`${p.expiry_days} days from confirmation`} />
+                    )}
                     <Row label={t.rowPrice} val={`฿${p.price?.toLocaleString()}`} />
                   </div>
                 </div>
@@ -1274,7 +1318,7 @@ function PackagePage({ lang="th" }) {
                     <p style={{fontSize:10,color:"var(--mu)",marginTop:2}}>{lang==="th"?"ครั้ง":"sessions"}</p>
                     <p style={{fontSize:10.5,color:"var(--mu)",textDecoration:"line-through",marginTop:4}}>฿{opt.fullPrice.toLocaleString()}</p>
                     <p style={{fontSize:14,fontWeight:800,color:sel?"var(--or)":"var(--br)"}}>฿{opt.price.toLocaleString()}</p>
-                    <p style={{fontSize:9.5,color:"var(--mu)",marginTop:2}}>{opt.days} {lang==="th"?"วัน":"days"}</p>
+                    <p style={{fontSize:9.5,color:"var(--mu)",marginTop:2}}>{lang==="th"?`อายุการใช้งาน ${opt.days} วัน`:`Valid ${opt.days} days`}</p>
                   </button>
                 );
               })}
@@ -1625,7 +1669,7 @@ export default function AppV2() {
       alert(msg);
       return;
     }
-    alert(lang==="th" ? "✅ จองสำเร็จ! ใช้สิทธิ์จากแพ็คเกจเรียบร้อยแล้ว" : "✅ Booking confirmed using your package credit!");
+    alert(lang==="th" ? "✅ ส่งคำขอจองแล้ว! รอแอดมินยืนยันก่อนถึงจะหักสิทธิ์และถือว่าจองสำเร็จ" : "✅ Booking request sent! Awaiting admin confirmation before the credit is deducted.");
     setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
     setPrefillPhone(phone || "");
     setTab("cancel");
@@ -1726,7 +1770,7 @@ export default function AppV2() {
           </div>
         </header>
         <main>
-          {tab==="home" && <HomePage goBook={() => goTab("book")} lang={lang} />}
+          {tab==="home" && <HomePage goBook={() => goTab("book")} goPackage={() => goTab("package")} lang={lang} />}
           {tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} lang={lang} />}
           {tab==="book" && page==="checkout" && booking && (
             <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} onConfirmWithPackage={handleConfirmWithPackage} lang={lang} />
@@ -2205,16 +2249,19 @@ function AdminDashboard({ token, onLogout }) {
                 {allPkgsLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
                 allPkgs.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ยังไม่มีแพ็คเกจ</p> : (
                   <table className="adm-table">
-                    <thead><tr><th>ชื่อลูกค้า</th><th>เบอร์</th><th>แพ็คเกจ</th><th>คงเหลือ</th><th>หมดอายุ</th><th>สถานะ</th></tr></thead>
+                    <thead><tr><th>ชื่อลูกค้า</th><th>เบอร์</th><th>แพ็คเกจ</th><th>ใช้ไป</th><th>คงเหลือ</th><th>ซื้อสำเร็จเมื่อ</th><th>หมดอายุ</th><th>สถานะ</th></tr></thead>
                     <tbody>
                       {allPkgs.map(pk => {
                         const expired = pk.status==="active" && pk.expiry_date && new Date(pk.expiry_date+"T23:59:59") < new Date();
+                        const used = pk.status==="active" || pk.status==="cancelled" ? (pk.total_credits - pk.remaining_credits) : null;
                         return (
                           <tr key={pk.id}>
                             <td style={{fontWeight:600}}>{pk.customer_name || "-"}</td>
                             <td>{pk.customer_id}</td>
                             <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits}</td>
+                            <td>{used!=null ? `${used} ครั้ง` : "-"}</td>
                             <td>{pk.status==="active" ? `${pk.remaining_credits} / ${pk.total_credits}` : "-"}</td>
+                            <td>{pk.activated_at ? parseUtc(pk.activated_at).toLocaleDateString("th-TH",{day:"2-digit",month:"short",year:"numeric",timeZone:"Asia/Bangkok"}) : "-"}</td>
                             <td>{pk.expiry_date ? new Date(pk.expiry_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short",year:"numeric"}) : "-"}</td>
                             <td>
                               <span style={{fontSize:11.5,fontWeight:600,color:expired?"#c0392b":pk.status==="active"?"#2d7a4f":pk.status==="cancelled"?"#c0392b":"var(--mu)"}}>
