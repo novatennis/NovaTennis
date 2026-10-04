@@ -96,8 +96,14 @@ function getDurationPrice(startHour, dateObj, durationMinutes) {
 
 const FIRST_TIME_PRICE = 450; // โปรโมชั่นจองครั้งแรก — ชั่วโมงละ 450 บาท ไม่ว่าช่วง Off Peak/Peak
 
+// "เคยจองแล้ว" นับเฉพาะ: ยืนยันแล้ว / ส่งสลิปแล้ว (รอตรวจ) / รอชำระที่ยังไม่เกิน 5 นาที (กันเปิดจองซ้อนหลายรายการพร้อมกันแล้วได้โปรทุกรายการ)
+// รายการที่กดจองแล้วทิ้งไว้จนหมดเวลา หรือถูกยกเลิก ไม่นับ — ลูกค้าจะไม่เสียสิทธิ์โปรไปโดยไม่เคยได้ใช้จริง
 async function isFirstTimeCustomer(customerId) {
-  const { body } = await sb(`bookings?customer_id=eq.${customerId}&status=neq.cancelled&select=id&limit=1`);
+  const freshCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const { ok, body } = await sb(
+    `bookings?customer_id=eq.${customerId}&or=(status.in.(confirmed,reviewing),and(status.eq.pending,created_time.gte.${freshCutoff}))&select=id&limit=1`
+  );
+  if (!ok) { console.error("isFirstTimeCustomer query failed"); return false; } // เช็คไม่ได้ → ไม่ให้โปร (ปลอดภัยฝั่งร้านไว้ก่อน)
   return !(body && body.length > 0);
 }
 
@@ -520,17 +526,40 @@ export default async function handler(req, res) {
         const prof = await profRes.json().catch(() => ({}));
         if (!profRes.ok || !prof.userId) { res.status(400).json({ error: "line_profile_failed" }); return; }
 
+        // เช็คว่าลูกค้าเป็นเพื่อนกับ LINE OA (ที่ผูกกับ Login Channel ไว้) แล้วหรือยัง
+        // true = เป็นเพื่อนแล้ว / false = ยังไม่เป็น / null = เช็คไม่ได้ (เช่นยังไม่ได้ผูก OA หรือ LINE ขัดข้อง) → ฝั่งเว็บจะ "ไม่บล็อก" กันลูกค้าจองไม่ได้
+        let isFriend = null;
+        try {
+          const frRes = await fetch("https://api.line.me/friendship/v1/status", {
+            headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+          });
+          if (frRes.ok) {
+            const fr = await frRes.json().catch(() => ({}));
+            if (typeof fr.friendFlag === "boolean") isFriend = fr.friendFlag;
+          } else {
+            console.error("LINE friendship status check failed:", frRes.status);
+          }
+        } catch (e) { console.error("LINE friendship status error:", e?.message); }
+
         // บันทึก/อัปเดตผู้ใช้ (merge เฉพาะคอลัมน์ที่ส่ง — เบอร์/ชื่อที่ผูกไว้เดิมไม่ถูกเขียนทับ)
-        await sb(`line_users`, {
+        const upsertBody = { line_user_id: prof.userId, display_name: prof.displayName || null, last_login: new Date().toISOString() };
+        if (isFriend !== null) upsertBody.is_friend = isFriend;
+        const upsertRes = await sb(`line_users`, {
           method: "POST",
           headers: { Prefer: "resolution=merge-duplicates" },
-          body: JSON.stringify({ line_user_id: prof.userId, display_name: prof.displayName || null, last_login: new Date().toISOString() }),
+          body: JSON.stringify(upsertBody),
         });
+        if (!upsertRes.ok && "is_friend" in upsertBody) {
+          // คอลัมน์ is_friend ยังไม่ถูกสร้าง (ยังไม่ได้รัน SQL) — บันทึกส่วนอื่นให้ก่อน ล็อกอินจะได้ไม่พัง
+          console.error("line_users upsert with is_friend failed — run add-line-friend-column.sql");
+          delete upsertBody.is_friend;
+          await sb(`line_users`, { method: "POST", headers: { Prefer: "resolution=merge-duplicates" }, body: JSON.stringify(upsertBody) });
+        }
         const { body: rows } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(prof.userId)}&select=*`);
         const row = (rows || [])[0] || {};
         res.status(200).json({
           session: signLineSession(prof.userId),
-          profile: { displayName: prof.displayName || "", pictureUrl: prof.pictureUrl || "", name: row.customer_name || "", phone: row.phone || "" },
+          profile: { displayName: prof.displayName || "", pictureUrl: prof.pictureUrl || "", name: row.customer_name || "", phone: row.phone || "", isFriend: isFriend ?? (typeof row.is_friend === "boolean" ? row.is_friend : null) },
         });
         return;
       }
@@ -541,7 +570,7 @@ export default async function handler(req, res) {
         const { body: rows } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}&select=*`);
         const row = (rows || [])[0];
         if (!row) { res.status(401).json({ error: "invalid_session" }); return; }
-        res.status(200).json({ profile: { displayName: row.display_name || "", name: row.customer_name || "", phone: row.phone || "" } });
+        res.status(200).json({ profile: { displayName: row.display_name || "", name: row.customer_name || "", phone: row.phone || "", isFriend: typeof row.is_friend === "boolean" ? row.is_friend : null } });
         return;
       }
 
