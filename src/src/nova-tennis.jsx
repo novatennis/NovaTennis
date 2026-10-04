@@ -242,6 +242,9 @@ const LINE_BOT_PROMPT = "aggressive";
 //   "off"     = ไม่บังคับ (มีปุ่มให้ล็อกอินเฉยๆ)
 const LINE_GATE_MODE = "booking";
 const LINE_BYPASS_KEY = "nova_line_bypass";
+// true = ในโหมด "booking" พอลูกค้ากด "จองสนาม"/"แพ็คเกจ" ตอนยังไม่ล็อกอิน ให้พาไปหน้า LINE Login ทันที (ข้ามหน้าแจ้งของเรา)
+// false = แสดงหน้าแจ้ง "เข้าสู่ระบบด้วย LINE" ของเราก่อน แล้วค่อยกดไปล็อกอิน
+const LINE_SKIP_INTRO = true;
 
 const loadLineSession = () => {
   try { return JSON.parse(localStorage.getItem(LINE_SESSION_KEY) || "null"); } catch { return null; }
@@ -1862,6 +1865,11 @@ export default function AppV2() {
   }, [tab, page]);
 
   const goTab = (id) => {
+    // ตัดสินใจตอน "กด" (ไม่ใช่ตอนแสดงผล) — กด Back จากหน้า LINE แล้วกลับมาหน้าแรกได้ปกติ ไม่วนลูปเด้งไปล็อกอินซ้ำ
+    if (LINE_SKIP_INTRO && LINE_GATE_MODE === "booking" && (id === "book" || id === "package") && !lineSession && !lineBypass) {
+      startLineLogin(id, null); // กลับมาแล้วจะเข้าหน้าที่กดไว้
+      return;
+    }
     if (id === "book") {
       // ถ้ามีการจองที่ยังค้างชำระเงินอยู่ (ยังไม่จบ ไม่ว่าจะสำเร็จหรือหมดเวลา) ให้กลับไปหน้าชำระเงินเดิมเลย
       // แทนที่จะเริ่มจองใหม่ทับ — กันปัญหาเผลอกดแท็บอื่นแล้วหากลับไม่เจอ
