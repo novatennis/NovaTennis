@@ -121,7 +121,12 @@ export default async function handler(req, res) {
         const { body: beforeRows } = await sb(`bookings?id=eq.${id}&select=*`);
         const before = (beforeRows || [])[0];
 
-        await sb(`bookings?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status }) });
+        // การจองคู่ (2 สนามโอนทีเดียว) — เปลี่ยนสถานะทั้งกลุ่มพร้อมกัน กันแอดมินยืนยันไปแค่สนามเดียว
+        if (before?.group_id) {
+          await sb(`bookings?group_id=eq.${encodeURIComponent(before.group_id)}`, { method: "PATCH", body: JSON.stringify({ status }) });
+        } else {
+          await sb(`bookings?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status }) });
+        }
 
         if (before?.package_id) {
           const wasConfirmed = before.status === "confirmed";
