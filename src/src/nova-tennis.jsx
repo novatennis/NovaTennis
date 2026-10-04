@@ -231,6 +231,17 @@ const isFullyBookedDate = (d) => {
 const LINE_LOGIN_CHANNEL_ID = "2011856443";
 const LINE_REDIRECT_URI = "https://nova-tennis.vercel.app/line-callback"; // ต้องตรงกับ Callback URL ใน LINE Developers
 const LINE_SESSION_KEY = "nova_line_session";
+// ชวนลูกค้าเพิ่มเพื่อน LINE OA ตอนล็อกอิน (ต้องผูก OA กับ LINE Login Channel ในหน้า LINE Developers ก่อน)
+// "aggressive" = ขึ้นหน้าชวนเพิ่มเพื่อนแยกต่างหากหลังกดยอมรับ / "normal" = เป็นตัวเลือกเล็กๆ ในหน้ายอมรับ / "" = ไม่ชวน
+const LINE_BOT_PROMPT = "aggressive";
+
+// โหมดบังคับล็อกอิน LINE — เปลี่ยนแค่ค่านี้ค่าเดียวเพื่อสลับพฤติกรรม:
+//   "gate"    = ต้องล็อกอินตั้งแต่เข้าเว็บ (ยังไม่ล็อกอิน = เห็นแต่หน้าล็อกอิน)
+//   "booking" = ดูหน้าแรก/ราคาได้อิสระ แต่ต้องล็อกอินตอนจะเข้าหน้าจองสนาม/แพ็คเกจ
+//   "prompt"  = ชวนล็อกอินตอนเข้าเว็บ แต่กดข้ามได้
+//   "off"     = ไม่บังคับ (มีปุ่มให้ล็อกอินเฉยๆ)
+const LINE_GATE_MODE = "booking";
+const LINE_BYPASS_KEY = "nova_line_bypass";
 
 const loadLineSession = () => {
   try { return JSON.parse(localStorage.getItem(LINE_SESSION_KEY) || "null"); } catch { return null; }
@@ -254,7 +265,8 @@ function startLineLogin(returnTarget = "home", pendingCheckout = null) {
     + `&client_id=${LINE_LOGIN_CHANNEL_ID}`
     + `&redirect_uri=${encodeURIComponent(LINE_REDIRECT_URI)}`
     + `&state=${encodeURIComponent(state)}`
-    + `&scope=${encodeURIComponent("profile")}`;
+    + `&scope=${encodeURIComponent("profile")}`
+    + (LINE_BOT_PROMPT ? `&bot_prompt=${LINE_BOT_PROMPT}` : "");
   window.location.href = url;
 }
 
@@ -388,6 +400,90 @@ const T = {
 
 function NovaLogo({ width }) {
   return <img src="/nova-logo.png" alt="NOVA Tennis" style={{ width, height: "auto", display: "block", margin: "0 auto" }} />;
+}
+
+// หน้า/การ์ดบอกให้ล็อกอินด้วย LINE — fullscreen (โหมด gate) หรือแทรกในหน้า (compact)
+function LineLoginGate({ lang="th", setLang, onLogin, compact=false, onSkip }) {
+  const body = (
+    <div style={{width:"100%",maxWidth:380,background:"#fff",borderRadius:18,padding:"26px 22px",boxShadow:"0 10px 40px rgba(102,57,36,.15)",border:"1px solid var(--dv)",textAlign:"center"}}>
+      {!compact && <NovaLogo width={130} />}
+      <p style={{fontSize:18,fontWeight:800,color:"var(--br)",marginTop:compact?0:18}}>{lang==="th" ? "เข้าสู่ระบบด้วย LINE" : "Sign in with LINE"}</p>
+      <p style={{fontSize:13,color:"var(--mu)",lineHeight:1.7,marginTop:8}}>
+        {lang==="th"
+          ? "เพื่อเริ่มใช้งานระบบจอง NOVA Tennis กรุณาเข้าสู่ระบบด้วยบัญชี LINE ของคุณ ระบบจะกรอกชื่อ-เบอร์ให้อัตโนมัติ และดูการจอง/แพ็คเกจของคุณได้ทันที"
+          : "Please sign in with your LINE account to use NOVA Tennis booking. Your name and phone will be filled in automatically, and you can see your bookings and packages instantly."}
+      </p>
+      <button onClick={onLogin} style={{width:"100%",marginTop:18,padding:"14px",borderRadius:12,border:"none",background:"#06C755",color:"#fff",fontWeight:800,fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:10,fontFamily:"'Noto Sans Thai',sans-serif",boxShadow:"0 4px 14px rgba(6,199,85,.35)"}}>
+        <span style={{background:"#fff",color:"#06C755",fontWeight:900,fontSize:11,padding:"3px 7px",borderRadius:6}}>LINE</span>
+        {lang==="th" ? "เข้าสู่ระบบด้วย LINE" : "Sign in with LINE"}
+      </button>
+      {onSkip && (
+        <button onClick={onSkip} style={{marginTop:12,background:"none",border:"none",color:"var(--mu)",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+          {lang==="th" ? "ข้ามไปก่อน" : "Skip for now"}
+        </button>
+      )}
+      {(LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && (
+        <p style={{fontSize:12,color:"var(--br)",marginTop:14,lineHeight:1.6,background:"var(--or-bg)",borderRadius:10,padding:"8px 10px"}}>
+          {lang==="th" ? "ระหว่างล็อกอิน LINE จะชวนให้เพิ่มเพื่อน LINE OA ของร้าน — ต้องเพิ่มเพื่อนด้วยจึงจะจองได้" : "During sign-in, LINE will ask you to add our LINE OA — adding it is required to book."}
+        </p>
+      )}
+      <p style={{fontSize:11,color:"var(--mu)",marginTop:14,lineHeight:1.6}}>
+        {lang==="th"
+          ? "ระบบเก็บเฉพาะชื่อและรหัสผู้ใช้ LINE ของคุณ ไม่เห็นรหัสผ่านหรือข้อความแชทใดๆ"
+          : "We only store your LINE display name and user ID. We cannot see your password or any chats."}
+      </p>
+    </div>
+  );
+  if (compact) return <div style={{padding:"28px 16px 100px",display:"flex",justifyContent:"center"}} className="fu">{body}</div>;
+  return (
+    <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:20,gap:14}}>
+      {setLang && (
+        <div style={{display:"flex",gap:4}}>
+          {["th","en"].map(l => (
+            <button key={l} onClick={() => setLang(l)} style={{padding:"5px 10px",borderRadius:8,border:"1.5px solid var(--dv)",background:lang===l?"var(--br)":"#fff",color:lang===l?"var(--or)":"var(--mu)",fontWeight:lang===l?700:400,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+              {l==="th"?"🇹🇭 TH":"🇬🇧 EN"}
+            </button>
+          ))}
+        </div>
+      )}
+      {body}
+    </div>
+  );
+}
+
+// ล็อกอิน LINE แล้ว แต่ยังไม่ได้เป็นเพื่อนกับ LINE OA ของร้าน → ต้องเพิ่มเพื่อนก่อนถึงจะจอง/ซื้อแพ็คเกจได้
+function LineFriendGate({ lang="th", compact=false, onRecheck, name }) {
+  const body = (
+    <div style={{width:"100%",maxWidth:380,background:"#fff",borderRadius:18,padding:"26px 22px",boxShadow:"0 10px 40px rgba(102,57,36,.15)",border:"1px solid var(--dv)",textAlign:"center"}}>
+      {!compact && <NovaLogo width={130} />}
+      <p style={{fontSize:30,marginTop:compact?0:14}}>🎾</p>
+      <p style={{fontSize:18,fontWeight:800,color:"var(--br)",marginTop:6}}>
+        {lang==="th" ? "เพิ่มเพื่อน LINE OA ก่อนดำเนินการต่อ" : "Add our LINE OA to continue"}
+      </p>
+      <p style={{fontSize:13,color:"var(--mu)",lineHeight:1.7,marginTop:8}}>
+        {lang==="th"
+          ? `${name ? `สวัสดีคุณ ${name} ` : ""}ก่อนจองหรือซื้อแพ็คเกจ กรุณาเพิ่มเพื่อน LINE OA ของ NOVA Tennis เพื่อให้ทางร้านติดต่อคุณได้สะดวก และรับข่าวสาร/โปรโมชั่นของร้าน`
+          : `${name ? `Hi ${name}. ` : ""}Before booking or buying a package, please add NOVA Tennis on LINE so we can reach you easily and share news and promotions.`}
+      </p>
+      <a href={LINE_OA_URL} target="_blank" rel="noreferrer"
+        style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,width:"100%",marginTop:18,padding:"14px",borderRadius:12,background:"#06C755",color:"#fff",fontWeight:800,fontSize:16,textDecoration:"none",boxShadow:"0 4px 14px rgba(6,199,85,.35)",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+        <span style={{background:"#fff",color:"#06C755",fontWeight:900,fontSize:11,padding:"3px 7px",borderRadius:6}}>LINE</span>
+        {lang==="th" ? "เพิ่มเพื่อน LINE OA" : "Add LINE OA"}
+      </a>
+      <button onClick={onRecheck} style={{width:"100%",marginTop:10,padding:"12px",borderRadius:12,border:"1.5px solid #06C755",background:"#fff",color:"#06A04A",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+        {lang==="th" ? "✓ เพิ่มเพื่อนแล้ว — ตรวจสอบอีกครั้ง" : "✓ I've added — check again"}
+      </button>
+      <p style={{fontSize:11,color:"var(--mu)",marginTop:12,lineHeight:1.6}}>
+        {lang==="th" ? "หากเพิ่มเพื่อนแล้วแต่ยังขึ้นหน้านี้ กด \"ตรวจสอบอีกครั้ง\" ระบบจะพาไปยืนยันกับ LINE อีกรอบ" : "If you've already added us and still see this, tap \"check again\" to re-verify with LINE."}
+      </p>
+    </div>
+  );
+  if (compact) return <div style={{padding:"28px 16px 100px",display:"flex",justifyContent:"center"}} className="fu">{body}</div>;
+  return (
+    <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      {body}
+    </div>
+  );
 }
 
 function TabBar({ tab, setTab, lang="th" }) {
@@ -1745,6 +1841,9 @@ export default function AppV2() {
   const [lineSession, setLineSession] = useState(() => loadLineSession());
   const [lineCbStatus, setLineCbStatus] = useState(() => (isLineCallbackPath() ? "processing" : null));
   const lineCbStarted = useRef(false);
+  // ข้ามล็อกอินได้ชั่วคราว (เฉพาะเมื่อล็อกอินล้มเหลว หรือโหมด prompt) — ใช้ได้แค่ในเบราว์เซอร์/เซสชันนี้
+  const [lineBypass, setLineBypass] = useState(() => { try { return sessionStorage.getItem(LINE_BYPASS_KEY) === "1"; } catch { return false; } });
+  const doBypass = () => { try { sessionStorage.setItem(LINE_BYPASS_KEY, "1"); } catch { /* no-op */ } setLineBypass(true); };
 
   const clearResumeParam = () => {
     try {
@@ -1828,6 +1927,7 @@ export default function AppV2() {
       const sess = {
         token: result.session, displayName: p.displayName || "", pictureUrl: p.pictureUrl || "",
         name: p.name || toFormName(p.displayName), phone: p.phone || "",
+        isFriend: typeof p.isFriend === "boolean" ? p.isFriend : null, // null = เช็คไม่ได้ → ไม่บล็อกลูกค้า
       };
       saveLineSession(sess); setLineSession(sess);
       try { localStorage.removeItem("nova_line_nonce"); } catch { /* no-op */ }
@@ -1858,7 +1958,8 @@ export default function AppV2() {
     db.lineMe(s.token).then(r => {
       if (r?.error === "invalid_session") { clearLineSession(); setLineSession(null); return; }
       if (r?.profile) {
-        const next = { ...s, displayName: r.profile.displayName || s.displayName, name: r.profile.name || s.name, phone: r.profile.phone || s.phone };
+        const next = { ...s, displayName: r.profile.displayName || s.displayName, name: r.profile.name || s.name, phone: r.profile.phone || s.phone,
+          isFriend: typeof r.profile.isFriend === "boolean" ? r.profile.isFriend : (s.isFriend ?? null) };
         saveLineSession(next); setLineSession(next);
       }
     }).catch(() => {});
@@ -1976,8 +2077,14 @@ export default function AppV2() {
             <p style={{fontSize:15,color:"#c0392b",fontWeight:700}}>{lang==="th" ? "เข้าสู่ระบบด้วย LINE ไม่สำเร็จ" : "LINE sign-in failed"}</p>
             <p style={{fontSize:13,color:"var(--mu)"}}>{lang==="th" ? "กรุณาลองใหม่อีกครั้ง หรือกรอกชื่อ-เบอร์โทรเองได้ตามปกติ" : "Please try again, or enter your name and phone manually."}</p>
             <button className="btn-primary" style={{maxWidth:260}} onClick={() => { window.history.replaceState(null, "", "/"); setLineCbStatus(null); setTab("home"); }}>
-              {lang==="th" ? "กลับหน้าแรก" : "Back to Home"}
+              {lang==="th" ? (LINE_GATE_MODE==="gate" || LINE_GATE_MODE==="booking" ? "ลองใหม่อีกครั้ง" : "กลับหน้าแรก") : (LINE_GATE_MODE==="gate" || LINE_GATE_MODE==="booking" ? "Try again" : "Back to Home")}
             </button>
+            {(LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && (
+              <button onClick={() => { doBypass(); window.history.replaceState(null, "", "/"); setLineCbStatus(null); setTab("home"); }}
+                style={{background:"none",border:"none",color:"var(--mu)",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {lang==="th" ? "เข้าใช้งานโดยไม่ใช้ LINE (กรอกชื่อ-เบอร์เอง)" : "Continue without LINE (enter details manually)"}
+              </button>
+            )}
           </>
         )}
       </div>
@@ -2016,6 +2123,26 @@ export default function AppV2() {
     </>
   );
 
+  const needLogin = !lineSession && !lineBypass;
+  // ล็อกอินแล้วแต่ LINE ยืนยันว่ายังไม่เป็นเพื่อนกับ OA (false เท่านั้น — ถ้าเช็คไม่ได้เป็น null จะไม่บล็อก กันลูกค้าจองไม่ได้เพราะระบบเรา/LINE ขัดข้อง)
+  const needFriend = (LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && !!lineSession && lineSession.isFriend === false && !lineBypass;
+  // กลับไปล็อกอินใหม่เพื่อตรวจสถานะเพื่อน โดยจำรายการที่เลือกไว้ (ถ้ามี) ให้กลับมาต่อได้
+  const recheckFriend = () => handleLineLogin(
+    booking && booking.slot && booking.court
+      ? { dateIso: toIso(booking.date), courtId: booking.court.courtId, courtIds: booking.courts ? booking.courts.map(c => c.courtId) : null, slot: booking.slot }
+      : null
+  );
+  if (LINE_GATE_MODE === "gate" && (needLogin || needFriend)) return (
+    <>
+      <style>{CSS}</style>
+      {needLogin
+        ? <LineLoginGate lang={lang} setLang={setLang} onLogin={() => handleLineLogin(null)} />
+        : <LineFriendGate lang={lang} name={toFormName(lineSession?.displayName)} onRecheck={recheckFriend} />}
+    </>
+  );
+  // โหมด booking: กั้นเฉพาะหน้าจองสนาม/แพ็คเกจ (หน้าแรก ราคา แบนเนอร์ ดูได้อิสระ)
+  const blockedByLine = LINE_GATE_MODE === "booking" && (needLogin || needFriend) && (tab === "book" || tab === "package");
+
   return (
     <>
       <style>{CSS}</style>
@@ -2042,16 +2169,24 @@ export default function AppV2() {
             ))}
           </div>
         </header>
+        {LINE_GATE_MODE === "prompt" && needLogin && tab === "home" && (
+          <div style={{position:"fixed",inset:0,zIndex:300,background:"rgba(46,26,14,.55)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+            <LineLoginGate lang={lang} compact onLogin={() => handleLineLogin(null)} onSkip={doBypass} />
+          </div>
+        )}
         <main>
+          {blockedByLine && (needLogin
+            ? <LineLoginGate lang={lang} compact onLogin={() => handleLineLogin(null)} />
+            : <LineFriendGate lang={lang} compact name={toFormName(lineSession?.displayName)} onRecheck={recheckFriend} />)}
           {tab==="home" && <HomePage goBook={() => goTab("book")} goPackage={() => goTab("package")} lang={lang} />}
-          {tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} lang={lang} />}
-          {tab==="book" && page==="checkout" && booking && (
+          {!blockedByLine && tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} lang={lang} />}
+          {!blockedByLine && tab==="book" && page==="checkout" && booking && (
             <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} onConfirmWithPackage={handleConfirmWithPackage} lineSession={lineSession} onLineLogin={handleLineLogin} onLinePhoneLinked={handleLinePhoneLinked} lang={lang} />
           )}
-          {tab==="book" && page==="payment" && booking && customer && (
+          {!blockedByLine && tab==="book" && page==="payment" && booking && customer && (
             <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} resumeBooking={resumeBooking} onCreated={(id, createdAt) => setResumeBooking({ id, createdAt })} onStartOver={resetBookingFlow} />
           )}
-          {tab==="package" && <PackagePage lang={lang} lineSession={lineSession} onLineLogin={handleLineLogin} onLinePhoneLinked={handleLinePhoneLinked} />}
+          {!blockedByLine && tab==="package" && <PackagePage lang={lang} lineSession={lineSession} onLineLogin={handleLineLogin} onLinePhoneLinked={handleLinePhoneLinked} />}
           {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone || lineSession?.phone || ""} />}
         </main>
         <TabBar tab={tab} setTab={goTab} lang={lang} />
