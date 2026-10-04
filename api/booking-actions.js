@@ -7,6 +7,34 @@
 // and prevents a customer from tampering with price or setting their own
 // booking status straight to "confirmed".
 
+import crypto from "crypto";
+
+// ─── LINE Login (ช่วยกรอกชื่อ/เบอร์อัตโนมัติ) ───────────────────────────────────────
+// Channel ID/secret อ่านจาก Environment Variables ของ Vercel เท่านั้น (ห้ามฝังในโค้ด)
+const LINE_LOGIN_CHANNEL_ID = process.env.LINE_LOGIN_CHANNEL_ID;
+const LINE_LOGIN_CHANNEL_SECRET = process.env.LINE_LOGIN_CHANNEL_SECRET;
+const LINE_REDIRECT_URI = "https://nova-tennis.vercel.app/line-callback"; // ต้องตรงกับ Callback URL ที่ตั้งใน LINE Developers เป๊ะ
+const LINE_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // session อยู่ได้ 30 วัน
+
+// session token = userId.expiry.signature (HMAC) — ไม่ต้องเก็บ session ฝั่งเซิร์ฟเวอร์
+function signLineSession(userId) {
+  const payload = `${userId}.${Date.now() + LINE_SESSION_TTL_MS}`;
+  const sig = crypto.createHmac("sha256", LINE_LOGIN_CHANNEL_SECRET).update(payload).digest("hex");
+  return `${payload}.${sig}`;
+}
+function verifyLineSession(token) {
+  if (!token || typeof token !== "string" || !LINE_LOGIN_CHANNEL_SECRET) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [userId, expiryStr, sig] = parts;
+  const expiry = Number(expiryStr);
+  if (!userId || !expiry || Date.now() > expiry) return null;
+  const expected = crypto.createHmac("sha256", LINE_LOGIN_CHANNEL_SECRET).update(`${userId}.${expiryStr}`).digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected)) ? userId : null;
+  } catch { return null; }
+}
+
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -66,6 +94,13 @@ function getDurationPrice(startHour, dateObj, durationMinutes) {
   return numHours * rate[60] + (rem === 30 ? rate[30] : 0);
 }
 
+const FIRST_TIME_PRICE = 450; // โปรโมชั่นจองครั้งแรก — ชั่วโมงละ 450 บาท ไม่ว่าช่วง Off Peak/Peak
+
+async function isFirstTimeCustomer(customerId) {
+  const { body } = await sb(`bookings?customer_id=eq.${customerId}&status=neq.cancelled&select=id&limit=1`);
+  return !(body && body.length > 0);
+}
+
 async function getActiveIntervals(bookingDate, courtId) {
   const { body } = await sb(
     `bookings?booking_date=eq.${bookingDate}&court_id=eq.${courtId}&status=neq.cancelled&select=hour,start_minute,duration_minutes,status,created_time`
@@ -114,7 +149,13 @@ export default async function handler(req, res) {
         const { id } = p;
         if (!id) { res.status(400).json({ error: "missing id" }); return; }
         const { body } = await sb(`bookings?id=eq.${id}&select=*`);
-        res.status(200).json({ booking: (body || [])[0] || null });
+        const booking = (body || [])[0] || null;
+        let group = null;
+        if (booking?.group_id) {
+          const { body: gRows } = await sb(`bookings?group_id=eq.${encodeURIComponent(booking.group_id)}&select=*&order=court_id.asc`);
+          group = gRows || null;
+        }
+        res.status(200).json({ booking, group });
         return;
       }
 
@@ -172,8 +213,9 @@ export default async function handler(req, res) {
           if (!pkg || pkg.status !== "active") { res.status(400).json({ error: "package_not_active" }); return; }
           if (pkg.remaining_credits <= 0) { res.status(400).json({ error: "package_no_credits" }); return; }
           if (pkg.expiry_date && new Date(pkg.expiry_date + "T23:59:59") < new Date()) { res.status(400).json({ error: "package_expired" }); return; }
-          const pkgTier = isPeak ? "peak" : "offpeak";
-          if (pkg.tier !== pkgTier) { res.status(400).json({ error: "package_wrong_tier" }); return; }
+          // แพ็ค Peak ใช้จองได้ทั้งช่วง Peak และ Off Peak — แพ็ค Off Peak ใช้ได้เฉพาะช่วง Off Peak เท่านั้น
+          const slotTier = isPeak ? "peak" : "offpeak";
+          if (!(pkg.tier === "peak" || pkg.tier === slotTier)) { res.status(400).json({ error: "package_wrong_tier" }); return; }
 
           await sb(`customers`, {
             method: "POST",
@@ -212,7 +254,15 @@ export default async function handler(req, res) {
         }
 
         // ─── จองจ่ายเงินสดตามปกติ ────────────────────────────────────────────────
-        const basePrice = getDurationPrice(hour, dateObj, durationMinutes);
+        let basePrice = getDurationPrice(hour, dateObj, durationMinutes);
+
+        // โปรโมชั่นจองครั้งแรก — เฉพาะจอง 60 นาที และยังไม่เคยมีการจอง (ที่ไม่ถูกยกเลิก) มาก่อนเลยในระบบ
+        // เช็คที่เซิร์ฟเวอร์เสมอ ไม่เชื่อ flag จาก client — ถ้าราคาปกติถูกกว่าอยู่แล้วก็ใช้ราคาปกติ (ลูกค้าได้ราคาที่ถูกที่สุดเสมอ)
+        let isFirstTimePromo = false;
+        if (durationMinutes === 60 && basePrice > FIRST_TIME_PRICE) {
+          const firstTime = await isFirstTimeCustomer(customerId);
+          if (firstTime) { basePrice = FIRST_TIME_PRICE; isFirstTimePromo = true; }
+        }
 
         let discountAmount = 0;
         let discountRow = null;
@@ -252,7 +302,54 @@ export default async function handler(req, res) {
           });
         }
 
-        res.status(200).json({ booking: bookingRow });
+        res.status(200).json({ booking: bookingRow, isFirstTimePromo });
+        return;
+      }
+
+      case "createBookingMulti": {
+        // จอง 2 สนามช่วงเวลาเดียวกันในครั้งเดียว — สร้าง 2 แถวพร้อมกัน (all-or-nothing) ใช้ group_id เดียวกัน โอนทีเดียว
+        // ข้อจำกัดโดยตั้งใจ: ราคาปกติเท่านั้น (ไม่ร่วมกับแพ็คเกจ/โค้ดส่วนลด/โปรจองครั้งแรก) เพื่อให้ยอดรวมชัดเจน ไม่สับสน
+        const { courtIds, customerId, customerName, bookingDate, hour, startMinute, durationMinutes } = p;
+        const ids = Array.isArray(courtIds) ? [...new Set(courtIds.map(Number))].sort() : [];
+        if (ids.length !== 2 || ids[0] !== 1 || ids[1] !== 2) { res.status(400).json({ error: "invalid courts" }); return; }
+        if (!customerId || !customerName || !bookingDate || hour == null || ![30, 60, 90, 120].includes(durationMinutes)) {
+          res.status(400).json({ error: "missing params" }); return;
+        }
+        if (!/^[0-9]{10}$/.test(customerId)) { res.status(400).json({ error: "invalid phone" }); return; }
+        if (String(customerName).trim().length < 1 || String(customerName).length > 16) { res.status(400).json({ error: "invalid name" }); return; }
+
+        const startMin = hour * 60 + (startMinute || 0);
+        const endMin = startMin + durationMinutes;
+        for (const cid of ids) {
+          const activeIntervals = await getActiveIntervals(bookingDate, cid);
+          if (activeIntervals.some(([s, e]) => startMin < e && endMin > s)) { res.status(409).json({ error: "slot_taken" }); return; }
+        }
+
+        const dateObj = new Date(bookingDate + "T00:00:00");
+        const unitPrice = getDurationPrice(hour, dateObj, durationMinutes);
+        const groupId = crypto.randomUUID();
+
+        await sb(`customers`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates" },
+          body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
+        });
+
+        const rowsToInsert = ids.map(cid => ({
+          court_id: cid, customer_id: customerId, customer_name: customerName,
+          booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
+          price: unitPrice, discount_amount: 0, status: "pending", group_id: groupId,
+        }));
+        const { ok, body: created } = await sb(`bookings`, {
+          method: "POST",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify(rowsToInsert),
+        });
+        if (!ok || !Array.isArray(created) || created.length !== 2) {
+          console.error("createBookingMulti insert failed:", created);
+          res.status(500).json({ error: "insert_failed" }); return;
+        }
+        res.status(200).json({ bookings: created, groupId });
         return;
       }
 
@@ -272,6 +369,13 @@ export default async function handler(req, res) {
           res.status(409).json({ error: "update_failed", detail: body });
           return;
         }
+        // การจองคู่ (2 สนามพร้อมกัน) โอนทีเดียว — ใส่สลิปเดียวกันให้อีกแถวในกลุ่มด้วย
+        if (row.group_id) {
+          await sb(`bookings?group_id=eq.${encodeURIComponent(row.group_id)}&id=neq.${bookingId}&status=in.(pending,reviewing)`, {
+            method: "PATCH",
+            body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
+          });
+        }
         res.status(200).json({ booking: row });
         return;
       }
@@ -287,16 +391,28 @@ export default async function handler(req, res) {
         });
         const row = (body || [])[0] || null;
         if (ok && row) {
+          let courtLabel = `Court ${row.court_id}`;
+          let totalPrice = row.price || 0;
+          if (row.group_id) {
+            const { body: others } = await sb(`bookings?group_id=eq.${encodeURIComponent(row.group_id)}&id=neq.${bookingId}&status=in.(pending,reviewing)`, {
+              method: "PATCH",
+              headers: { Prefer: "return=representation" },
+              body: JSON.stringify({ status: "cancelled" }),
+            });
+            const ids = [row, ...(others || [])].map(r => r.court_id).sort();
+            courtLabel = ids.map(c => `Court ${c}`).join(" + ");
+            totalPrice += (others || []).reduce((s, r) => s + (r.price || 0), 0);
+          }
           const startMin = (row.hour || 0) * 60 + (row.start_minute || 0);
           const dur = row.duration_minutes || 60;
           const text =
             `❌ <b>ลูกค้ายกเลิกการจองเอง</b>\n\n` +
             `👤 ${row.customer_name || "-"}\n` +
             `📞 ${row.customer_id}\n` +
-            `🎾 Court ${row.court_id}\n` +
+            `🎾 ${courtLabel}\n` +
             `📅 ${row.booking_date}\n` +
             `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(startMin+dur)}\n` +
-            `💰 ฿${row.price?.toLocaleString?.() || row.price}`;
+            `💰 ฿${totalPrice.toLocaleString()}`;
           await notifyTelegram(text);
         }
         res.status(200).json({ ok: true });
@@ -376,6 +492,79 @@ export default async function handler(req, res) {
         if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
         const { body } = await sb(`packages?customer_id=eq.${phone}&select=*&order=created_time.desc`);
         res.status(200).json({ packages: body || [] });
+        return;
+      }
+
+      case "lineLogin": {
+        // แลก code จาก LINE เป็นข้อมูลโปรไฟล์ — ทำที่เซิร์ฟเวอร์ทั้งหมด secret ไม่หลุดไปที่เบราว์เซอร์
+        const { code } = p;
+        if (!LINE_LOGIN_CHANNEL_ID || !LINE_LOGIN_CHANNEL_SECRET) { res.status(500).json({ error: "line_not_configured" }); return; }
+        if (!code || typeof code !== "string") { res.status(400).json({ error: "missing code" }); return; }
+
+        const tokenRes = await fetch("https://api.line.me/oauth2/v2.1/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code", code, redirect_uri: LINE_REDIRECT_URI,
+            client_id: LINE_LOGIN_CHANNEL_ID, client_secret: LINE_LOGIN_CHANNEL_SECRET,
+          }).toString(),
+        });
+        const tokenJson = await tokenRes.json().catch(() => ({}));
+        if (!tokenRes.ok || !tokenJson.access_token) {
+          console.error("LINE token exchange failed:", tokenJson?.error, tokenJson?.error_description);
+          res.status(400).json({ error: "line_token_failed" }); return;
+        }
+        const profRes = await fetch("https://api.line.me/v2/profile", {
+          headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+        });
+        const prof = await profRes.json().catch(() => ({}));
+        if (!profRes.ok || !prof.userId) { res.status(400).json({ error: "line_profile_failed" }); return; }
+
+        // บันทึก/อัปเดตผู้ใช้ (merge เฉพาะคอลัมน์ที่ส่ง — เบอร์/ชื่อที่ผูกไว้เดิมไม่ถูกเขียนทับ)
+        await sb(`line_users`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates" },
+          body: JSON.stringify({ line_user_id: prof.userId, display_name: prof.displayName || null, last_login: new Date().toISOString() }),
+        });
+        const { body: rows } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(prof.userId)}&select=*`);
+        const row = (rows || [])[0] || {};
+        res.status(200).json({
+          session: signLineSession(prof.userId),
+          profile: { displayName: prof.displayName || "", pictureUrl: prof.pictureUrl || "", name: row.customer_name || "", phone: row.phone || "" },
+        });
+        return;
+      }
+
+      case "lineMe": {
+        const userId = verifyLineSession(p.session);
+        if (!userId) { res.status(401).json({ error: "invalid_session" }); return; }
+        const { body: rows } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}&select=*`);
+        const row = (rows || [])[0];
+        if (!row) { res.status(401).json({ error: "invalid_session" }); return; }
+        res.status(200).json({ profile: { displayName: row.display_name || "", name: row.customer_name || "", phone: row.phone || "" } });
+        return;
+      }
+
+      case "lineLinkPhone": {
+        // ผูกชื่อ+เบอร์กับบัญชี LINE นี้ไว้ ครั้งต่อไปจะกรอกให้อัตโนมัติ
+        const userId = verifyLineSession(p.session);
+        if (!userId) { res.status(401).json({ error: "invalid_session" }); return; }
+        const { name, phone } = p;
+        if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
+        if (!name || String(name).trim().length < 1 || String(name).length > 16) { res.status(400).json({ error: "invalid name" }); return; }
+        await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ customer_name: String(name).trim(), phone }),
+        });
+        res.status(200).json({ ok: true });
+        return;
+      }
+
+      case "checkFirstTime": {
+        const { phone } = p;
+        if (!/^[0-9]{10}$/.test(phone || "")) { res.status(200).json({ eligible: false }); return; }
+        const eligible = await isFirstTimeCustomer(phone);
+        res.status(200).json({ eligible, price: FIRST_TIME_PRICE });
         return;
       }
 
