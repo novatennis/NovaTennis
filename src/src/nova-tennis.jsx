@@ -67,8 +67,8 @@ const db = {
   async lineLogin(code) { return callBookingAction("lineLogin", { code }); },
   async lineMe(session) { return callBookingAction("lineMe", { session }); },
   async lineLinkPhone(session, name, phone) { return callBookingAction("lineLinkPhone", { session, name, phone }); },
-  async checkFirstTime(phone) {
-    const result = await callBookingAction("checkFirstTime", { phone });
+  async checkFirstTime(phone, bookingDate) {
+    const result = await callBookingAction("checkFirstTime", { phone, bookingDate });
     return result?.eligible ? result.price : null; // null = ไม่เข้าเงื่อนไข
   },
   async updateSlip(id, slipUrl) {
@@ -172,6 +172,10 @@ function getDurationPrice(startHour, dateObj, durationMinutes) {
 }
 // สำหรับจุดที่ต้องการราคาอ้างอิงต่อชั่วโมง (เช่น สรุปราคาหน้าแรก)
 function getSlotPrice(hour, dateObj) { return getDurationPrice(hour, dateObj, 60); }
+
+// โปรโมชั่นจองครั้งแรก (แสดงผลเท่านั้น — เซิร์ฟเวอร์เป็นคนตัดสินราคาจริง ต้องแก้ให้ตรงกับ FIRST_TIME_PROMO ใน booking-actions.js ถ้าเปลี่ยน)
+// ใช้ได้กับ "วันที่เล่น" ถึง lastPlayDate (รวมวันนั้น)
+const FIRST_TIME_PROMO = { weekday: 450, weekend: 490, lastPlayDate: "2026-10-31", endTh: "31 ต.ค. 2569", endEn: "31 Oct 2026" };
 
 // ราคาแพ็คเกจสำหรับแสดงผลเท่านั้น — เซิร์ฟเวอร์เป็นคนตัดสินราคาจริงเสมอ (ต้องแก้ให้ตรงกับ PACKAGE_PRICES ใน booking-actions.js ถ้าเปลี่ยนราคา)
 const PACKAGE_TIERS = {
@@ -317,10 +321,16 @@ const CSS = `
   @keyframes fireGlow { 0%,100% { box-shadow:0 6px 22px rgba(232,66,15,.45), 0 0 0 rgba(255,154,31,0); } 50% { box-shadow:0 8px 30px rgba(255,90,20,.75), 0 0 26px rgba(255,170,40,.65); } }
   @keyframes flicker { 0%,100% { transform:translateY(0) scale(1) rotate(-3deg); opacity:.95; } 25% { transform:translateY(-3px) scale(1.12) rotate(3deg); opacity:1; } 50% { transform:translateY(-1px) scale(.95) rotate(-2deg); opacity:.85; } 75% { transform:translateY(-4px) scale(1.08) rotate(4deg); opacity:1; } }
   @keyframes shine { 0% { transform:translateX(-120%) skewX(-20deg); } 60%,100% { transform:translateX(220%) skewX(-20deg); } }
+  @keyframes twinkle { 0%,100% { opacity:.25; transform:scale(.7) rotate(0deg); } 50% { opacity:1; transform:scale(1.15) rotate(20deg); } }
+  @keyframes popPrice { 0%,100% { transform:scale(1); } 50% { transform:scale(1.06); } }
+  @keyframes tagWiggle { 0%,100% { transform:rotate(-2deg); } 50% { transform:rotate(2deg); } }
+  .promo-spark { position:absolute; animation:twinkle 1.8s ease-in-out infinite; pointer-events:none; }
+  .promo-price { animation:popPrice 2s ease-in-out infinite; }
+  .promo-tag { animation:tagWiggle 2.4s ease-in-out infinite; }
   .pkg-fire { animation:fireGlow 1.8s ease-in-out infinite; }
   .pkg-flame { position:absolute; animation:flicker 1.2s ease-in-out infinite; pointer-events:none; }
   .pkg-shine { position:absolute; top:0; bottom:0; width:60px; background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent); animation:shine 3.2s ease-in-out infinite; pointer-events:none; }
-  @media (prefers-reduced-motion: reduce) { .pkg-fire, .pkg-flame, .pkg-shine { animation:none; } }
+  @media (prefers-reduced-motion: reduce) { .pkg-fire, .pkg-flame, .pkg-shine, .promo-spark, .promo-price, .promo-tag { animation:none; } }
 `;
 
 // ─── Translations ─────────────────────────────────────────────────────────────
@@ -627,6 +637,44 @@ function HomePage({ goBook, goPackage, lang="th" }) {
         )}
         <button className="btn-primary" onClick={goBook}>{t.bookNow}</button>
       </div>
+
+      {/* แบนเนอร์โปรจองครั้งแรก — แสดงเฉพาะช่วงโปรโมชั่น (หายเองหลังพ้นวันสุดท้าย) */}
+      {toIso(new Date()) <= FIRST_TIME_PROMO.lastPlayDate && (
+        <div style={{padding:"14px 16px 0"}}>
+          <button onClick={goBook} style={{position:"relative",overflow:"hidden",width:"100%",padding:"18px 16px 16px",borderRadius:"var(--r)",border:"2px dashed rgba(255,255,255,.55)",cursor:"pointer",textAlign:"left",color:"#fff",background:"linear-gradient(135deg,#1E4E66 0%,#2F7A94 55%,#4BA3B8 100%)",boxShadow:"0 6px 22px rgba(47,122,148,.4)"}}>
+            <span className="promo-spark" style={{top:10,right:16,fontSize:20,animationDelay:"0s"}}>✨</span>
+            <span className="promo-spark" style={{top:52,right:46,fontSize:14,animationDelay:".6s"}}>✨</span>
+            <span className="promo-spark" style={{bottom:12,right:20,fontSize:18,animationDelay:"1.1s"}}>✨</span>
+            <span className="promo-tag" style={{position:"relative",display:"inline-block",background:"#FFD54A",color:"#5A3A00",borderRadius:20,padding:"3px 12px",fontSize:11.5,fontWeight:800,marginBottom:8}}>
+              🎁 {lang==="th" ? "สำหรับลูกค้าใหม่" : "NEW CUSTOMERS"}
+            </span>
+            <p style={{position:"relative",fontSize:21,fontWeight:800,lineHeight:1.25,textShadow:"0 2px 8px rgba(0,0,0,.25)",paddingRight:40}}>
+              {lang==="th" ? "ลองเล่นครั้งแรก ราคาพิเศษ!" : "Try your first game — special price!"}
+            </p>
+            <div style={{position:"relative",display:"flex",gap:10,marginTop:12,flexWrap:"wrap"}}>
+              <div className="promo-price" style={{background:"#fff",color:"#1E4E66",borderRadius:14,padding:"8px 14px",textAlign:"center",minWidth:112,boxShadow:"0 3px 10px rgba(0,0,0,.2)"}}>
+                <p style={{fontSize:11,fontWeight:700}}>{lang==="th" ? "จันทร์ – ศุกร์" : "Mon – Fri"}</p>
+                <p style={{fontSize:26,fontWeight:900,lineHeight:1.1}}>฿{FIRST_TIME_PROMO.weekday}<span style={{fontSize:11,fontWeight:700}}>/{lang==="th" ? "ชม." : "hr"}</span></p>
+              </div>
+              <div className="promo-price" style={{background:"#fff",color:"#1E4E66",borderRadius:14,padding:"8px 14px",textAlign:"center",minWidth:112,boxShadow:"0 3px 10px rgba(0,0,0,.2)",animationDelay:".4s"}}>
+                <p style={{fontSize:11,fontWeight:700}}>{lang==="th" ? "เสาร์ – อาทิตย์" : "Sat – Sun"}</p>
+                <p style={{fontSize:26,fontWeight:900,lineHeight:1.1}}>฿{FIRST_TIME_PROMO.weekend}<span style={{fontSize:11,fontWeight:700}}>/{lang==="th" ? "ชม." : "hr"}</span></p>
+              </div>
+            </div>
+            <p style={{position:"relative",fontSize:12.5,marginTop:10,fontWeight:700}}>
+              ⏰ {lang==="th" ? `โปรนี้ถึง ${FIRST_TIME_PROMO.endTh} เท่านั้น` : `Offer valid until ${FIRST_TIME_PROMO.endEn} only`}
+            </p>
+            <span style={{position:"relative",display:"inline-flex",alignItems:"center",gap:6,marginTop:10,background:"#FFD54A",color:"#5A3A00",fontWeight:800,fontSize:13.5,padding:"8px 18px",borderRadius:24,boxShadow:"0 3px 10px rgba(0,0,0,.25)"}}>
+              {lang==="th" ? "จองเลย" : "Book now"} <span style={{fontSize:16}}>→</span>
+            </span>
+            <p style={{position:"relative",fontSize:10.5,marginTop:10,opacity:.85,lineHeight:1.5}}>
+              {lang==="th"
+                ? "* เงื่อนไข: ลูกค้าจองครั้งแรก • จอง 60 นาที • 1 สนาม • วันเล่นไม่เกิน " + FIRST_TIME_PROMO.endTh + " • ไม่ร่วมกับโค้ดส่วนลดหรือแพ็คเกจ"
+                : "* Terms: first booking only • 60 minutes • 1 court • play date up to " + FIRST_TIME_PROMO.endEn + " • cannot combine with discount codes or packages"}
+            </p>
+          </button>
+        </div>
+      )}
 
       {/* แบนเนอร์แพ็คเกจสมาชิก — โทนไฟลุก เด่นกว่าส่วนอื่นในหน้า กดแล้วไปหน้าแพ็คเกจ */}
       <div style={{padding:"14px 16px 0"}}>
@@ -1003,8 +1051,8 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
   useEffect(() => {
     setFirstTimePrice(null);
     if (!phoneOk || slot.durationMinutes !== 60 || isGroup) return;
-    db.checkFirstTime(phone).then(price => setFirstTimePrice(price)).catch(() => {});
-  }, [phone, phoneOk, slot.durationMinutes, isGroup]);
+    db.checkFirstTime(phone, toIso(date)).then(price => setFirstTimePrice(price)).catch(() => {});
+  }, [phone, phoneOk, slot.durationMinutes, isGroup, date]);
   const firstTimeEligible = !isGroup && firstTimePrice != null && firstTimePrice < slot.price && !matchedPkg;
 
   const basePrice = (firstTimeEligible) ? Math.min(slot.price, firstTimePrice) : slot.price;
@@ -1107,7 +1155,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
             <span style={{fontSize:20,flexShrink:0}}>🎉</span>
             <div>
               <p style={{fontSize:13.5,fontWeight:700,color:"#2d7a4f"}}>{lang==="th"?"ยินดีต้อนรับ! ราคาพิเศษสำหรับการจองครั้งแรก":"Welcome! Special first-booking price"}</p>
-              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือจ่ายแค่ ฿${firstTimePrice} (จากปกติ ฿${slot.price}) — ใช้ได้กับการจอง 60 นาทีครั้งแรกเท่านั้น`:`Only ฿${firstTimePrice} (normally ฿${slot.price}) — valid for your first 60-minute booking only`}</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือจ่ายแค่ ฿${firstTimePrice} (จากปกติ ฿${slot.price}) — ใช้ได้กับการจอง 60 นาทีครั้งแรกเท่านั้น สำหรับวันเล่นถึง ${FIRST_TIME_PROMO.endTh}`:`Only ฿${firstTimePrice} (normally ฿${slot.price}) — first 60-minute booking only, for play dates up to ${FIRST_TIME_PROMO.endEn}`}</p>
             </div>
           </div>
         )}
