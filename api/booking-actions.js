@@ -94,7 +94,15 @@ function getDurationPrice(startHour, dateObj, durationMinutes) {
   return numHours * rate[60] + (rem === 30 ? rate[30] : 0);
 }
 
-const FIRST_TIME_PRICE = 450; // โปรโมชั่นจองครั้งแรก — ชั่วโมงละ 450 บาท ไม่ว่าช่วง Off Peak/Peak
+// โปรโมชั่นจองครั้งแรก (ต่อชั่วโมง) — จันทร์-ศุกร์ ฿450 / เสาร์-อาทิตย์ ฿490 ไม่ว่าช่วง Off Peak/Peak
+// นับตาม "วันที่เล่น" (booking_date) ใช้ได้ถึงวันที่เล่น 31 ต.ค. 2569 (รวมวันนั้น) — ต้องแก้ให้ตรงกับ FIRST_TIME_PROMO ใน nova-tennis.jsx ด้วยถ้าเปลี่ยน
+const FIRST_TIME_PROMO = { weekday: 450, weekend: 490, lastPlayDate: "2026-10-31" };
+function getFirstTimePrice(bookingDate) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(bookingDate || "")) return null;
+  if (bookingDate > FIRST_TIME_PROMO.lastPlayDate) return null; // เลยช่วงโปรโมชั่นแล้ว
+  const day = new Date(bookingDate + "T00:00:00").getDay();
+  return (day === 0 || day === 6) ? FIRST_TIME_PROMO.weekend : FIRST_TIME_PROMO.weekday;
+}
 
 // "เคยจองแล้ว" นับเฉพาะ: ยืนยันแล้ว / ส่งสลิปแล้ว (รอตรวจ) / รอชำระที่ยังไม่เกิน 5 นาที (กันเปิดจองซ้อนหลายรายการพร้อมกันแล้วได้โปรทุกรายการ)
 // รายการที่กดจองแล้วทิ้งไว้จนหมดเวลา หรือถูกยกเลิก ไม่นับ — ลูกค้าจะไม่เสียสิทธิ์โปรไปโดยไม่เคยได้ใช้จริง
@@ -265,9 +273,10 @@ export default async function handler(req, res) {
         // โปรโมชั่นจองครั้งแรก — เฉพาะจอง 60 นาที และยังไม่เคยมีการจอง (ที่ไม่ถูกยกเลิก) มาก่อนเลยในระบบ
         // เช็คที่เซิร์ฟเวอร์เสมอ ไม่เชื่อ flag จาก client — ถ้าราคาปกติถูกกว่าอยู่แล้วก็ใช้ราคาปกติ (ลูกค้าได้ราคาที่ถูกที่สุดเสมอ)
         let isFirstTimePromo = false;
-        if (durationMinutes === 60 && basePrice > FIRST_TIME_PRICE) {
+        const promoPrice = durationMinutes === 60 ? getFirstTimePrice(bookingDate) : null;
+        if (promoPrice != null && basePrice > promoPrice) {
           const firstTime = await isFirstTimeCustomer(customerId);
-          if (firstTime) { basePrice = FIRST_TIME_PRICE; isFirstTimePromo = true; }
+          if (firstTime) { basePrice = promoPrice; isFirstTimePromo = true; }
         }
 
         let discountAmount = 0;
@@ -590,10 +599,12 @@ export default async function handler(req, res) {
       }
 
       case "checkFirstTime": {
-        const { phone } = p;
+        const { phone, bookingDate } = p;
         if (!/^[0-9]{10}$/.test(phone || "")) { res.status(200).json({ eligible: false }); return; }
+        const promoPrice = getFirstTimePrice(bookingDate); // null = วันที่เล่นนี้อยู่นอกช่วงโปรโมชั่น
+        if (promoPrice == null) { res.status(200).json({ eligible: false }); return; }
         const eligible = await isFirstTimeCustomer(phone);
-        res.status(200).json({ eligible, price: FIRST_TIME_PRICE });
+        res.status(200).json({ eligible, price: promoPrice });
         return;
       }
 
