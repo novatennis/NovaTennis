@@ -638,65 +638,59 @@ function HomePage({ goBook, goPackage, lang="th" }) {
         <button className="btn-primary" onClick={goBook}>{t.bookNow}</button>
       </div>
 
-      {/* แบนเนอร์โปรจองครั้งแรก — แสดงเฉพาะช่วงโปรโมชั่น (หายเองหลังพ้นวันสุดท้าย) */}
-      {toIso(new Date()) <= FIRST_TIME_PROMO.lastPlayDate && (
-        <div style={{padding:"14px 16px 0"}}>
-          <button onClick={goBook} style={{position:"relative",overflow:"hidden",width:"100%",padding:"18px 16px 16px",borderRadius:"var(--r)",border:"2px dashed rgba(255,255,255,.55)",cursor:"pointer",textAlign:"left",color:"#fff",background:"linear-gradient(135deg,#1E4E66 0%,#2F7A94 55%,#4BA3B8 100%)",boxShadow:"0 6px 22px rgba(47,122,148,.4)"}}>
-            <span className="promo-spark" style={{top:10,right:16,fontSize:20,animationDelay:"0s"}}>✨</span>
-            <span className="promo-spark" style={{top:52,right:46,fontSize:14,animationDelay:".6s"}}>✨</span>
-            <span className="promo-spark" style={{bottom:12,right:20,fontSize:18,animationDelay:"1.1s"}}>✨</span>
-            <span className="promo-tag" style={{position:"relative",display:"inline-block",background:"#FFD54A",color:"#5A3A00",borderRadius:20,padding:"3px 12px",fontSize:11.5,fontWeight:800,marginBottom:8}}>
-              🎁 {lang==="th" ? "สำหรับลูกค้าใหม่" : "NEW CUSTOMERS"}
-            </span>
-            <p style={{position:"relative",fontSize:21,fontWeight:800,lineHeight:1.25,textShadow:"0 2px 8px rgba(0,0,0,.25)",paddingRight:40}}>
-              {lang==="th" ? "ลองเล่นครั้งแรก ราคาพิเศษ!" : "Try your first game — special price!"}
-            </p>
-            <div style={{position:"relative",display:"flex",gap:10,marginTop:12,flexWrap:"wrap"}}>
-              <div className="promo-price" style={{background:"#fff",color:"#1E4E66",borderRadius:14,padding:"8px 14px",textAlign:"center",minWidth:112,boxShadow:"0 3px 10px rgba(0,0,0,.2)"}}>
-                <p style={{fontSize:11,fontWeight:700}}>{lang==="th" ? "จันทร์ – ศุกร์" : "Mon – Fri"}</p>
-                <p style={{fontSize:26,fontWeight:900,lineHeight:1.1}}>฿{FIRST_TIME_PROMO.weekday}<span style={{fontSize:11,fontWeight:700}}>/{lang==="th" ? "ชม." : "hr"}</span></p>
-              </div>
-              <div className="promo-price" style={{background:"#fff",color:"#1E4E66",borderRadius:14,padding:"8px 14px",textAlign:"center",minWidth:112,boxShadow:"0 3px 10px rgba(0,0,0,.2)",animationDelay:".4s"}}>
-                <p style={{fontSize:11,fontWeight:700}}>{lang==="th" ? "เสาร์ – อาทิตย์" : "Sat – Sun"}</p>
-                <p style={{fontSize:26,fontWeight:900,lineHeight:1.1}}>฿{FIRST_TIME_PROMO.weekend}<span style={{fontSize:11,fontWeight:700}}>/{lang==="th" ? "ชม." : "hr"}</span></p>
-              </div>
-            </div>
-            <p style={{position:"relative",fontSize:12.5,marginTop:10,fontWeight:700}}>
-              ⏰ {lang==="th" ? `โปรนี้ถึง ${FIRST_TIME_PROMO.endTh} เท่านั้น` : `Offer valid until ${FIRST_TIME_PROMO.endEn} only`}
-            </p>
-            <span style={{position:"relative",display:"inline-flex",alignItems:"center",gap:6,marginTop:10,background:"#FFD54A",color:"#5A3A00",fontWeight:800,fontSize:13.5,padding:"8px 18px",borderRadius:24,boxShadow:"0 3px 10px rgba(0,0,0,.25)"}}>
-              {lang==="th" ? "จองเลย" : "Book now"} <span style={{fontSize:16}}>→</span>
-            </span>
-            <p style={{position:"relative",fontSize:10.5,marginTop:10,opacity:.85,lineHeight:1.5}}>
-              {lang==="th"
-                ? "* เงื่อนไข: ลูกค้าจองครั้งแรก • จอง 60 นาที • 1 สนาม • วันเล่นไม่เกิน " + FIRST_TIME_PROMO.endTh + " • ไม่ร่วมกับโค้ดส่วนลดหรือแพ็คเกจ"
-                : "* Terms: first booking only • 60 minutes • 1 court • play date up to " + FIRST_TIME_PROMO.endEn + " • cannot combine with discount codes or packages"}
-            </p>
-          </button>
-        </div>
-      )}
+      {/* แบนเนอร์คู่: โปรจองครั้งแรก + แพ็คเกจ — วางข้างกันให้เห็นพร้อมกันโดยไม่ต้องเลื่อนหน้า
+          (โปรจองครั้งแรกหายเองหลังพ้นวันสุดท้าย เหลือแพ็คเกจเต็มความกว้าง) */}
+      {(() => {
+        const promoActive = toIso(new Date()) <= FIRST_TIME_PROMO.lastPlayDate;
+        const th = lang === "th";
+        const pill = (bg, color) => ({ display:"inline-block", alignSelf:"flex-start", background:bg, color, borderRadius:20, padding:"3px 10px", fontSize:11, fontWeight:800 });
+        const cardBase = { position:"relative", overflow:"hidden", width:"100%", minHeight:232, padding:"14px 13px 13px", borderRadius:"var(--r)", border:"none", cursor:"pointer", textAlign:"left", color:"#fff", display:"flex", flexDirection:"column", justifyContent:"space-between", gap:6 };
+        const cta = (color) => ({ display:"block", textAlign:"center", background:"#fff", color, fontWeight:800, fontSize:14, padding:"9px 6px", borderRadius:22, boxShadow:"0 3px 10px rgba(0,0,0,.22)" });
+        return (
+          <div style={{padding:"14px 16px 0"}}>
+            <div style={{display:"grid",gridTemplateColumns:promoActive?"1fr 1fr":"1fr",gap:10,alignItems:"stretch"}}>
 
-      {/* แบนเนอร์แพ็คเกจสมาชิก — โทนไฟลุก เด่นกว่าส่วนอื่นในหน้า กดแล้วไปหน้าแพ็คเกจ */}
-      <div style={{padding:"14px 16px 0"}}>
-        <button onClick={goPackage} className="pkg-fire" style={{position:"relative",overflow:"hidden",width:"100%",padding:"20px 18px 18px",borderRadius:"var(--r)",border:"none",cursor:"pointer",textAlign:"left",color:"#fff",background:"linear-gradient(135deg,#9E1B0A 0%,#E8420F 48%,#FF9A1F 100%)"}}>
-          <span className="pkg-shine" />
-          <span className="pkg-flame" style={{top:6,right:14,fontSize:34,animationDelay:"0s"}}>🔥</span>
-          <span className="pkg-flame" style={{top:34,right:58,fontSize:22,animationDelay:".35s"}}>🔥</span>
-          <span className="pkg-flame" style={{bottom:8,right:20,fontSize:26,animationDelay:".7s"}}>🔥</span>
-          <span style={{position:"relative",display:"inline-block",background:"rgba(255,255,255,.2)",border:"1px solid rgba(255,255,255,.45)",borderRadius:20,padding:"3px 11px",fontSize:11,fontWeight:800,letterSpacing:.8,marginBottom:8}}>
-            🔥 {lang==="th"?"แพ็คเกจสมาชิก":"MEMBER PACKAGES"}
-          </span>
-          <p style={{position:"relative",fontSize:21,fontWeight:800,lineHeight:1.25,textShadow:"0 2px 8px rgba(0,0,0,.25)",paddingRight:48}}>
-            {lang==="th" ? "ประหยัดสูงสุด ฿900!" : "Save up to ฿900!"}
-          </p>
-          <p style={{position:"relative",fontSize:12.5,marginTop:6,opacity:.95,lineHeight:1.5,paddingRight:36}}>
-            {lang==="th" ? "10 ครั้ง เริ่มเพียง ฿460/ชม. • ซื้อล่วงหน้า คุ้มกว่าจ่ายเดี่ยว" : "10 sessions from just ฿460/hr • Pre-pay and save"}
-          </p>
-          <span style={{position:"relative",display:"inline-flex",alignItems:"center",gap:6,marginTop:12,background:"#fff",color:"#C2330C",fontWeight:800,fontSize:13.5,padding:"8px 16px",borderRadius:24,boxShadow:"0 3px 10px rgba(0,0,0,.2)"}}>
-            {lang==="th" ? "ดูแพ็คเกจ" : "View packages"} <span style={{fontSize:16}}>→</span>
-          </span>
-        </button>
-      </div>
+              {promoActive && (
+                <button onClick={goBook} style={{...cardBase,background:"linear-gradient(160deg,#1E4E66 0%,#2F7A94 60%,#4BA3B8 100%)",boxShadow:"0 6px 20px rgba(47,122,148,.4)"}}>
+                  <span className="promo-spark" style={{top:8,right:10,fontSize:18}}>✨</span>
+                  <span className="promo-spark" style={{top:46,right:30,fontSize:12,animationDelay:".7s"}}>✨</span>
+                  <span className="promo-tag" style={pill("#FFD54A","#5A3A00")}>🎁 {th?"ลูกค้าใหม่":"NEW CUSTOMER"}</span>
+                  <div>
+                    <p style={{fontSize:17,fontWeight:800,lineHeight:1.2}}>{th?"จองครั้งแรก":"First booking"}</p>
+                    <p className="promo-price" style={{fontSize:40,fontWeight:900,lineHeight:1.05,color:"#FFD54A",marginTop:4,textShadow:"0 2px 8px rgba(0,0,0,.3)"}}>฿{FIRST_TIME_PROMO.weekday}<span style={{fontSize:13,fontWeight:700,color:"#fff"}}>/{th?"ชม.":"hr"}</span></p>
+                    <p style={{fontSize:12.5,fontWeight:700,marginTop:1}}>{th?"จันทร์–ศุกร์":"Mon–Fri"}</p>
+                    <p style={{fontSize:13,fontWeight:800,marginTop:6,background:"rgba(255,255,255,.2)",borderRadius:10,padding:"4px 8px",display:"inline-block"}}>฿{FIRST_TIME_PROMO.weekend} {th?"เสาร์–อาทิตย์":"Sat–Sun"}</p>
+                    <p style={{fontSize:11.5,fontWeight:700,marginTop:7,opacity:.95}}>⏰ {th?`ถึง ${FIRST_TIME_PROMO.endTh}`:`Until ${FIRST_TIME_PROMO.endEn}`}</p>
+                  </div>
+                  <span style={cta("#1E4E66")}>{th?"จองเลย →":"Book now →"}</span>
+                </button>
+              )}
+
+              <button onClick={goPackage} className="pkg-fire" style={{...cardBase,background:"linear-gradient(160deg,#9E1B0A 0%,#E8420F 55%,#FF9A1F 100%)"}}>
+                <span className="pkg-shine" />
+                <span className="pkg-flame" style={{top:6,right:8,fontSize:26}}>🔥</span>
+                <span className="pkg-flame" style={{top:40,right:30,fontSize:16,animationDelay:".5s"}}>🔥</span>
+                <span style={{...pill("rgba(255,255,255,.22)","#fff"),border:"1px solid rgba(255,255,255,.5)",position:"relative"}}>🔥 {th?"แพ็คเกจ":"PACKAGES"}</span>
+                <div style={{position:"relative"}}>
+                  <p style={{fontSize:17,fontWeight:800,lineHeight:1.2}}>{th?"ซื้อล่วงหน้า คุ้มกว่า":"Pre-pay, save more"}</p>
+                  <p style={{fontSize:12.5,fontWeight:700,marginTop:6}}>{th?"ประหยัดสูงสุด":"Save up to"}</p>
+                  <p style={{fontSize:40,fontWeight:900,lineHeight:1.05,color:"#FFE27A",textShadow:"0 2px 8px rgba(0,0,0,.3)"}}>฿900</p>
+                  <p style={{fontSize:13,fontWeight:800,marginTop:6,background:"rgba(255,255,255,.2)",borderRadius:10,padding:"4px 8px",display:"inline-block"}}>{th?"10 ครั้ง เริ่ม ฿460/ชม.":"10 sessions from ฿460/hr"}</p>
+                  <p style={{fontSize:11.5,fontWeight:700,marginTop:7,opacity:.95}}>{th?"แพ็ค 2 • 5 • 10 ครั้ง":"2 • 5 • 10 sessions"}</p>
+                </div>
+                <span style={{...cta("#C2330C"),position:"relative"}}>{th?"ดูแพ็คเกจ →":"View packages →"}</span>
+              </button>
+            </div>
+            {promoActive && (
+              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:8,lineHeight:1.5}}>
+                {th
+                  ? `* โปรจองครั้งแรก: ลูกค้าใหม่ • จอง 60 นาที • 1 สนาม • วันเล่นถึง ${FIRST_TIME_PROMO.endTh} • ไม่ร่วมกับโค้ดส่วนลดหรือแพ็คเกจ`
+                  : `* First-booking offer: new customers • 60 min • 1 court • play date up to ${FIRST_TIME_PROMO.endEn} • cannot combine with discount codes or packages`}
+              </p>
+            )}
+          </div>
+        );
+      })()}
 
       <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
 
@@ -2294,6 +2288,16 @@ function AdminDashboard({ token, onLogout }) {
   })();
 
   // แพ็คเกจสมาชิก
+  // กดที่ชื่อลูกค้าในตารางว่าง → ไปแท็บ "การจอง" (วันเดียวกัน) แล้วเลื่อน/ไฮไลต์แถวของการจองนั้นให้
+  const [highlightId, setHighlightId] = useState(null);
+  const goToBooking = (b) => { setHighlightId(b.id); setTab("bookings"); };
+  useEffect(() => {
+    if (tab !== "bookings" || !highlightId) return;
+    const t1 = setTimeout(() => document.getElementById(`bk-${highlightId}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 250);
+    const t2 = setTimeout(() => setHighlightId(null), 6000);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [tab, highlightId, bookings]);
+
   const [pkgQueue, setPkgQueue] = useState([]);
   const [pkgQueueLoading, setPkgQueueLoading] = useState(true);
   const [allPkgs, setAllPkgs] = useState([]);
@@ -2532,6 +2536,7 @@ function AdminDashboard({ token, onLogout }) {
                 <Dot color="#c0392b" label="ไม่ว่าง / มีคนจอง" />
                 <Dot color="#663924" label="ปิดสนาม" />
               </div>
+              <p style={{fontSize:11.5,color:"var(--mu)",margin:"-6px 0 12px"}}>👆 กดที่ช่องที่มีชื่อลูกค้า เพื่อไปดูรายละเอียดการจองนั้นในแท็บ "การจอง" (สีแดง = ยืนยันแล้ว / ส้ม = รอตรวจสอบ / เหลือง = รอชำระ)</p>
               <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",padding:0,boxShadow:"var(--sh)",overflow:"auto",maxHeight:640}}>
                 {loading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> : (() => {
                   const dateObj = new Date(date+"T00:00:00");
@@ -2550,29 +2555,50 @@ function AdminDashboard({ token, onLogout }) {
                     <table className="adm-table" style={{tableLayout:"fixed",width:"100%"}}>
                       <thead><tr><th style={{width:90}}>เวลา</th><th>Court 1</th><th>Court 2</th></tr></thead>
                       <tbody>
-                        {slots.map(startMin => {
-                          const endMin = startMin + 30;
-                          return (
-                            <tr key={startMin}>
-                              <td style={{fontWeight:600}}>{minutesToLabel(startMin)}–{minutesToLabel(endMin)}</td>
-                              {[1,2].map(courtId => {
-                                let state = "ว่าง", color = "#2d7a4f", bg = "rgba(45,122,79,.08)";
-                                if (isFullyBookedDate(dateObj) || isManuallyClosed(dateObj, courtId, startMin, endMin)) {
-                                  state = "ปิด"; color = "#663924"; bg = "rgba(102,57,36,.08)";
-                                } else {
-                                  const overlap = activeBookings.some(b => {
-                                    if (b.court_id !== courtId) return false;
-                                    const s = (b.hour||0)*60 + (b.start_minute||0);
-                                    const e = s + (b.duration_minutes||60);
+                        {(() => {
+                          const skip = {}; // ช่องที่ถูกรวมไปกับการจองด้านบนแล้ว (rowSpan) ไม่ต้องวาดซ้ำ
+                          const stLabel = { confirmed: "✅ ยืนยันแล้ว", reviewing: "🔍 รอตรวจสอบ", pending: "⏳ รอชำระ" };
+                          const stBg = { confirmed: "rgba(192,57,43,.12)", reviewing: "rgba(230,126,34,.16)", pending: "rgba(241,196,15,.2)" };
+                          return slots.map(startMin => {
+                            const endMin = startMin + 30;
+                            return (
+                              <tr key={startMin}>
+                                <td style={{fontWeight:600,verticalAlign:"top"}}>{minutesToLabel(startMin)}–{minutesToLabel(endMin)}</td>
+                                {[1,2].map(courtId => {
+                                  if (skip[`${courtId}:${startMin}`]) return null;
+                                  const bk = activeBookings.find(x => {
+                                    if (x.court_id !== courtId) return false;
+                                    const s = (x.hour||0)*60 + (x.start_minute||0);
+                                    const e = s + (x.duration_minutes||60);
                                     return startMin < e && endMin > s;
                                   });
-                                  if (overlap) { state = "ไม่ว่าง"; color = "#c0392b"; bg = "rgba(192,57,43,.08)"; }
-                                }
-                                return <td key={courtId} style={{textAlign:"center",background:bg,color,fontWeight:700,fontSize:12.5}}>{state}</td>;
-                              })}
-                            </tr>
-                          );
-                        })}
+                                  if (bk) {
+                                    const bs = (bk.hour||0)*60 + (bk.start_minute||0);
+                                    const be = bs + (bk.duration_minutes||60);
+                                    const span = Math.max(1, Math.ceil((Math.min(be, DAY_END_MIN) - startMin) / 30));
+                                    for (let k = 1; k < span; k++) skip[`${courtId}:${startMin + 30*k}`] = true;
+                                    return (
+                                      <td key={courtId} rowSpan={span} onClick={() => goToBooking(bk)} title="กดเพื่อดูรายละเอียดการจอง"
+                                        style={{verticalAlign:"top",textAlign:"left",background:stBg[bk.status] || "rgba(192,57,43,.12)",borderLeft:"3px solid #c0392b",cursor:"pointer",padding:"7px 9px"}}>
+                                        <div style={{fontWeight:800,fontSize:13,color:"#8b1e12",lineHeight:1.3}}>
+                                          {bk.customer_name || "-"}
+                                          {bk.group_id && <span style={{marginLeft:5,fontSize:10,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"1px 5px",borderRadius:8}}>🔗 คู่</span>}
+                                          {bk.package_id && <span style={{marginLeft:5,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 5px",borderRadius:8}}>🎟</span>}
+                                        </div>
+                                        <div style={{fontSize:12.5,fontWeight:600,color:"var(--br)",marginTop:2}}>📞 {bk.customer_id}</div>
+                                        <div style={{fontSize:10.5,color:"var(--mu)",marginTop:2}}>{stLabel[bk.status] || bk.status} · {minutesToLabel(bs)}–{minutesToLabel(be)}</div>
+                                      </td>
+                                    );
+                                  }
+                                  if (isFullyBookedDate(dateObj) || isManuallyClosed(dateObj, courtId, startMin, endMin)) {
+                                    return <td key={courtId} style={{textAlign:"center",background:"rgba(102,57,36,.08)",color:"#663924",fontWeight:700,fontSize:12.5,verticalAlign:"middle"}}>ปิด</td>;
+                                  }
+                                  return <td key={courtId} style={{textAlign:"center",background:"rgba(45,122,79,.08)",color:"#2d7a4f",fontWeight:700,fontSize:12.5,verticalAlign:"middle"}}>ว่าง</td>;
+                                })}
+                              </tr>
+                            );
+                          });
+                        })()}
                       </tbody>
                     </table>
                   );
@@ -2649,7 +2675,7 @@ function AdminDashboard({ token, onLogout }) {
                       {sortedBookings.map(b => {
                         const st = stInfo(b.status);
                         return (
-                          <tr key={b.id}>
+                          <tr key={b.id} id={`bk-${b.id}`} style={highlightId === b.id ? {background:"rgba(255,213,74,.4)",outline:"2px solid #E8A200"} : undefined}>
                             <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
                             <td>{fmtTime(b)}</td>
                             <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
