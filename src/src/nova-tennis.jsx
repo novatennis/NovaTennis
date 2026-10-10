@@ -1916,6 +1916,7 @@ export default function AppV2() {
   });
   const [adminPw, setAdminPw] = useState("");
   const [adminErr, setAdminErr] = useState(false);
+  const [adminErrMsg, setAdminErrMsg] = useState("");
   const [adminChecking, setAdminChecking] = useState(false);
   const [logoTaps, setLogoTaps] = useState(0);
   const [lang, setLang] = useState("th");
@@ -2143,23 +2144,27 @@ export default function AppV2() {
     if (!adminPw.trim() || adminChecking) return;
     setAdminChecking(true);
     setAdminErr(false);
+    const showErr = (msg, ms) => { setAdminErrMsg(msg); setAdminErr(true); setTimeout(() => setAdminErr(false), ms); };
     try {
       const res = await fetch("/api/admin-actions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "login", password: adminPw }),
+        body: JSON.stringify({ action: "login", password: adminPw.trim() }), // ตัดช่องว่างหัวท้าย (คีย์บอร์ดมือถือชอบเติมให้เอง)
       });
-      const data = await res.json();
-      if (data.ok && data.token) {
+      let data = null;
+      try { data = await res.json(); } catch { /* ไม่ใช่ JSON */ }
+      if (data?.ok && data.token) {
         setAdminToken(data.token);
         try { sessionStorage.setItem("nova_admin_token", data.token); } catch { /* no-op */ }
+      } else if (res.status === 401) {
+        showErr("รหัสผ่านไม่ถูกต้อง", 2500);
+      } else if (res.status === 500 && data?.error === "Server not configured") {
+        showErr("เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า ADMIN_PASSWORD (ตรวจ Environment Variables ที่ Vercel แล้ว Redeploy)", 9000);
       } else {
-        setAdminErr(true);
-        setTimeout(() => setAdminErr(false), 2000);
+        showErr(`เชื่อมต่อระบบไม่ได้ (รหัส ${res.status}) — ดู Vercel → Logs`, 9000);
       }
     } catch {
-      setAdminErr(true);
-      setTimeout(() => setAdminErr(false), 2000);
+      showErr("เชื่อมต่อระบบไม่ได้ ตรวจอินเทอร์เน็ตแล้วลองใหม่", 5000);
     }
     setAdminChecking(false);
   };
@@ -2208,7 +2213,7 @@ export default function AppV2() {
             onKeyDown={e=>e.key==="Enter"&&handleAdminLogin()}
             placeholder="รหัสผ่าน"
             style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1.5px solid ${adminErr?"#c0392b":"var(--dv)"}`,fontSize:15,marginBottom:12,outline:"none"}} />
-          {adminErr && <p style={{color:"#c0392b",fontSize:12,marginBottom:8}}>รหัสผ่านไม่ถูกต้อง</p>}
+          {adminErr && <p style={{color:"#c0392b",fontSize:12,marginBottom:8,lineHeight:1.5}}>{adminErrMsg || "รหัสผ่านไม่ถูกต้อง"}</p>}
           <button onClick={handleAdminLogin} disabled={adminChecking}
             style={{width:"100%",padding:"13px",borderRadius:10,border:"none",background:"#663924",color:"#F47E1F",fontWeight:700,fontSize:15,cursor:adminChecking?"not-allowed":"pointer",fontFamily:"'Noto Sans Thai',sans-serif",opacity:adminChecking?0.7:1}}>
             {adminChecking ? "⏳ กำลังตรวจสอบ..." : "เข้าสู่ระบบ"}
