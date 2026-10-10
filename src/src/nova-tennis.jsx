@@ -67,6 +67,7 @@ const db = {
   async lineLogin(code) { return callBookingAction("lineLogin", { code }); },
   async lineMe(session) { return callBookingAction("lineMe", { session }); },
   async lineLinkPhone(session, name, phone) { return callBookingAction("lineLinkPhone", { session, name, phone }); },
+  async recordSource(kind, id, utm) { await callBookingAction("recordSource", { kind, id, utm }); },
   async checkFirstTime(phone, bookingDate) {
     const result = await callBookingAction("checkFirstTime", { phone, bookingDate });
     return result?.eligible ? result.price : null; // null = ไม่เข้าเงื่อนไข
@@ -230,6 +231,39 @@ const isFullyBookedDate = (d) => {
 };
 
 // ใช้วันที่ตามเวลาท้องถิ่น (ไม่ใช่ UTC) เพื่อไม่ให้วันที่คลาดเคลื่อนตอนใกล้เที่ยงคืน
+// ─── ติดตามโฆษณา: UTM (แหล่งที่มา) + Meta Pixel ───────────────────────────────────
+// ใส่ Pixel ID จาก Meta Events Manager ตรงนี้เพื่อเปิดใช้ (เว้นว่าง "" = ปิด ไม่โหลดสคริปต์ใดๆ ของ Meta)
+const META_PIXEL_ID = "";
+const UTM_KEY = "nova_utm";
+const UTM_KEYS = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"];
+
+// เก็บ UTM จาก URL ตอนลูกค้าเข้าเว็บจากโฆษณา (ล่าสุดทับของเก่า) เก็บไว้ 30 วัน
+function captureUtm() {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const found = {};
+    UTM_KEYS.forEach(k => { const v = q.get(k); if (v) found[k] = v.slice(0, 80); });
+    if (Object.keys(found).length) localStorage.setItem(UTM_KEY, JSON.stringify({ ...found, _ts: Date.now() }));
+  } catch { /* no-op */ }
+}
+function getStoredUtm() {
+  try {
+    const u = JSON.parse(localStorage.getItem(UTM_KEY) || "null");
+    if (!u || Date.now() - (u._ts || 0) > 30 * 24 * 60 * 60 * 1000) return null;
+    const { _ts, ...rest } = u; // eslint-disable-line no-unused-vars
+    return Object.keys(rest).length ? rest : null;
+  } catch { return null; }
+}
+function initMetaPixel() {
+  if (!META_PIXEL_ID || typeof window === "undefined" || window.fbq) return;
+  /* eslint-disable */
+  !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,document,'script','https://connect.facebook.net/en_US/fbevents.js');
+  /* eslint-enable */
+  window.fbq("init", META_PIXEL_ID);
+  window.fbq("track", "PageView");
+}
+const trackFb = (event, params) => { try { if (window.fbq) window.fbq("track", event, params || {}); } catch { /* no-op */ } };
+
 // ─── LINE Login (ช่วยกรอกชื่อ/เบอร์อัตโนมัติ) ───────────────────────────────────────
 // Channel ID เป็นข้อมูลสาธารณะ (โผล่ใน URL ตอนล็อกอินอยู่แล้ว) — ส่วน secret อยู่ฝั่งเซิร์ฟเวอร์เท่านั้น
 const LINE_LOGIN_CHANNEL_ID = "2011856443";
@@ -684,8 +718,8 @@ function HomePage({ goBook, goPackage, lang="th" }) {
             {promoActive && (
               <p style={{fontSize:10.5,color:"var(--mu)",marginTop:8,lineHeight:1.5}}>
                 {th
-                  ? `* โปรจองครั้งแรก: ลูกค้าใหม่ • จอง 60 นาที • 1 สนาม • วันเล่นถึง ${FIRST_TIME_PROMO.endTh} • ไม่ร่วมกับโค้ดส่วนลดหรือแพ็คเกจ`
-                  : `* First-booking offer: new customers • 60 min • 1 court • play date up to ${FIRST_TIME_PROMO.endEn} • cannot combine with discount codes or packages`}
+                  ? `* โปรจองครั้งแรก: ลูกค้าใหม่ • จอง 60 นาที • 1 สนาม • วันเล่นถึง ${FIRST_TIME_PROMO.endTh} • ใช้ร่วมกับโค้ดส่วนลดได้ แต่ไม่ร่วมกับแพ็คเกจ`
+                  : `* First-booking offer: new customers • 60 min • 1 court • play date up to ${FIRST_TIME_PROMO.endEn} • can be combined with a discount code, but not with packages`}
               </p>
             )}
           </div>
@@ -1055,7 +1089,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
     if (d.discount_amount > 0) return d.discount_amount;
     return Math.round(basePrice * d.discount_percent / 100);
   };
-  const discountAmount = (firstTimeEligible || isGroup) ? 0 : calcDiscount(discount); // โปรจองครั้งแรก ไม่ซ้อนกับโค้ดส่วนลดอื่น เพื่อความง่าย ไม่สับสน
+  const discountAmount = isGroup ? 0 : calcDiscount(discount); // โปรจองครั้งแรกใช้ร่วมกับโค้ดส่วนลดได้ (โค้ดคิดจากราคาหลังโปร) — เซิร์ฟเวอร์คิดแบบเดียวกันและเป็นตัวตัดสินราคาจริง
   const finalPrice = Math.max(0, basePrice - discountAmount);
 
   const handleCheckCode = async () => {
@@ -1089,7 +1123,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
           <Row label={`⏱ ${t.duration}`} val={`${slot.durationMinutes} ${t.minutesLabel}`} />
           {isGroup && <Row label={lang==="th"?"ราคาต่อสนาม":"Per court"} val={`฿${(slot.unitPrice ?? slot.price/courts.length).toLocaleString()} × ${courts.length}`} />}
           {firstTimeEligible && !useCredit && <Row label="🎉" val={lang==="th"?"ราคาพิเศษจองครั้งแรก":"First booking promo"} />}
-          {discount && !useCredit && !firstTimeEligible && !isGroup && <Row label="🏷" val={`-฿${discountAmount.toLocaleString()}`} />}
+          {discount && !useCredit && !isGroup && <Row label="🏷" val={`-฿${discountAmount.toLocaleString()}`} />}
           <div style={{borderTop:"1px solid var(--dv)",margin:"12px 0"}} />
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <span style={{fontWeight:700,color:"var(--br)",fontSize:15}}>{t.total}</span>
@@ -1149,11 +1183,11 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
             <span style={{fontSize:20,flexShrink:0}}>🎉</span>
             <div>
               <p style={{fontSize:13.5,fontWeight:700,color:"#2d7a4f"}}>{lang==="th"?"ยินดีต้อนรับ! ราคาพิเศษสำหรับการจองครั้งแรก":"Welcome! Special first-booking price"}</p>
-              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือจ่ายแค่ ฿${firstTimePrice} (จากปกติ ฿${slot.price}) — ใช้ได้กับการจอง 60 นาทีครั้งแรกเท่านั้น สำหรับวันเล่นถึง ${FIRST_TIME_PROMO.endTh}`:`Only ฿${firstTimePrice} (normally ฿${slot.price}) — first 60-minute booking only, for play dates up to ${FIRST_TIME_PROMO.endEn}`}</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือจ่ายแค่ ฿${firstTimePrice} (จากปกติ ฿${slot.price}) — ใช้ได้กับการจอง 60 นาทีครั้งแรกเท่านั้น สำหรับวันเล่นถึง ${FIRST_TIME_PROMO.endTh} • มีโค้ดส่วนลด ใส่เพิ่มด้านล่างได้อีก`:`Only ฿${firstTimePrice} (normally ฿${slot.price}) — first 60-minute booking only, for play dates up to ${FIRST_TIME_PROMO.endEn} • have a discount code? Add it below too`}</p>
             </div>
           </div>
         )}
-        {!useCredit && !firstTimeEligible && !isGroup && (
+        {!useCredit && !isGroup && (
           <div>
             <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.discount}</label>
             <div style={{display:"flex",gap:8}}>
@@ -1256,6 +1290,8 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
         // แจ้งขึ้นไปให้ AppV2 รู้จักการจองนี้ด้วย (แม้เป็นการจองใหม่ ไม่ใช่ resume) — เพื่อให้แถบ
         // "กลับไปชำระเงิน" คำนวณเวลาที่เหลือได้ถูกต้อง ไม่ว่าจะออกจากหน้านี้ไปทางไหนก็ตาม
         onCreated?.(b.id, b.created_time);
+        const utm = getStoredUtm();
+        if (utm) db.recordSource("booking", b.id, utm).catch(() => {});
       }
     };
     save();
@@ -1292,6 +1328,7 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
         return;
       }
       setUploaded(true);
+      trackFb("Purchase", { value: finalPrice, currency: "THB", content_name: isGroup ? "court_booking_2courts" : "court_booking" });
       fetch("/api/notify-admin-telegram", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1496,6 +1533,8 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinePhoneLinked })
     setCreating(false);
     if (error || !pkgRow) { setCreateErr(lang==="th" ? "สร้างรายการไม่สำเร็จ ลองใหม่อีกครั้ง" : "Failed to create order, please try again"); return; }
     setPkg(pkgRow);
+    const utm = getStoredUtm();
+    if (utm) db.recordSource("package", pkgRow.id, utm).catch(() => {});
   };
 
   if (pkg) {
@@ -1702,6 +1741,7 @@ function PackagePaymentView({ pkg, lang="th", onDone }) {
         return;
       }
       setUploaded(true);
+      trackFb("Purchase", { value: pkg.price, currency: "THB", content_name: "package" });
       fetch("/api/notify-admin-telegram", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1958,6 +1998,21 @@ export default function AppV2() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ติดตามโฆษณา: เก็บ UTM + เริ่ม Meta Pixel (ไม่ทำงานในหน้า Admin)
+  useEffect(() => {
+    captureUtm();
+    let isAdminPath = false;
+    try { isAdminPath = window.location.pathname.replace(/\/$/, "") === "/admin"; } catch { /* no-op */ }
+    if (!isAdminPath) initMetaPixel();
+  }, []);
+  useEffect(() => {
+    if (tab === "book" || tab === "package") trackFb("ViewContent", { content_name: tab === "book" ? "booking" : "packages" });
+  }, [tab]);
+  useEffect(() => {
+    if (tab === "book" && page === "checkout" && booking) trackFb("InitiateCheckout", { value: booking.slot?.price || 0, currency: "THB" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, tab]);
+
   // จัดการตอน LINE ส่งลูกค้ากลับมาที่ /line-callback — แลก code ที่เซิร์ฟเวอร์ แล้วพากลับไปหน้าเดิม
   useEffect(() => {
     if (lineCbStatus !== "processing" || lineCbStarted.current) return;
@@ -1980,6 +2035,7 @@ export default function AppV2() {
         isFriend: typeof p.isFriend === "boolean" ? p.isFriend : null, // null = เช็คไม่ได้ → ไม่บล็อกลูกค้า
       };
       saveLineSession(sess); setLineSession(sess);
+      trackFb("CompleteRegistration", { status: true });
       try { localStorage.removeItem("nova_line_nonce"); } catch { /* no-op */ }
       window.history.replaceState(null, "", "/");
       let restored = false;
@@ -2266,6 +2322,20 @@ function AdminDashboard({ token, onLogout }) {
   });
   const [reportTo, setReportTo] = useState(toIso(new Date()));
   const [reportRows, setReportRows] = useState([]);
+  // แหล่งที่มาของลูกค้า (โฆษณา) + คำนวณความคุ้มค่า
+  const [sourceRows, setSourceRows] = useState(null);
+  const [sourceMsg, setSourceMsg] = useState("");
+  const [sourceLoading, setSourceLoading] = useState(false);
+  const [adSpend, setAdSpend] = useState("");
+  const [marginalCost, setMarginalCost] = useState("150");
+  const loadSourceReport = async () => {
+    setSourceLoading(true); setSourceMsg("");
+    const r = await callAdminAction("sourceReport", token, { from: reportFrom, to: reportTo });
+    if (r?.error === "utm_column_missing") { setSourceRows(null); setSourceMsg("ยังไม่ได้รัน SQL add-utm-columns.sql ที่ Supabase"); }
+    else if (r?.error) { setSourceRows(null); setSourceMsg("ดึงข้อมูลไม่สำเร็จ ลองใหม่อีกครั้ง"); }
+    else setSourceRows(r?.rows || []);
+    setSourceLoading(false);
+  };
   const [reportLoading, setReportLoading] = useState(false);
   // รายละเอียดของวันที่ admin กดดูเพิ่ม (ใครจอง จองวันไหน เวลาไหน โอนตอนกี่โมง)
   const [expandedDay, setExpandedDay] = useState(null);
@@ -2859,6 +2929,64 @@ function AdminDashboard({ token, onLogout }) {
                   </div>
                   <button onClick={loadReport} style={{marginTop:18,padding:"9px 16px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 ดึงรายงาน</button>
                 </div>
+              </div>
+
+              <div style={{background:"#fff",borderRadius:12,padding:20,marginBottom:20,border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                <p style={{fontWeight:700,color:"var(--br)",marginBottom:6}}>📣 แหล่งที่มาของลูกค้า (โฆษณา)</p>
+                <p style={{fontSize:12,color:"var(--mu)",marginBottom:12,lineHeight:1.6}}>ใช้ช่วงวันที่ด้านบน นับตามวันที่ลูกค้ากดจอง/กดซื้อ เฉพาะรายการที่ส่งสลิปแล้วหรือยืนยันแล้ว ลูกค้าที่ไม่ได้มาจากลิงก์ที่ติด UTM จะอยู่ในแถว "ไม่ทราบ / เข้าตรง"</p>
+                <button onClick={loadSourceReport} style={{padding:"9px 16px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{sourceLoading ? "⏳ กำลังโหลด..." : "📣 ดูแหล่งที่มา"}</button>
+                {sourceMsg && <p style={{fontSize:12.5,color:"#c0392b",marginTop:10}}>{sourceMsg}</p>}
+                {sourceRows && sourceRows.length === 0 && <p style={{fontSize:13,color:"var(--mu)",marginTop:12}}>ไม่มีข้อมูลในช่วงนี้</p>}
+                {sourceRows && sourceRows.length > 0 && (() => {
+                  const adRows = sourceRows.filter(r => !r.source.startsWith("(ไม่ทราบ"));
+                  const adCustomers = adRows.reduce((s, r) => s + r.customers, 0);
+                  const adBookings = adRows.reduce((s, r) => s + r.bookings, 0);
+                  const adRevenue = adRows.reduce((s, r) => s + r.bookingRevenue + r.packageRevenue, 0);
+                  const spend = Number(adSpend) || 0;
+                  const mc = Number(marginalCost) || 0;
+                  const profit = adRevenue - adBookings * mc - spend;
+                  return (
+                    <>
+                      <div style={{overflow:"auto",marginTop:12}}>
+                        <table className="adm-table">
+                          <thead><tr><th>แหล่งที่มา (source / campaign / ad)</th><th>ลูกค้า</th><th>จอง</th><th>รายได้จอง</th><th>แพ็คเกจ</th><th>รายได้แพ็ค</th></tr></thead>
+                          <tbody>
+                            {sourceRows.map(r => (
+                              <tr key={r.source}>
+                                <td style={{fontWeight:600}}>{r.source}</td>
+                                <td>{r.customers}</td>
+                                <td>{r.bookings}</td>
+                                <td>฿{r.bookingRevenue.toLocaleString()}</td>
+                                <td>{r.packages}</td>
+                                <td>฿{r.packageRevenue.toLocaleString()}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div style={{marginTop:16,padding:14,borderRadius:10,background:"var(--cr)",border:"1px solid var(--dv)"}}>
+                        <p style={{fontWeight:700,color:"var(--br)",fontSize:13.5,marginBottom:10}}>💰 ความคุ้มค่าของโฆษณา (เฉพาะแถวที่มาจากแอด)</p>
+                        <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:12}}>
+                          <div>
+                            <label style={{fontSize:11.5,color:"var(--mu)",display:"block",marginBottom:4}}>ค่าโฆษณาที่ใช้ในช่วงนี้ (บาท)</label>
+                            <input type="number" inputMode="numeric" value={adSpend} onChange={e=>setAdSpend(e.target.value)} placeholder="เช่น 3000"
+                              style={{padding:"8px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,width:140,outline:"none"}} />
+                          </div>
+                          <div>
+                            <label style={{fontSize:11.5,color:"var(--mu)",display:"block",marginBottom:4}}>ต้นทุนส่วนเพิ่มต่อการจอง (บาท)</label>
+                            <input type="number" inputMode="numeric" value={marginalCost} onChange={e=>setMarginalCost(e.target.value)}
+                              style={{padding:"8px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,width:140,outline:"none"}} />
+                          </div>
+                        </div>
+                        <Row label="ลูกค้าจากแอด (นับตามแหล่ง)" val={`${adCustomers} คน`} />
+                        <Row label="รายได้รวมจากแอด" val={`฿${adRevenue.toLocaleString()}`} />
+                        <Row label="ค่าโฆษณาต่อลูกค้า 1 คน" val={spend > 0 && adCustomers > 0 ? `฿${Math.round(spend / adCustomers).toLocaleString()}` : "-"} />
+                        <Row label="กำไรหลังหักต้นทุนส่วนเพิ่ม + ค่าแอด" val={spend > 0 ? `${profit >= 0 ? "" : "-"}฿${Math.abs(Math.round(profit)).toLocaleString()}` : "-"} />
+                        <p style={{fontSize:11,color:"var(--mu)",marginTop:8,lineHeight:1.6}}>* ประมาณการเท่านั้น: ต้นทุนส่วนเพิ่มคิดจากจำนวนการจองคูณค่าที่กรอก (สมมติครั้งละ 60 นาที) รายได้แพ็คเกจนับตอนซื้อ แต่ต้นทุนเกิดตอนลูกค้ามาใช้ ช่วงสั้นๆ ตัวเลขจึงอาจเอียง ลูกค้าที่กลับมาจองซ้ำทีหลังจะไม่อยู่ในแถวนี้ ถ้าไม่ได้เข้าผ่านลิงก์แอดอีก</p>
+                      </div>
+                    </>
+                  );
+                })()}
               </div>
 
               <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12,marginBottom:20}}>
