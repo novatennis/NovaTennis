@@ -351,7 +351,7 @@ const CSS = `
   .card-header p { color:var(--or); font-size:13px; font-weight:600; }
   .card-body { padding:16px 18px; }
   @keyframes fu { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
-  .fu { animation:fu .3s ease both; }
+  .fu { animation:fu .3s ease backwards; } /* backwards = จบแอนิเมชันแล้วไม่ค้าง transform ไม่งั้น position:fixed ของลูกหลาน (เช่นป๊อปอัปเงื่อนไข) จะเพี้ยนไปอิงกล่องนี้แทนหน้าจอ */
   @keyframes fireGlow { 0%,100% { box-shadow:0 6px 22px rgba(232,66,15,.45), 0 0 0 rgba(255,154,31,0); } 50% { box-shadow:0 8px 30px rgba(255,90,20,.75), 0 0 26px rgba(255,170,40,.65); } }
   @keyframes flicker { 0%,100% { transform:translateY(0) scale(1) rotate(-3deg); opacity:.95; } 25% { transform:translateY(-3px) scale(1.12) rotate(3deg); opacity:1; } 50% { transform:translateY(-1px) scale(.95) rotate(-2deg); opacity:.85; } 75% { transform:translateY(-4px) scale(1.08) rotate(4deg); opacity:1; } }
   @keyframes shine { 0% { transform:translateX(-120%) skewX(-20deg); } 60%,100% { transform:translateX(220%) skewX(-20deg); } }
@@ -718,8 +718,8 @@ function HomePage({ goBook, goPackage, lang="th" }) {
             {promoActive && (
               <p style={{fontSize:10.5,color:"var(--mu)",marginTop:8,lineHeight:1.5}}>
                 {th
-                  ? `* โปรจองครั้งแรก: ลูกค้าใหม่ • จอง 60 นาที • 1 สนาม • วันเล่นถึง ${FIRST_TIME_PROMO.endTh} • ใช้ร่วมกับโค้ดส่วนลดได้ แต่ไม่ร่วมกับแพ็คเกจ`
-                  : `* First-booking offer: new customers • 60 min • 1 court • play date up to ${FIRST_TIME_PROMO.endEn} • can be combined with a discount code, but not with packages`}
+                  ? `* โปรจองครั้งแรก: ลูกค้าใหม่ • จอง 60 นาที • 1 สนาม • วันเล่นถึง ${FIRST_TIME_PROMO.endTh} • ไม่ร่วมกับโค้ดส่วนลดหรือแพ็คเกจ`
+                  : `* First-booking offer: new customers • 60 min • 1 court • play date up to ${FIRST_TIME_PROMO.endEn} • cannot combine with discount codes or packages`}
               </p>
             )}
           </div>
@@ -1089,7 +1089,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
     if (d.discount_amount > 0) return d.discount_amount;
     return Math.round(basePrice * d.discount_percent / 100);
   };
-  const discountAmount = isGroup ? 0 : calcDiscount(discount); // โปรจองครั้งแรกใช้ร่วมกับโค้ดส่วนลดได้ (โค้ดคิดจากราคาหลังโปร) — เซิร์ฟเวอร์คิดแบบเดียวกันและเป็นตัวตัดสินราคาจริง
+  const discountAmount = (firstTimeEligible || isGroup) ? 0 : calcDiscount(discount); // โปรจองครั้งแรกไม่ร่วมกับโค้ดส่วนลด (เซิร์ฟเวอร์บังคับกฎเดียวกัน)
   const finalPrice = Math.max(0, basePrice - discountAmount);
 
   const handleCheckCode = async () => {
@@ -1123,7 +1123,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
           <Row label={`⏱ ${t.duration}`} val={`${slot.durationMinutes} ${t.minutesLabel}`} />
           {isGroup && <Row label={lang==="th"?"ราคาต่อสนาม":"Per court"} val={`฿${(slot.unitPrice ?? slot.price/courts.length).toLocaleString()} × ${courts.length}`} />}
           {firstTimeEligible && !useCredit && <Row label="🎉" val={lang==="th"?"ราคาพิเศษจองครั้งแรก":"First booking promo"} />}
-          {discount && !useCredit && !isGroup && <Row label="🏷" val={`-฿${discountAmount.toLocaleString()}`} />}
+          {discount && !useCredit && !firstTimeEligible && !isGroup && <Row label="🏷" val={`-฿${discountAmount.toLocaleString()}`} />}
           <div style={{borderTop:"1px solid var(--dv)",margin:"12px 0"}} />
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <span style={{fontWeight:700,color:"var(--br)",fontSize:15}}>{t.total}</span>
@@ -1183,11 +1183,11 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
             <span style={{fontSize:20,flexShrink:0}}>🎉</span>
             <div>
               <p style={{fontSize:13.5,fontWeight:700,color:"#2d7a4f"}}>{lang==="th"?"ยินดีต้อนรับ! ราคาพิเศษสำหรับการจองครั้งแรก":"Welcome! Special first-booking price"}</p>
-              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือจ่ายแค่ ฿${firstTimePrice} (จากปกติ ฿${slot.price}) — ใช้ได้กับการจอง 60 นาทีครั้งแรกเท่านั้น สำหรับวันเล่นถึง ${FIRST_TIME_PROMO.endTh} • มีโค้ดส่วนลด ใส่เพิ่มด้านล่างได้อีก`:`Only ฿${firstTimePrice} (normally ฿${slot.price}) — first 60-minute booking only, for play dates up to ${FIRST_TIME_PROMO.endEn} • have a discount code? Add it below too`}</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือจ่ายแค่ ฿${firstTimePrice} (จากปกติ ฿${slot.price}) — ใช้ได้กับการจอง 60 นาทีครั้งแรกเท่านั้น สำหรับวันเล่นถึง ${FIRST_TIME_PROMO.endTh}`:`Only ฿${firstTimePrice} (normally ฿${slot.price}) — first 60-minute booking only, for play dates up to ${FIRST_TIME_PROMO.endEn}`}</p>
             </div>
           </div>
         )}
-        {!useCredit && !isGroup && (
+        {!useCredit && !firstTimeEligible && !isGroup && (
           <div>
             <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.discount}</label>
             <div style={{display:"flex",gap:8}}>
@@ -1210,11 +1210,11 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
             onConfirmWithPackage({ name: name.trim(), phone, packageId: matchedPkg.id });
             return;
           }
-          if (discount) {
+          if (discount && !firstTimeEligible) {
             const confirmed = window.confirm(lang==="th" ? "การใช้โค้ดส่วนลด หากกดดำเนินการต่อแล้วจะไม่สามารถใช้โค้ดนี้ซ้ำได้อีก" : "Once you proceed, this discount code cannot be used again.");
             if (!confirmed) return;
           }
-          onConfirm({name:name.trim(),phone,discount,finalPrice,discountAmount});
+          onConfirm({name:name.trim(),phone,discount:firstTimeEligible?null:discount,finalPrice,discountAmount});
         }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:ok?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:ok?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:ok?"pointer":"not-allowed"}}>{useCredit?(lang==="th"?"ยืนยันการจอง (ใช้สิทธิ์) ✓":"Confirm Booking (Use Credit) ✓"):t.confirmBooking}</button>
       </div>
     </div>
