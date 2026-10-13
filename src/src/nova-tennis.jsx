@@ -1076,10 +1076,17 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
 
   // โปรโมชั่นจองครั้งแรก — เฉพาะ 60 นาที และยังไม่เคยจองที่ไม่ถูกยกเลิกมาก่อนเลย (เซิร์ฟเวอร์เป็นคนชี้ขาดตอนยืนยันจริงอีกชั้น)
   const [firstTimePrice, setFirstTimePrice] = useState(null);
+  const [ftChecking, setFtChecking] = useState(false); // กำลังเช็คสิทธิ์โปรอยู่ — ยังไม่ให้กดยืนยัน กันราคาที่เห็นไม่ตรงกับที่ระบบคิดจริง
   useEffect(() => {
     setFirstTimePrice(null);
-    if (!phoneOk || slot.durationMinutes !== 60 || isGroup) return;
-    db.checkFirstTime(phone, toIso(date)).then(price => setFirstTimePrice(price)).catch(() => {});
+    if (!phoneOk || slot.durationMinutes !== 60 || isGroup) { setFtChecking(false); return; }
+    let cancelled = false;
+    setFtChecking(true);
+    db.checkFirstTime(phone, toIso(date))
+      .then(price => { if (!cancelled) setFirstTimePrice(price); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setFtChecking(false); });
+    return () => { cancelled = true; };
   }, [phone, phoneOk, slot.durationMinutes, isGroup, date]);
   const firstTimeEligible = !isGroup && firstTimePrice != null && firstTimePrice < slot.price && !matchedPkg;
 
@@ -1204,7 +1211,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
 
       <div style={{display:"flex",gap:12}}>
         <button onClick={onCancel} style={{flex:1,padding:"14px",borderRadius:"var(--r)",border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:15,cursor:"pointer"}}>{t.cancel}</button>
-        <button disabled={!ok} onClick={() => {
+        <button disabled={!ok || ftChecking || checkingPkg} onClick={() => {
           if (lineSession && (lineSession.phone !== phone || lineSession.name !== name.trim())) onLinePhoneLinked?.(name.trim(), phone);
           if (useCredit && matchedPkg) {
             onConfirmWithPackage({ name: name.trim(), phone, packageId: matchedPkg.id });
@@ -1215,7 +1222,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
             if (!confirmed) return;
           }
           onConfirm({name:name.trim(),phone,discount:firstTimeEligible?null:discount,finalPrice,discountAmount});
-        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:ok?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:ok?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:ok?"pointer":"not-allowed"}}>{useCredit?(lang==="th"?"ยืนยันการจอง (ใช้สิทธิ์) ✓":"Confirm Booking (Use Credit) ✓"):t.confirmBooking}</button>
+        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:(ok&&!ftChecking&&!checkingPkg)?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:(ok&&!ftChecking&&!checkingPkg)?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:(ok&&!ftChecking&&!checkingPkg)?"pointer":"not-allowed"}}>{(ok&&(ftChecking||checkingPkg))?(lang==="th"?"กำลังตรวจสอบสิทธิ์...":"Checking eligibility..."):useCredit?(lang==="th"?"ยืนยันการจอง (ใช้สิทธิ์) ✓":"Confirm Booking (Use Credit) ✓"):t.confirmBooking}</button>
       </div>
     </div>
   );
@@ -1228,7 +1235,7 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
   const courts = booking.courts;
   const isGroup = !!(courts && courts.length > 1);
   const courtLabel = isGroup ? courts.map(c => c.courtName).join(" + ") : court.courtName;
-  const { finalPrice, discountAmount, discount } = customer;
+  const { finalPrice: clientPrice, discountAmount, discount } = customer; // clientPrice = ราคาที่หน้ากรอกข้อมูลคำนวณไว้ (เป็นแค่ค่าคาดการณ์)
   const initialSecs = resumeBooking
     ? Math.max(0, 300 - Math.floor((Date.now() - parseUtc(resumeBooking.createdAt).getTime())/1000))
     : 300;
@@ -1239,6 +1246,8 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
   const [uploading, setUploading] = useState(false);
   const [uploaded, setUploaded] = useState(false);
   const [bookingId, setBookingId] = useState(resumeBooking?.id || null);
+  // ราคาจริงที่เซิร์ฟเวอร์คำนวณและบันทึกไว้ — ใช้แสดงยอดโอน/แจ้ง Telegram เสมอ (กู้หน้าจากการจองเดิม ราคามาจากฐานข้อมูลอยู่แล้ว)
+  const [serverPrice, setServerPrice] = useState(resumeBooking ? clientPrice : null);
   const fileRef = useRef();
   const savedRef = useRef(!!resumeBooking);
 
@@ -1248,7 +1257,7 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
       savedRef.current = true;
       // สร้างการจอง — เซิร์ฟเวอร์เป็นคนตรวจสอบช่วงเวลาว่างและคำนวณราคาสุดท้ายเองทั้งหมด
       // จอง 2 สนามพร้อมกัน → สร้าง 2 แถวในครั้งเดียว (ไม่ใช้โค้ดส่วนลด) / จอง 1 สนามตามปกติ
-      const { booking: b, error } = isGroup
+      const result = isGroup
         ? await db.createBookingMulti({
             courtIds: courts.map(c => c.courtId),
             customerId: customer.phone,
@@ -1268,6 +1277,7 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
             durationMinutes: slot.durationMinutes || 60,
             discountCodeId: discount?.id || null,
           });
+      const { booking: b, error } = result;
       if (error) {
         // ช่วงเวลานี้เพิ่งถูกจองไปโดยคนอื่นพอดี (แข่งกันจองพร้อมกัน) — แจ้งแล้วพากลับหน้าจอง
         alert(lang==="th" ? "ขออภัย ช่วงเวลานี้เพิ่งถูกจองไปแล้ว กรุณาเลือกช่วงเวลาใหม่" : "Sorry, this time slot was just booked. Please choose another time.");
@@ -1275,6 +1285,9 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
         return;
       }
       if (b) {
+        // ราคาจริง = ที่เซิร์ฟเวอร์บันทึก (การจองคู่ = รวมทุกแถว)
+        const total = isGroup ? (result.bookings || []).reduce((s, r) => s + (r.price || 0), 0) : (b.price ?? clientPrice);
+        setServerPrice(total);
         setBookingId(b.id);
         // เก็บ bookingId ไว้ทั้งใน URL และ localStorage — ถ้าเบราว์เซอร์รีโหลดตอนออกไปสแกนจ่ายเงินแล้วกลับมา
         // (โดยเฉพาะ in-app browser บางตัวที่อาจล้าง query string ตอนโหลดใหม่)
@@ -1328,7 +1341,7 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
         return;
       }
       setUploaded(true);
-      trackFb("Purchase", { value: finalPrice, currency: "THB", content_name: isGroup ? "court_booking_2courts" : "court_booking" });
+      trackFb("Purchase", { value: serverPrice ?? clientPrice, currency: "THB", content_name: isGroup ? "court_booking_2courts" : "court_booking" });
       fetch("/api/notify-admin-telegram", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1336,7 +1349,7 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
           courtName: courtLabel,
           date: fmtDate(date, lang),
           time: slot.label,
-          price: finalPrice,
+          price: serverPrice ?? clientPrice,
           name: customer.name,
           phone: customer.phone,
         }),
@@ -1366,9 +1379,16 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
         <p style={{fontSize:13,color:"var(--mu)",marginBottom:12}}>{t.scanQR}</p>
         <img src="/qr-payment.png" alt="PromptPay QR" style={{width:200,height:200,objectFit:"contain",borderRadius:10,border:"1px solid var(--dv)",background:"#fff"}} />
         <div style={{marginTop:14,display:"inline-flex",alignItems:"center",gap:8,background:"var(--or-bg)",borderRadius:20,padding:"8px 18px"}}>
-          <span style={{fontSize:24,fontWeight:800,color:"var(--or)"}}>฿{finalPrice.toLocaleString()}</span>
+          <span style={{fontSize:24,fontWeight:800,color:"var(--or)"}}>{serverPrice != null ? `฿${serverPrice.toLocaleString()}` : (lang==="th" ? "กำลังคำนวณราคา..." : "Calculating price...")}</span>
           <span style={{fontSize:12,color:"var(--mu)"}}>{t.transfer}</span>
         </div>
+        {serverPrice != null && !resumeBooking && serverPrice !== clientPrice && (
+          <p style={{marginTop:10,fontSize:12,lineHeight:1.6,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:10,padding:"8px 10px"}}>
+            {lang==="th"
+              ? `ℹ️ ยอดที่ต้องโอนคือ ฿${serverPrice.toLocaleString()} (คิดตามเงื่อนไขล่าสุดของระบบ ต่างจากที่แสดงในหน้ากรอกข้อมูล ฿${clientPrice.toLocaleString()}) กรุณาโอนตามยอดนี้`
+              : `ℹ️ Please transfer ฿${serverPrice.toLocaleString()} (calculated by our system, different from ฿${clientPrice.toLocaleString()} shown earlier).`}
+          </p>
+        )}
         <div style={{marginTop:12,padding:"10px 14px",background:"var(--cr)",borderRadius:10}}>
           <p style={{fontSize:11,color:"var(--mu)"}}>{t.accountName}</p>
           <p style={{fontSize:14,fontWeight:700,color:"var(--br)"}}>{PAYMENT_ACCOUNT_NAME}</p>
@@ -1430,7 +1450,7 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
       {uploaded ? (
         <button className="btn-primary" onClick={() => onDone(customer.phone)}>{t.checkMyBooking} →</button>
       ) : (
-        <button className="btn-primary" disabled={!slip || uploading} onClick={handleUpload} style={{opacity:(!slip||uploading)?0.6:1,cursor:(!slip||uploading)?"not-allowed":"pointer"}}>
+        <button className="btn-primary" disabled={!slip || uploading || !bookingId} onClick={handleUpload} style={{opacity:(!slip||uploading||!bookingId)?0.6:1,cursor:(!slip||uploading||!bookingId)?"not-allowed":"pointer"}}>
           {uploading ? t.sending : t.sendSlip}
         </button>
       )}
