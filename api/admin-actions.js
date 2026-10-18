@@ -20,8 +20,10 @@ const TOKEN_SECRET = process.env.ADMIN_TOKEN_SECRET || ADMIN_PASSWORD;
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // โทเคนหมดอายุใน 12 ชั่วโมง
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_TELEGRAM_CHAT_IDS = process.env.ADMIN_TELEGRAM_CHAT_IDS; // คั่นด้วยจุลภาค
+const nameLen = (s) => Array.from(String(s ?? "")).length; // นับเป็นตัวอักษร (emoji 1 ตัว ไม่ใช่ 2)
 const minutesToLabel = (mins) => `${String(Math.floor(mins / 60)).padStart(2, "0")}:${String(mins % 60).padStart(2, "0")}`;
 
+const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); // กันอักขระ < > & ในชื่อทำให้ข้อความ Telegram ส่งไม่ผ่าน
 async function notifyTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !ADMIN_TELEGRAM_CHAT_IDS) return;
   const chatIds = ADMIN_TELEGRAM_CHAT_IDS.split(",").map(s => s.trim()).filter(Boolean);
@@ -159,10 +161,11 @@ export default async function handler(req, res) {
           if (status === "confirmed" && !wasConfirmed) {
             const { body: pkgRows } = await sb(`packages?id=eq.${before.package_id}&select=*`);
             const pkg = (pkgRows || [])[0];
+            const units = Math.max(1, Math.round((before.duration_minutes || 60) / 60)); // 60 นาที = 1 ครั้ง, 120 นาที = 2 ครั้ง
             if (pkg && pkg.remaining_credits > 0) {
               await sb(`packages?id=eq.${before.package_id}&remaining_credits=eq.${pkg.remaining_credits}`, {
                 method: "PATCH",
-                body: JSON.stringify({ remaining_credits: pkg.remaining_credits - 1 }),
+                body: JSON.stringify({ remaining_credits: Math.max(0, pkg.remaining_credits - units) }),
               });
             }
           }
@@ -171,10 +174,11 @@ export default async function handler(req, res) {
           if (status === "cancelled" && wasConfirmed && refundCredit) {
             const { body: pkgRows } = await sb(`packages?id=eq.${before.package_id}&select=*`);
             const pkg = (pkgRows || [])[0];
+            const units = Math.max(1, Math.round((before.duration_minutes || 60) / 60));
             if (pkg && pkg.remaining_credits < pkg.total_credits) {
               await sb(`packages?id=eq.${before.package_id}`, {
                 method: "PATCH",
-                body: JSON.stringify({ remaining_credits: pkg.remaining_credits + 1 }),
+                body: JSON.stringify({ remaining_credits: Math.min(pkg.total_credits, pkg.remaining_credits + units) }),
               });
             }
           }
@@ -221,7 +225,7 @@ export default async function handler(req, res) {
         const { customerId, customerName, courtIds, bookingDate, hour, startMinute, durationMinutes, price, status } = p;
         if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid phone" }); return; }
         const name = String(customerName || "").trim();
-        if (name.length < 1 || name.length > 40) { res.status(400).json({ error: "invalid name" }); return; }
+        if (name.length < 1 || nameLen(name) > 40) { res.status(400).json({ error: "invalid name" }); return; }
         const ids = Array.isArray(courtIds) ? [...new Set(courtIds.map(Number))].sort() : [];
         if (ids.length < 1 || ids.length > 2 || ids.some(c => c !== 1 && c !== 2)) { res.status(400).json({ error: "invalid courts" }); return; }
         if (!/^\d{4}-\d{2}-\d{2}$/.test(bookingDate || "")) { res.status(400).json({ error: "invalid date" }); return; }
@@ -257,7 +261,7 @@ export default async function handler(req, res) {
 
         await notifyTelegram(
           `📞 <b>แอดมินจองให้ลูกค้า</b>\n\n` +
-          `👤 ${name}\n📞 ${customerId}\n` +
+          `👤 ${esc(name)}\n📞 ${customerId}\n` +
           `🎾 ${ids.map(c => `Court ${c}`).join(" + ")}\n📅 ${bookingDate}\n` +
           `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n` +
           `💰 ฿${(Math.round(unit) * ids.length).toLocaleString()} (${status === "confirmed" ? "ชำระแล้ว" : "รอชำระ"})`
@@ -269,10 +273,44 @@ export default async function handler(req, res) {
         // แก้ชื่อที่พิมพ์ผิดในการจองที่มีอยู่ (การจองคู่แก้ทั้งคู่) — ไม่แตะเบอร์/ราคา/สถานะ
         const { id, name } = p;
         const clean = String(name || "").trim();
-        if (!id || clean.length < 1 || clean.length > 40) { res.status(400).json({ error: "invalid" }); return; }
+        if (!id || clean.length < 1 || nameLen(clean) > 40) { res.status(400).json({ error: "invalid" }); return; }
         const { body } = await sb(`bookings?id=eq.${id}&select=group_id`);
         const gid = (body || [])[0]?.group_id;
         await sb(gid ? `bookings?group_id=eq.${encodeURIComponent(gid)}` : `bookings?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ customer_name: clean }) });
+        res.status(200).json({ ok: true });
+        return;
+      }
+      case "updateCustomerName": {
+        // แก้ชื่อลูกค้า "ที่ยังไม่ผูก LINE" (เช่นแอดมินจองให้แล้วพิมพ์ชื่อผิด) — แก้ทั้งข้อมูลลูกค้า แพ็คเกจ และการจองทุกรายการของเบอร์นี้
+        // ลูกค้าที่ผูก LINE แล้วใช้ชื่อ LINE ซึ่งซิงก์ทับทุกครั้งที่ล็อกอิน จึงไม่ให้แก้ตรงนี้ (กันสับสนว่าแก้แล้วชื่อเด้งกลับ)
+        const { phone, name } = p;
+        const clean = String(name || "").trim();
+        if (!/^[0-9]{10}$/.test(phone || "") || clean.length < 1 || nameLen(clean) > 40) { res.status(400).json({ error: "invalid" }); return; }
+        const { body: linked } = await sb(`line_users?phone=eq.${phone}&select=line_user_id&limit=1`);
+        if (linked && linked.length > 0) { res.status(409).json({ error: "name_from_line" }); return; }
+        const patch = { method: "PATCH", body: JSON.stringify({ customer_name: clean }) };
+        await sb(`customers?customer_id=eq.${phone}`, patch);
+        await sb(`packages?customer_id=eq.${phone}`, patch);
+        await sb(`bookings?customer_id=eq.${phone}`, patch);
+        res.status(200).json({ ok: true });
+        return;
+      }
+      case "changeCustomerPhone": {
+        // เปลี่ยนเบอร์ลูกค้า: ย้ายข้อมูลลูกค้า การจองทุกรายการ แพ็คเกจ และการผูก LINE ไปเบอร์ใหม่ "พร้อมกันในธุรกรรมเดียว" (ฟังก์ชัน SQL change_customer_phone)
+        // ถ้ามีขั้นตอนใดล้มเหลว ฐานข้อมูลย้อนกลับทั้งหมด ไม่ค้างครึ่งๆ กลางๆ — เบอร์ใหม่ต้องยังไม่มีข้อมูลในระบบ (ยังไม่รองรับการรวมข้อมูลสองเบอร์)
+        const { oldPhone, newPhone } = p;
+        if (!/^[0-9]{10}$/.test(oldPhone || "") || !/^[0-9]{10}$/.test(newPhone || "")) { res.status(400).json({ error: "invalid_phone" }); return; }
+        if (oldPhone === newPhone) { res.status(400).json({ error: "same_phone" }); return; }
+        const r = await sb(`rpc/change_customer_phone`, { method: "POST", body: JSON.stringify({ old_phone: oldPhone, new_phone: newPhone }) });
+        if (!r.ok) {
+          const msg = String(r.body?.message || "");
+          if (msg.includes("phone_exists")) { res.status(409).json({ error: "phone_exists" }); return; }
+          if (msg.includes("invalid_phone") || msg.includes("same_phone")) { res.status(400).json({ error: msg.includes("same") ? "same_phone" : "invalid_phone" }); return; }
+          if (r.body?.code === "PGRST202" || msg.includes("Could not find the function")) { res.status(500).json({ error: "rpc_missing" }); return; } // ยังไม่ได้รัน add-change-phone-function.sql
+          console.error("changeCustomerPhone failed:", r.body);
+          res.status(500).json({ error: "change_failed" }); return;
+        }
+        await notifyTelegram(`🔧 <b>แอดมินเปลี่ยนเบอร์ลูกค้า</b>\n\n📞 ${oldPhone} → ${newPhone}\n(ย้ายข้อมูลลูกค้า การจอง แพ็คเกจ และการผูก LINE ไปเบอร์ใหม่แล้ว)`);
         res.status(200).json({ ok: true });
         return;
       }
