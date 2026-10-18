@@ -10,7 +10,7 @@ async function callBookingAction(action, payload) {
   const res = await fetch("/api/booking-actions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action, ...payload }),
+    body: JSON.stringify({ action, session: loadLineSession()?.token, ...payload }),
   });
   return res.json();
 }
@@ -276,10 +276,19 @@ const LINE_BOT_PROMPT = "aggressive";
 // โหมดบังคับล็อกอิน LINE — เปลี่ยนแค่ค่านี้ค่าเดียวเพื่อสลับพฤติกรรม:
 //   "gate"    = ต้องล็อกอินตั้งแต่เข้าเว็บ (ยังไม่ล็อกอิน = เห็นแต่หน้าล็อกอิน)
 //   "booking" = ดูหน้าแรก/ราคาได้อิสระ แต่ต้องล็อกอินตอนจะเข้าหน้าจองสนาม/แพ็คเกจ
-//   "prompt"  = ชวนล็อกอินตอนเข้าเว็บ แต่กดข้ามได้
 //   "off"     = ไม่บังคับ (มีปุ่มให้ล็อกอินเฉยๆ)
 const LINE_GATE_MODE = "booking";
-const LINE_BYPASS_KEY = "nova_line_bypass";
+// เบอร์โทรแอดมิน — โชว์ให้ลูกค้าที่ไม่มี LINE / ล็อกอินไม่ได้ / ต้องการเปลี่ยนเบอร์ที่ผูกไว้ (แก้เบอร์ตรงนี้ถ้าเปลี่ยน)
+const ADMIN_CONTACT_PHONE = "063-146-5997";
+const adminTel = () => `tel:${ADMIN_CONTACT_PHONE.replace(/\D/g, "")}`;
+// ข้อความผิดพลาดที่เซิร์ฟเวอร์ส่งกลับ (เรื่องบัญชี LINE / เบอร์)
+const accountErrMsg = (code, lang = "th") => ({
+  line_required: lang==="th" ? "กรุณาเข้าสู่ระบบด้วย LINE ใหม่อีกครั้ง" : "Please sign in with LINE again.",
+  invalid_session: lang==="th" ? "เซสชัน LINE หมดอายุ กรุณาเข้าสู่ระบบใหม่" : "Your LINE session expired. Please sign in again.",
+  phone_not_linked: lang==="th" ? "ยังไม่ได้ผูกเบอร์โทรกับบัญชี LINE กรุณากรอกเบอร์ก่อน" : "No phone number is linked to your LINE account yet.",
+  phone_linked_elsewhere: lang==="th" ? `เบอร์นี้ถูกผูกกับบัญชี LINE อื่นแล้ว กรุณาติดต่อแอดมิน ${ADMIN_CONTACT_PHONE}` : `This number is linked to another LINE account. Please contact the admin: ${ADMIN_CONTACT_PHONE}`,
+  phone_locked: lang==="th" ? `บัญชีนี้ผูกเบอร์ไว้แล้ว เปลี่ยนเบอร์ไม่ได้ กรุณาติดต่อแอดมิน ${ADMIN_CONTACT_PHONE}` : `This account's phone number is locked. Contact the admin: ${ADMIN_CONTACT_PHONE}`,
+}[code] || null);
 // true = ในโหมด "booking" พอลูกค้ากด "จองสนาม"/"แพ็คเกจ" ตอนยังไม่ล็อกอิน ให้พาไปหน้า LINE Login ทันที (ข้ามหน้าแจ้งของเรา)
 // false = แสดงหน้าแจ้ง "เข้าสู่ระบบด้วย LINE" ของเราก่อน แล้วค่อยกดไปล็อกอิน
 const LINE_SKIP_INTRO = true;
@@ -450,7 +459,7 @@ function NovaLogo({ width }) {
 }
 
 // หน้า/การ์ดบอกให้ล็อกอินด้วย LINE — fullscreen (โหมด gate) หรือแทรกในหน้า (compact)
-function LineLoginGate({ lang="th", setLang, onLogin, compact=false, onSkip }) {
+function LineLoginGate({ lang="th", setLang, onLogin, compact=false }) {
   const body = (
     <div style={{width:"100%",maxWidth:380,background:"#fff",borderRadius:18,padding:"26px 22px",boxShadow:"0 10px 40px rgba(102,57,36,.15)",border:"1px solid var(--dv)",textAlign:"center"}}>
       {!compact && <NovaLogo width={130} />}
@@ -464,16 +473,14 @@ function LineLoginGate({ lang="th", setLang, onLogin, compact=false, onSkip }) {
         <span style={{background:"#fff",color:"#06C755",fontWeight:900,fontSize:11,padding:"3px 7px",borderRadius:6}}>LINE</span>
         {lang==="th" ? "เข้าสู่ระบบด้วย LINE" : "Sign in with LINE"}
       </button>
-      {onSkip && (
-        <button onClick={onSkip} style={{marginTop:12,background:"none",border:"none",color:"var(--mu)",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
-          {lang==="th" ? "ข้ามไปก่อน" : "Skip for now"}
-        </button>
-      )}
       {(LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && (
         <p style={{fontSize:12,color:"var(--br)",marginTop:14,lineHeight:1.6,background:"var(--or-bg)",borderRadius:10,padding:"8px 10px"}}>
           {lang==="th" ? "ระหว่างล็อกอิน LINE จะชวนให้เพิ่มเพื่อน LINE OA ของร้าน — ต้องเพิ่มเพื่อนด้วยจึงจะจองได้" : "During sign-in, LINE will ask you to add our LINE OA — adding it is required to book."}
         </p>
       )}
+      <a href={adminTel()} style={{display:"block",marginTop:14,fontSize:12.5,fontWeight:700,color:"var(--br)",textDecoration:"underline"}}>
+        {lang==="th" ? `ไม่มี LINE? โทรจองกับแอดมิน ${ADMIN_CONTACT_PHONE}` : `No LINE? Call the admin to book: ${ADMIN_CONTACT_PHONE}`}
+      </a>
       <p style={{fontSize:11,color:"var(--mu)",marginTop:14,lineHeight:1.6}}>
         {lang==="th"
           ? "ระบบเก็บเฉพาะชื่อและรหัสผู้ใช้ LINE ของคุณ ไม่เห็นรหัสผ่านหรือข้อความแชทใดๆ"
@@ -520,6 +527,9 @@ function LineFriendGate({ lang="th", compact=false, onRecheck, name }) {
       <button onClick={onRecheck} style={{width:"100%",marginTop:10,padding:"12px",borderRadius:12,border:"1.5px solid #06C755",background:"#fff",color:"#06A04A",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
         {lang==="th" ? "✓ เพิ่มเพื่อนแล้ว — ตรวจสอบอีกครั้ง" : "✓ I've added — check again"}
       </button>
+      <a href={adminTel()} style={{display:"block",marginTop:12,fontSize:12.5,fontWeight:700,color:"var(--br)",textDecoration:"underline"}}>
+        {lang==="th" ? `ไม่สะดวกเพิ่มเพื่อน? โทรจองกับแอดมิน ${ADMIN_CONTACT_PHONE}` : `Prefer not to add us? Call the admin: ${ADMIN_CONTACT_PHONE}`}
+      </a>
       <p style={{fontSize:11,color:"var(--mu)",marginTop:12,lineHeight:1.6}}>
         {lang==="th" ? "หากเพิ่มเพื่อนแล้วแต่ยังขึ้นหน้านี้ กด \"ตรวจสอบอีกครั้ง\" ระบบจะพาไปยืนยันกับ LINE อีกรอบ" : "If you've already added us and still see this, tap \"check again\" to re-verify with LINE."}
       </p>
@@ -1038,7 +1048,7 @@ function BookingPage({ onProceed, lang="th" }) {
   );
 }
 
-function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, lineSession, onLineLogin, onLinePhoneLinked, lang="th" }) {
+function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, lineSession, onLineLogin, onLinkPhone, lang="th" }) {
   const t = T[lang];
   const { date, court, slot } = booking;
   const courts = booking.courts; // มี 2 สนามเมื่อเป็นการจองพร้อมกัน (โอนครั้งเดียว)
@@ -1052,6 +1062,10 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
   const [checkingCode, setCheckingCode] = useState(false);
   const nameOk = name.trim().length >= 1 && name.length <= 16;
   const phoneOk = /^[0-9]{10}$/.test(phone);
+  const phoneLocked = !!lineSession?.phone;
+  useEffect(() => { if (lineSession?.phone) setPhone(lineSession.phone); }, [lineSession?.phone]); // ผูกกับบัญชี LINE แล้ว → ล็อก ไม่ให้แก้ (เซิร์ฟเวอร์ก็ใช้เบอร์ที่ผูกไว้เสมอ)
+  const [linking, setLinking] = useState(false);
+  const [linkErr, setLinkErr] = useState("");
   const ok = nameOk && phoneOk;
 
   // เช็คว่ามีสิทธิ์แพ็คเกจที่ใช้กับช่วงเวลานี้ได้ไหม (ต้องจอง 60 นาทีพอดี + tier ตรงกัน + ยังไม่หมดอายุ)
@@ -1172,8 +1186,9 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
         </div>
         <div>
           <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.phone}</label>
-          <input value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))} placeholder="0812345678" inputMode="numeric"
-            style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:`1.5px solid ${phone&&!phoneOk?"#c0392b":"var(--dv)"}`,color:"var(--tx)",outline:"none"}} />
+          <input value={phone} readOnly={phoneLocked} onChange={e => { if (!phoneLocked) setPhone(e.target.value.replace(/\D/g,"").slice(0,10)); }} placeholder="0812345678" inputMode="numeric"
+            style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:phoneLocked?"var(--cr2)":"#fff",border:`1.5px solid ${phone&&!phoneOk?"#c0392b":"var(--dv)"}`,color:phoneLocked?"var(--mu)":"var(--tx)",outline:"none"}} />
+          <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>{lineSession?.phone ? (lang==="th" ? `🔒 เบอร์ที่ผูกกับบัญชี LINE ของคุณ — เปลี่ยนเองไม่ได้ ต้องการเปลี่ยนติดต่อแอดมิน ${ADMIN_CONTACT_PHONE}` : `🔒 Linked to your LINE account — can't be changed here. Contact admin: ${ADMIN_CONTACT_PHONE}`) : (lang==="th" ? "กรอกครั้งแรกครั้งเดียว — เบอร์นี้จะถูกล็อกกับบัญชี LINE ของคุณ กรุณากรอกให้ถูกต้อง" : "Enter once — this number will be locked to your LINE account. Please double-check it.")}</p>
         </div>
         {matchedPkg && (
           <div onClick={() => setUseCredit(v => !v)} style={{display:"flex",gap:10,alignItems:"flex-start",padding:"13px 14px",borderRadius:10,border:`1.5px solid ${useCredit?"var(--or)":"var(--dv)"}`,background:useCredit?"var(--or-bg)":"#fff",cursor:"pointer"}}>
@@ -1209,10 +1224,22 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
         )}
       </div>
 
+      {linkErr && <p style={{fontSize:12.5,color:"#c0392b",marginBottom:10,lineHeight:1.6}}>{linkErr}</p>}
       <div style={{display:"flex",gap:12}}>
         <button onClick={onCancel} style={{flex:1,padding:"14px",borderRadius:"var(--r)",border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:15,cursor:"pointer"}}>{t.cancel}</button>
-        <button disabled={!ok || ftChecking || checkingPkg} onClick={() => {
-          if (lineSession && (lineSession.phone !== phone || lineSession.name !== name.trim())) onLinePhoneLinked?.(name.trim(), phone);
+        <button disabled={!ok || ftChecking || checkingPkg || linking} onClick={async () => {
+          setLinkErr("");
+          // ครั้งแรก: ผูกเบอร์กับบัญชี LINE ก่อน (เซิร์ฟเวอร์เช็คว่าเบอร์นี้ไม่ได้ผูกกับ LINE อื่น) ผ่านแล้วจึงไปต่อ
+          if (lineSession && !lineSession.phone) {
+            const sure = window.confirm(lang==="th"
+              ? `ยืนยันเบอร์ ${phone} ใช่หรือไม่?\n\nเบอร์นี้จะถูกผูกกับบัญชี LINE ของคุณ และแก้ไขเองไม่ได้อีก (ต้องติดต่อแอดมิน)`
+              : `Confirm phone number ${phone}?\n\nIt will be linked to your LINE account and can't be changed by yourself later.`);
+            if (!sure) return;
+            setLinking(true);
+            const r = await onLinkPhone(name.trim(), phone);
+            setLinking(false);
+            if (!r?.ok) { setLinkErr(accountErrMsg(r?.error, lang) || (lang==="th" ? "ผูกเบอร์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Couldn't link your number. Please try again.")); return; }
+          }
           if (useCredit && matchedPkg) {
             onConfirmWithPackage({ name: name.trim(), phone, packageId: matchedPkg.id });
             return;
@@ -1222,7 +1249,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
             if (!confirmed) return;
           }
           onConfirm({name:name.trim(),phone,discount:firstTimeEligible?null:discount,finalPrice,discountAmount});
-        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:(ok&&!ftChecking&&!checkingPkg)?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:(ok&&!ftChecking&&!checkingPkg)?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:(ok&&!ftChecking&&!checkingPkg)?"pointer":"not-allowed"}}>{(ok&&(ftChecking||checkingPkg))?(lang==="th"?"กำลังตรวจสอบสิทธิ์...":"Checking eligibility..."):useCredit?(lang==="th"?"ยืนยันการจอง (ใช้สิทธิ์) ✓":"Confirm Booking (Use Credit) ✓"):t.confirmBooking}</button>
+        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:(ok&&!ftChecking&&!checkingPkg&&!linking)?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:(ok&&!ftChecking&&!checkingPkg&&!linking)?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:(ok&&!ftChecking&&!checkingPkg&&!linking)?"pointer":"not-allowed"}}>{linking?(lang==="th"?"กำลังผูกเบอร์...":"Linking..."):(ok&&(ftChecking||checkingPkg))?(lang==="th"?"กำลังตรวจสอบสิทธิ์...":"Checking eligibility..."):useCredit?(lang==="th"?"ยืนยันการจอง (ใช้สิทธิ์) ✓":"Confirm Booking (Use Credit) ✓"):t.confirmBooking}</button>
       </div>
     </div>
   );
@@ -1279,8 +1306,8 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
           });
       const { booking: b, error } = result;
       if (error) {
-        // ช่วงเวลานี้เพิ่งถูกจองไปโดยคนอื่นพอดี (แข่งกันจองพร้อมกัน) — แจ้งแล้วพากลับหน้าจอง
-        alert(lang==="th" ? "ขออภัย ช่วงเวลานี้เพิ่งถูกจองไปแล้ว กรุณาเลือกช่วงเวลาใหม่" : "Sorry, this time slot was just booked. Please choose another time.");
+        // บัญชี/เบอร์มีปัญหา → บอกสาเหตุ / นอกนั้นคือช่วงเวลาเพิ่งถูกจองไปโดยคนอื่น (แข่งกันจองพร้อมกัน)
+        alert(accountErrMsg(error, lang) || (lang==="th" ? "ขออภัย ช่วงเวลานี้เพิ่งถูกจองไปแล้ว กรุณาเลือกช่วงเวลาใหม่" : "Sorry, this time slot was just booked. Please choose another time."));
         onDone(customer.phone);
         return;
       }
@@ -1510,7 +1537,7 @@ function Dot({ color, label }) {
 }
 
 // ─── Package (แพ็คเกจสมาชิก) ──────────────────────────────────────────────────
-function PackagePage({ lang="th", lineSession, onLineLogin, onLinePhoneLinked }) {
+function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
   const t = T[lang];
   const [selected, setSelected] = useState(null); // { tier, credits, price, days }
   const [name, setName] = useState(() => toFormName(lineSession?.name || lineSession?.displayName));
@@ -1535,6 +1562,8 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinePhoneLinked })
 
   const nameOk = name.trim().length >= 1 && name.length <= 16;
   const phoneOk = /^[0-9]{10}$/.test(phone);
+  const phoneLocked = !!lineSession?.phone;
+  useEffect(() => { if (lineSession?.phone) { setPhone(lineSession.phone); setLookupPhone(lineSession.phone); } }, [lineSession?.phone]);
 
   const handleLookup = async () => {
     if (!/^[0-9]{10}$/.test(lookupPhone)) return;
@@ -1545,20 +1574,29 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinePhoneLinked })
 
   const handleBuy = async () => {
     if (!selected || !nameOk || !phoneOk || creating) return;
-    if (lineSession && (lineSession.phone !== phone || lineSession.name !== name.trim())) onLinePhoneLinked?.(name.trim(), phone);
-    setCreating(true); setCreateErr("");
+    setCreateErr("");
+    if (lineSession && !lineSession.phone) {
+      const sure = window.confirm(lang==="th"
+        ? `ยืนยันเบอร์ ${phone} ใช่หรือไม่?\n\nเบอร์นี้จะถูกผูกกับบัญชี LINE ของคุณ และแก้ไขเองไม่ได้อีก (ต้องติดต่อแอดมิน)`
+        : `Confirm phone number ${phone}?\n\nIt will be linked to your LINE account and can't be changed by yourself later.`);
+      if (!sure) return;
+      setCreating(true);
+      const r = await onLinkPhone(name.trim(), phone);
+      if (!r?.ok) { setCreating(false); setCreateErr(accountErrMsg(r?.error, lang) || (lang==="th" ? "ผูกเบอร์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Couldn't link your number. Please try again.")); return; }
+    }
+    setCreating(true);
     const { package: pkgRow, error } = await db.createPackage({
       tier: selected.tier, credits: selected.credits, customerId: phone, customerName: name.trim(),
     });
     setCreating(false);
-    if (error || !pkgRow) { setCreateErr(lang==="th" ? "สร้างรายการไม่สำเร็จ ลองใหม่อีกครั้ง" : "Failed to create order, please try again"); return; }
+    if (error || !pkgRow) { setCreateErr(accountErrMsg(error, lang) || (lang==="th" ? "สร้างรายการไม่สำเร็จ ลองใหม่อีกครั้ง" : "Failed to create order, please try again")); return; }
     setPkg(pkgRow);
     const utm = getStoredUtm();
     if (utm) db.recordSource("package", pkgRow.id, utm).catch(() => {});
   };
 
   if (pkg) {
-    return <PackagePaymentView pkg={pkg} lang={lang} onDone={() => { setPkg(null); setSelected(null); setName(""); setPhone(""); }} />;
+    return <PackagePaymentView pkg={pkg} lang={lang} onDone={() => { setPkg(null); setSelected(null); setName(toFormName(lineSession?.name || lineSession?.displayName)); setPhone(lineSession?.phone || ""); }} />;
   }
 
   const pkgStatusInfo = (s) => {
@@ -1605,7 +1643,7 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinePhoneLinked })
       <section>
         <StepHead n="🔍" label={lang==="th"?"แพ็คเกจของฉัน":"My Packages"} />
         <div style={{display:"flex",gap:8,marginBottom:12}}>
-          <input value={lookupPhone} onChange={e => setLookupPhone(e.target.value.replace(/\D/g,"").slice(0,10))}
+          <input value={lookupPhone} readOnly={phoneLocked} onChange={e => { if (!phoneLocked) setLookupPhone(e.target.value.replace(/\D/g,"").slice(0,10)); }}
             placeholder={t.searchPlaceholder} inputMode="numeric"
             style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
           <button onClick={handleLookup} disabled={lookupLoading || lookupPhone.length < 10} style={{padding:"0 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
@@ -1708,8 +1746,9 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinePhoneLinked })
             </div>
             <div>
               <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.phone}</label>
-              <input value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))} placeholder="0812345678" inputMode="numeric"
-                style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:`1.5px solid ${phone&&!phoneOk?"#c0392b":"var(--dv)"}`,color:"var(--tx)",outline:"none"}} />
+              <input value={phone} readOnly={phoneLocked} onChange={e => { if (!phoneLocked) setPhone(e.target.value.replace(/\D/g,"").slice(0,10)); }} placeholder="0812345678" inputMode="numeric"
+                style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:phoneLocked?"var(--cr2)":"#fff",border:`1.5px solid ${phone&&!phoneOk?"#c0392b":"var(--dv)"}`,color:phoneLocked?"var(--mu)":"var(--tx)",outline:"none"}} />
+              <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>{lineSession?.phone ? (lang==="th" ? `🔒 เบอร์ที่ผูกกับบัญชี LINE ของคุณ — เปลี่ยนเองไม่ได้ ต้องการเปลี่ยนติดต่อแอดมิน ${ADMIN_CONTACT_PHONE}` : `🔒 Linked to your LINE account — can't be changed here. Contact admin: ${ADMIN_CONTACT_PHONE}`) : (lang==="th" ? "กรอกครั้งแรกครั้งเดียว — เบอร์นี้จะถูกล็อกกับบัญชี LINE ของคุณ กรุณากรอกให้ถูกต้อง" : "Enter once — this number will be locked to your LINE account. Please double-check it.")}</p>
             </div>
           </div>
           {createErr && <p style={{fontSize:12,color:"#c0392b",marginBottom:10}}>{createErr}</p>}
@@ -1849,9 +1888,10 @@ function PackagePaymentView({ pkg, lang="th", onDone }) {
 }
 
 // ─── Cancel / Check Booking Page ─────────────────────────────────────────────
-function CancelPage({ lang="th", initialPhone="" }) {
+function CancelPage({ lang="th", initialPhone="", lockedPhone="" }) {
   const t = T[lang];
-  const [phone, setPhone] = useState(initialPhone);
+  const [phone, setPhone] = useState(lockedPhone || initialPhone);
+  useEffect(() => { if (lockedPhone) setPhone(lockedPhone); }, [lockedPhone]); // ผูก LINE แล้ว → ดูได้เฉพาะการจองของเบอร์ตัวเอง
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
@@ -1883,9 +1923,9 @@ function CancelPage({ lang="th", initialPhone="" }) {
     <div style={{padding:"20px 16px 100px"}} className="fu">
       <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:20}}>{t.myBookings}</h2>
       <div style={{display:"flex",gap:8,marginBottom:20}}>
-        <input value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g,"").slice(0,10))}
+        <input value={phone} readOnly={!!lockedPhone} onChange={e => { if (!lockedPhone) setPhone(e.target.value.replace(/\D/g,"").slice(0,10)); }}
           placeholder={t.searchPlaceholder} inputMode="numeric"
-          style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
+          style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:lockedPhone?"var(--cr2)":"#fff",border:"1.5px solid var(--dv)",color:lockedPhone?"var(--mu)":"var(--tx)",outline:"none"}} />
         <button onClick={() => handleSearch()} disabled={loading || phone.length < 10} style={{padding:"0 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
           {loading ? "..." : t.searchBtn}
         </button>
@@ -1947,9 +1987,6 @@ export default function AppV2() {
   const [lineSession, setLineSession] = useState(() => loadLineSession());
   const [lineCbStatus, setLineCbStatus] = useState(() => (isLineCallbackPath() ? "processing" : null));
   const lineCbStarted = useRef(false);
-  // ข้ามล็อกอินได้ชั่วคราว (เฉพาะเมื่อล็อกอินล้มเหลว หรือโหมด prompt) — ใช้ได้แค่ในเบราว์เซอร์/เซสชันนี้
-  const [lineBypass, setLineBypass] = useState(() => { try { return sessionStorage.getItem(LINE_BYPASS_KEY) === "1"; } catch { return false; } });
-  const doBypass = () => { try { sessionStorage.setItem(LINE_BYPASS_KEY, "1"); } catch { /* no-op */ } setLineBypass(true); };
 
   const clearResumeParam = () => {
     try {
@@ -1969,7 +2006,7 @@ export default function AppV2() {
 
   const goTab = (id) => {
     // ตัดสินใจตอน "กด" (ไม่ใช่ตอนแสดงผล) — กด Back จากหน้า LINE แล้วกลับมาหน้าแรกได้ปกติ ไม่วนลูปเด้งไปล็อกอินซ้ำ
-    if (LINE_SKIP_INTRO && LINE_GATE_MODE === "booking" && (id === "book" || id === "package") && !lineSession && !lineBypass) {
+    if (LINE_SKIP_INTRO && LINE_GATE_MODE === "booking" && (id === "book" || id === "package") && !lineSession) {
       startLineLogin(id, null); // กลับมาแล้วจะเข้าหน้าที่กดไว้
       return;
     }
@@ -2099,11 +2136,17 @@ export default function AppV2() {
     clearLineSession(); setLineSession(null);
   };
   // ผูกชื่อ+เบอร์ที่กรอกล่าสุดไว้กับบัญชี LINE — ครั้งหน้ากรอกให้อัตโนมัติ (ทำเบื้องหลัง ไม่ให้ลูกค้ารอ)
-  const handleLinePhoneLinked = (name, phone) => {
-    if (!lineSession?.token) return;
-    db.lineLinkPhone(lineSession.token, name, phone).then(r => {
-      if (r?.ok) { const next = { ...lineSession, name, phone }; saveLineSession(next); setLineSession(next); }
-    }).catch(() => {});
+  const handleLinkPhone = async (name, phone) => {
+    if (!lineSession?.token) return { ok: false, error: "line_required" };
+    try {
+      const r = await db.lineLinkPhone(lineSession.token, name, phone);
+      if (r?.ok) {
+        const next = { ...lineSession, name: r.name || name, phone: r.phone || phone };
+        saveLineSession(next); setLineSession(next);
+        return { ok: true };
+      }
+      return { ok: false, error: r?.error };
+    } catch { return { ok: false, error: "network" }; }
   };
 
   const handleLogoTap = () => {
@@ -2137,7 +2180,7 @@ export default function AppV2() {
         package_no_credits: lang==="th" ? "สิทธิ์ในแพ็คเกจหมดแล้ว" : "No credits left in this package",
         package_expired: lang==="th" ? "แพ็คเกจหมดอายุแล้ว" : "This package has expired",
         package_wrong_tier: lang==="th" ? "แพ็คเกจนี้ใช้กับช่วงเวลานี้ไม่ได้" : "This package cannot be used for this time slot",
-      }[error] || (lang==="th" ? "จองไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Booking failed, please try again");
+      }[error] || accountErrMsg(error, lang) || (lang==="th" ? "จองไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Booking failed, please try again");
       alert(msg);
       return;
     }
@@ -2210,12 +2253,9 @@ export default function AppV2() {
             <button className="btn-primary" style={{maxWidth:260}} onClick={() => { window.history.replaceState(null, "", "/"); setLineCbStatus(null); setTab("home"); }}>
               {lang==="th" ? (LINE_GATE_MODE==="gate" || LINE_GATE_MODE==="booking" ? "ลองใหม่อีกครั้ง" : "กลับหน้าแรก") : (LINE_GATE_MODE==="gate" || LINE_GATE_MODE==="booking" ? "Try again" : "Back to Home")}
             </button>
-            {(LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && (
-              <button onClick={() => { doBypass(); window.history.replaceState(null, "", "/"); setLineCbStatus(null); setTab("home"); }}
-                style={{background:"none",border:"none",color:"var(--mu)",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
-                {lang==="th" ? "เข้าใช้งานโดยไม่ใช้ LINE (กรอกชื่อ-เบอร์เอง)" : "Continue without LINE (enter details manually)"}
-              </button>
-            )}
+            <a href={adminTel()} style={{fontSize:13,fontWeight:700,color:"var(--br)",textDecoration:"underline"}}>
+              {lang==="th" ? `ไม่มี LINE หรือเข้าไม่ได้ โทรจองกับแอดมิน ${ADMIN_CONTACT_PHONE}` : `No LINE or can't sign in? Call the admin: ${ADMIN_CONTACT_PHONE}`}
+            </a>
           </>
         )}
       </div>
@@ -2254,9 +2294,9 @@ export default function AppV2() {
     </>
   );
 
-  const needLogin = !lineSession && !lineBypass;
+  const needLogin = !lineSession;
   // ล็อกอินแล้วแต่ LINE ยืนยันว่ายังไม่เป็นเพื่อนกับ OA (false เท่านั้น — ถ้าเช็คไม่ได้เป็น null จะไม่บล็อก กันลูกค้าจองไม่ได้เพราะระบบเรา/LINE ขัดข้อง)
-  const needFriend = (LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && !!lineSession && lineSession.isFriend === false && !lineBypass;
+  const needFriend = (LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && !!lineSession && lineSession.isFriend === false;
   // กลับไปล็อกอินใหม่เพื่อตรวจสถานะเพื่อน โดยจำรายการที่เลือกไว้ (ถ้ามี) ให้กลับมาต่อได้
   const recheckFriend = () => handleLineLogin(
     booking && booking.slot && booking.court
@@ -2300,11 +2340,6 @@ export default function AppV2() {
             ))}
           </div>
         </header>
-        {LINE_GATE_MODE === "prompt" && needLogin && tab === "home" && (
-          <div style={{position:"fixed",inset:0,zIndex:300,background:"rgba(46,26,14,.55)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
-            <LineLoginGate lang={lang} compact onLogin={() => handleLineLogin(null)} onSkip={doBypass} />
-          </div>
-        )}
         <main>
           {blockedByLine && (needLogin
             ? <LineLoginGate lang={lang} compact onLogin={() => handleLineLogin(null)} />
@@ -2312,13 +2347,13 @@ export default function AppV2() {
           {tab==="home" && <HomePage goBook={() => goTab("book")} goPackage={() => goTab("package")} lang={lang} />}
           {!blockedByLine && tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} lang={lang} />}
           {!blockedByLine && tab==="book" && page==="checkout" && booking && (
-            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} onConfirmWithPackage={handleConfirmWithPackage} lineSession={lineSession} onLineLogin={handleLineLogin} onLinePhoneLinked={handleLinePhoneLinked} lang={lang} />
+            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} onConfirmWithPackage={handleConfirmWithPackage} lineSession={lineSession} onLineLogin={handleLineLogin} onLinkPhone={handleLinkPhone} lang={lang} />
           )}
           {!blockedByLine && tab==="book" && page==="payment" && booking && customer && (
             <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} resumeBooking={resumeBooking} onCreated={(id, createdAt) => setResumeBooking({ id, createdAt })} onStartOver={resetBookingFlow} />
           )}
-          {!blockedByLine && tab==="package" && <PackagePage lang={lang} lineSession={lineSession} onLineLogin={handleLineLogin} onLinePhoneLinked={handleLinePhoneLinked} />}
-          {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone || lineSession?.phone || ""} />}
+          {!blockedByLine && tab==="package" && <PackagePage lang={lang} lineSession={lineSession} onLineLogin={handleLineLogin} onLinkPhone={handleLinkPhone} />}
+          {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone || lineSession?.phone || ""} lockedPhone={lineSession?.phone || ""} />}
         </main>
         <TabBar tab={tab} setTab={goTab} lang={lang} />
       </div>
@@ -2393,6 +2428,69 @@ function AdminDashboard({ token, onLogout }) {
     return () => { clearTimeout(t1); clearTimeout(t2); };
   }, [tab, highlightId, bookings]);
 
+  // ── จองแทนลูกค้า (ลูกค้าโทรมาจอง / ไม่มี LINE) ──
+  const START_OPTS = (() => { const o = []; for (let m = DAY_START_MIN; m < DAY_END_MIN; m += 30) o.push(m); return o; })();
+  const [nb, setNb] = useState({ phone: "", name: "", date: toIso(new Date()), courts: [1], startMin: 10 * 60, duration: 60, price: "", status: "reviewing" });
+  const [nbInfo, setNbInfo] = useState(null);
+  const [nbBusy, setNbBusy] = useState(false);
+  const [nbMsg, setNbMsg] = useState(null);
+  const nbAutoUnit = nb.date ? getDurationPrice(Math.floor(nb.startMin / 60), new Date(nb.date + "T00:00:00"), nb.duration).price : 0;
+  const nbUnit = nb.price !== "" ? Number(nb.price) : nbAutoUnit; // ราคาต่อสนาม (ว่าง = ราคาปกติ)
+  const nbNameOk = nb.name.trim().length >= 1 && nb.name.trim().length <= 40;
+  const nbPhoneOk = /^[0-9]{10}$/.test(nb.phone);
+  const nbCanSubmit = nbPhoneOk && nbNameOk && nb.courts.length > 0 && nb.date && Number.isFinite(nbUnit) && nbUnit >= 0 && !nbBusy;
+  useEffect(() => {
+    setNbInfo(null);
+    if (!/^[0-9]{10}$/.test(nb.phone)) return;
+    let cancelled = false;
+    callAdminAction("lookupCustomer", token, { phone: nb.phone }).then(r => {
+      if (cancelled || !r || r.error) return;
+      setNbInfo(r);
+      if (r.name) setNb(prev => (prev.phone === nb.phone && !prev.name ? { ...prev, name: r.name } : prev)); // เบอร์เดิม → เติมชื่อเดิมให้ (แก้ได้)
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nb.phone]);
+  const startNbFromGrid = (courtId, startMin) => { setNb(prev => ({ ...prev, date, courts: [courtId], startMin })); setNbMsg(null); setTab("newbooking"); };
+  const submitNb = async () => {
+    if (!nbCanSubmit) return;
+    const total = Math.round(nbUnit) * nb.courts.length;
+    const ok = window.confirm(
+      `จองให้ ${nb.name.trim()} (${nb.phone})\n` +
+      `${nb.courts.map(c => "Court " + c).join(" + ")} • ${nb.date} • ${minutesToLabel(nb.startMin)}–${minutesToLabel(nb.startMin + nb.duration)}\n` +
+      `ยอดรวม ฿${total.toLocaleString()} • ${nb.status === "confirmed" ? "ชำระแล้ว (ยืนยันทันที)" : "รอชำระ"}\n\nยืนยันการจอง?`);
+    if (!ok) return;
+    setNbBusy(true); setNbMsg(null);
+    const r = await callAdminAction("createAdminBooking", token, {
+      customerId: nb.phone, customerName: nb.name.trim(), courtIds: nb.courts, bookingDate: nb.date,
+      hour: Math.floor(nb.startMin / 60), startMinute: nb.startMin % 60, durationMinutes: nb.duration, price: Math.round(nbUnit), status: nb.status,
+    });
+    setNbBusy(false);
+    if (r?.ok) {
+      setNbMsg({ ok: true, text: `✅ จองให้ ${nb.name.trim()} เรียบร้อย (${nb.courts.map(c => "Court " + c).join(" + ")} ${nb.date} ${minutesToLabel(nb.startMin)})` });
+      setNb(prev => ({ ...prev, phone: "", name: "", price: "" })); setNbInfo(null);
+      loadBookings(); loadQueue();
+    } else {
+      setNbMsg({ ok: false, text: r?.error === "slot_taken" ? `❌ ช่วงเวลานี้มีคนจองแล้ว (Court ${r.court}) — ดูที่แท็บตารางว่าง` : "❌ บันทึกไม่สำเร็จ ตรวจข้อมูลแล้วลองใหม่อีกครั้ง" });
+    }
+  };
+  // แก้ชื่อที่พิมพ์ผิดในการจองที่มีอยู่ (การจองคู่แก้ทั้งคู่)
+  const renameBooking = async (b) => {
+    const n = window.prompt("แก้ชื่อลูกค้า (1–40 ตัวอักษร)", b.customer_name || "");
+    if (n == null) return;
+    const clean = n.trim();
+    if (!clean || clean.length > 40) { alert("ชื่อต้องมี 1–40 ตัวอักษร"); return; }
+    const r = await callAdminAction("updateBookingName", token, { id: b.id, name: clean });
+    if (r?.ok) { loadBookings(); loadQueue(); }
+  };
+  // ลูกค้า: เบอร์ที่ผูกกับ LINE + ปลดล็อก
+  const [linkedPhones, setLinkedPhones] = useState({});
+  const unlinkPhone = async (phone) => {
+    if (!window.confirm(`ปลดล็อกเบอร์ ${phone} จากบัญชี LINE?\n\nลูกค้าจะผูกเบอร์ใหม่ (หรือเบอร์เดิม) ได้อีกครั้งตอนจองครั้งถัดไป ประวัติการจองเดิมยังอยู่กับเบอร์เดิม`)) return;
+    const r = await callAdminAction("unlinkLinePhone", token, { phone });
+    if (r?.ok) loadCustomers();
+  };
+
   const [pkgQueue, setPkgQueue] = useState([]);
   const [pkgQueueLoading, setPkgQueueLoading] = useState(true);
   const [allPkgs, setAllPkgs] = useState([]);
@@ -2439,8 +2537,9 @@ function AdminDashboard({ token, onLogout }) {
     setDiscounts(rows || []);
   };
   const loadCustomers = async () => {
-    const { customers: rows } = await callAdminAction("customers", token, {});
+    const { customers: rows, linked } = await callAdminAction("customers", token, {});
     setCustomers(rows || []);
+    setLinkedPhones(Object.fromEntries((linked || []).map(l => [l.phone, l.display_name || "LINE"])));
   };
 
   const loadReport = async () => {
@@ -2610,7 +2709,7 @@ function AdminDashboard({ token, onLogout }) {
         </header>
 
         <div style={{background:"#fff",borderBottom:"1px solid var(--dv)",display:"flex",padding:"0 20px",overflowX:"auto"}}>
-          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["packages","🎟 แพ็คเกจ"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
+          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["newbooking","➕ จองแทน"],["packages","🎟 แพ็คเกจ"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
             <button key={id} onClick={() => setTab(id)} style={{padding:"13px 16px",background:"none",border:"none",borderBottom:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",fontWeight:tab===id?700:400,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
               {label}
             </button>
@@ -2631,7 +2730,7 @@ function AdminDashboard({ token, onLogout }) {
                 <Dot color="#c0392b" label="ไม่ว่าง / มีคนจอง" />
                 <Dot color="#663924" label="ปิดสนาม" />
               </div>
-              <p style={{fontSize:11.5,color:"var(--mu)",margin:"-6px 0 12px"}}>👆 กดที่ช่องที่มีชื่อลูกค้า เพื่อไปดูรายละเอียดการจองนั้นในแท็บ "การจอง" (สีแดง = ยืนยันแล้ว / ส้ม = รอตรวจสอบ / เหลือง = รอชำระ)</p>
+              <p style={{fontSize:11.5,color:"var(--mu)",margin:"-6px 0 12px"}}>👆 กดช่องที่มีชื่อลูกค้า = ดูรายละเอียดการจอง / กดช่อง "ว่าง" = จองช่วงนั้นให้ลูกค้า (สีแดง = ยืนยันแล้ว / ส้ม = รอตรวจสอบ / เหลือง = รอชำระ)</p>
               <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",padding:0,boxShadow:"var(--sh)",overflow:"auto",maxHeight:640}}>
                 {loading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> : (() => {
                   const dateObj = new Date(date+"T00:00:00");
@@ -2688,7 +2787,7 @@ function AdminDashboard({ token, onLogout }) {
                                   if (isFullyBookedDate(dateObj) || isManuallyClosed(dateObj, courtId, startMin, endMin)) {
                                     return <td key={courtId} style={{textAlign:"center",background:"rgba(102,57,36,.08)",color:"#663924",fontWeight:700,fontSize:12.5,verticalAlign:"middle"}}>ปิด</td>;
                                   }
-                                  return <td key={courtId} style={{textAlign:"center",background:"rgba(45,122,79,.08)",color:"#2d7a4f",fontWeight:700,fontSize:12.5,verticalAlign:"middle"}}>ว่าง</td>;
+                                  return <td key={courtId} onClick={() => startNbFromGrid(courtId, startMin)} title="กดเพื่อจองช่วงนี้ให้ลูกค้า" style={{textAlign:"center",background:"rgba(45,122,79,.08)",color:"#2d7a4f",fontWeight:700,fontSize:12.5,verticalAlign:"middle",cursor:"pointer"}}>ว่าง</td>;
                                 })}
                               </tr>
                             );
@@ -2722,7 +2821,7 @@ function AdminDashboard({ token, onLogout }) {
                               <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short"})}</td>
                               <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
                               <td>{fmtTime(b)}</td>
-                              <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
+                              <td style={{fontWeight:600}}>{b.customer_name || "-"} <button onClick={() => renameBooking(b)} title="แก้ชื่อ" style={{border:"none",background:"none",cursor:"pointer",fontSize:12,padding:"0 2px"}}>✏️</button>{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}</td>
                               <td>{b.customer_id}</td>
                               <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
                               <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
@@ -2773,7 +2872,7 @@ function AdminDashboard({ token, onLogout }) {
                           <tr key={b.id} id={`bk-${b.id}`} style={highlightId === b.id ? {background:"rgba(255,213,74,.4)",outline:"2px solid #E8A200"} : undefined}>
                             <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
                             <td>{fmtTime(b)}</td>
-                            <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
+                            <td style={{fontWeight:600}}>{b.customer_name || "-"} <button onClick={() => renameBooking(b)} title="แก้ชื่อ" style={{border:"none",background:"none",cursor:"pointer",fontSize:12,padding:"0 2px"}}>✏️</button>{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}</td>
                             <td>{b.customer_id}</td>
                             <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
                             <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
@@ -2793,6 +2892,79 @@ function AdminDashboard({ token, onLogout }) {
                     </tbody>
                   </table>
                 )}
+              </div>
+            </div>
+          )}
+
+          {tab==="newbooking" && (
+            <div style={{maxWidth:560}}>
+              <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:4}}>➕ จองแทนลูกค้า</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginBottom:14,lineHeight:1.6}}>สำหรับลูกค้าที่โทรมาจอง หรือไม่มี LINE ไม่ต้องล็อกอิน LINE ไม่มีโปรอัตโนมัติ (กำหนดราคาเองได้) ถ้าลูกค้าล็อกอิน LINE และผูกเบอร์นี้ภายหลัง ชื่อ LINE จะมาแทนชื่อที่ใส่ไว้ตรงนี้</p>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",padding:18,boxShadow:"var(--sh)",display:"flex",flexDirection:"column",gap:14}}>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>เบอร์โทรลูกค้า</label>
+                  <input value={nb.phone} onChange={e => setNb(p => ({ ...p, phone: e.target.value.replace(/\D/g, "").slice(0, 10) }))} inputMode="numeric" placeholder="0812345678"
+                    style={{width:"100%",padding:"11px 12px",borderRadius:8,border:`1.5px solid ${nb.phone && !nbPhoneOk ? "#c0392b" : "var(--dv)"}`,fontSize:15,outline:"none"}} />
+                  {nbInfo && (
+                    <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"var(--mu)"}}>
+                      {nbInfo.bookingsCount > 0 ? `เคยจอง ${nbInfo.bookingsCount} รายการ` : "ลูกค้าใหม่ (ยังไม่เคยจอง) — โปรจองครั้งแรก ฿450 จ.–ศ. / ฿490 ส.–อา. (60 นาที) ให้ใส่ราคาเองด้านล่าง"}
+                      {" • "}{nbInfo.linked ? `🔗 ผูก LINE แล้ว (${nbInfo.lineName || "LINE"})` : "ยังไม่ผูก LINE"}
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ชื่อลูกค้า (ไม่เกิน 40 ตัวอักษร)</label>
+                  <input value={nb.name} onChange={e => setNb(p => ({ ...p, name: e.target.value }))} maxLength={40} placeholder="ชื่อลูกค้า"
+                    style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,outline:"none"}} />
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>วันที่เล่น</label>
+                    <input type="date" value={nb.date} onChange={e => setNb(p => ({ ...p, date: e.target.value }))} style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>เวลาเริ่ม</label>
+                    <select value={nb.startMin} onChange={e => setNb(p => ({ ...p, startMin: Number(e.target.value) }))} style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,background:"#fff"}}>
+                      {START_OPTS.map(m => <option key={m} value={m}>{minutesToLabel(m)}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ระยะเวลา</label>
+                    <select value={nb.duration} onChange={e => setNb(p => ({ ...p, duration: Number(e.target.value) }))} style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,background:"#fff"}}>
+                      {[30, 60, 90, 120].map(d => <option key={d} value={d}>{d} นาที</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>สนาม</label>
+                    <div style={{display:"flex",gap:8}}>
+                      {[1, 2].map(c => {
+                        const on = nb.courts.includes(c);
+                        return <button key={c} onClick={() => setNb(p => ({ ...p, courts: on ? p.courts.filter(x => x !== c) : [...p.courts, c].sort() }))}
+                          style={{flex:1,padding:"10px 6px",borderRadius:8,border:`2px solid ${on ? "var(--or)" : "var(--dv)"}`,background:on ? "var(--or-bg)" : "#fff",color:on ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer"}}>{on ? "✓ " : ""}Court {c}</button>;
+                      })}
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ราคาต่อสนาม (บาท) — เว้นว่าง = ราคาปกติ ฿{nbAutoUnit.toLocaleString()}</label>
+                  <input type="number" inputMode="numeric" value={nb.price} onChange={e => setNb(p => ({ ...p, price: e.target.value }))} placeholder={String(nbAutoUnit)}
+                    style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,outline:"none"}} />
+                  <p style={{fontSize:12,color:"var(--mu)",marginTop:6}}>ยอดรวม <b style={{color:"var(--or)"}}>฿{(Math.round(nbUnit || 0) * nb.courts.length).toLocaleString()}</b> ({nb.courts.length} สนาม)</p>
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>สถานะ</label>
+                  <div style={{display:"flex",gap:8}}>
+                    {[["reviewing", "⏳ รอชำระ (ค้างไว้ ไม่หมดอายุ)"], ["confirmed", "✅ ชำระแล้ว (ยืนยันทันที)"]].map(([v, label]) => (
+                      <button key={v} onClick={() => setNb(p => ({ ...p, status: v }))}
+                        style={{flex:1,padding:"10px 6px",borderRadius:8,border:`2px solid ${nb.status === v ? "var(--or)" : "var(--dv)"}`,background:nb.status === v ? "var(--or-bg)" : "#fff",color:nb.status === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+                    ))}
+                  </div>
+                </div>
+                <button onClick={submitNb} disabled={!nbCanSubmit}
+                  style={{padding:"13px",borderRadius:10,border:"none",background:nbCanSubmit ? "linear-gradient(90deg,var(--or),var(--or2))" : "var(--cr2)",color:nbCanSubmit ? "#fff" : "var(--mu)",fontWeight:800,fontSize:15,cursor:nbCanSubmit ? "pointer" : "not-allowed",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                  {nbBusy ? "⏳ กำลังบันทึก..." : "บันทึกการจอง"}
+                </button>
+                {nbMsg && <p style={{fontSize:13,fontWeight:600,color:nbMsg.ok ? "#2d7a4f" : "#c0392b",lineHeight:1.6}}>{nbMsg.text}</p>}
               </div>
             </div>
           )}
@@ -3124,13 +3296,16 @@ function AdminDashboard({ token, onLogout }) {
           {tab==="customers" && (
             <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
               <table className="adm-table">
-                <thead><tr><th>#</th><th>ชื่อ</th><th>เบอร์โทร</th></tr></thead>
+                <thead><tr><th>#</th><th>ชื่อ</th><th>เบอร์โทร</th><th>LINE</th></tr></thead>
                 <tbody>
                   {customers.map((c,i) => (
                     <tr key={c.customer_id}>
                       <td style={{color:"var(--mu)"}}>{i+1}</td>
                       <td style={{fontWeight:600}}>{c.customer_name}</td>
                       <td style={{fontFamily:"monospace"}}>{c.customer_id}</td>
+                      <td>{linkedPhones[c.customer_id]
+                        ? <span style={{fontSize:12}}>🔗 {linkedPhones[c.customer_id]} <button onClick={() => unlinkPhone(c.customer_id)} style={{marginLeft:6,padding:"3px 8px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:11,cursor:"pointer"}}>ปลดล็อกเบอร์</button></span>
+                        : <span style={{fontSize:12,color:"var(--mu)"}}>ยังไม่ผูก</span>}</td>
                     </tr>
                   ))}
                 </tbody>
