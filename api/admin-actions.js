@@ -18,6 +18,20 @@ const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const TOKEN_SECRET = process.env.ADMIN_TOKEN_SECRET || ADMIN_PASSWORD;
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000; // โทเคนหมดอายุใน 12 ชั่วโมง
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const ADMIN_TELEGRAM_CHAT_IDS = process.env.ADMIN_TELEGRAM_CHAT_IDS; // คั่นด้วยจุลภาค
+const minutesToLabel = (mins) => `${String(Math.floor(mins / 60)).padStart(2, "0")}:${String(mins % 60).padStart(2, "0")}`;
+
+async function notifyTelegram(text) {
+  if (!TELEGRAM_BOT_TOKEN || !ADMIN_TELEGRAM_CHAT_IDS) return;
+  const chatIds = ADMIN_TELEGRAM_CHAT_IDS.split(",").map(s => s.trim()).filter(Boolean);
+  await Promise.all(chatIds.map(chatId =>
+    fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+    }).catch(() => {})
+  ));
+}
 
 function sign(expiry) {
   return crypto.createHmac("sha256", TOKEN_SECRET).update(String(expiry)).digest("hex");
@@ -52,6 +66,16 @@ async function sb(path, options = {}) {
   const ct = res.headers.get("content-type") || "";
   const body = ct.includes("application/json") ? await res.json() : null;
   return { ok: res.ok, body };
+}
+
+async function getActiveIntervals(bookingDate, courtId) {
+  const { body } = await sb(
+    `bookings?booking_date=eq.${bookingDate}&court_id=eq.${courtId}&status=neq.cancelled&select=hour,start_minute,duration_minutes,status,created_time`
+  );
+  const now = Date.now();
+  return (body || [])
+    .filter((b) => (b.status === "pending" ? now - new Date(b.created_time).getTime() < 5 * 60 * 1000 : true))
+    .map((b) => { const s = (b.hour || 0) * 60 + (b.start_minute || 0); return [s, s + (b.duration_minutes || 60)]; });
 }
 
 export default async function handler(req, res) {
@@ -100,7 +124,8 @@ export default async function handler(req, res) {
       }
       case "customers": {
         const { body } = await sb(`customers?select=*`);
-        res.status(200).json({ customers: body || [] });
+        const { body: linked } = await sb(`line_users?phone=not.is.null&select=phone,display_name`);
+        res.status(200).json({ customers: body || [], linked: linked || [] });
         return;
       }
       case "report": {
@@ -173,6 +198,90 @@ export default async function handler(req, res) {
         for (const k of (pq.body || [])) { const r = row(keyOf(k.utm)); r.customers.add(k.customer_id); r.packages++; r.packageRevenue += k.price || 0; }
         const rows = Object.values(map).map(r => ({ ...r, customers: r.customers.size })).sort((a, b) => (b.bookingRevenue + b.packageRevenue) - (a.bookingRevenue + a.packageRevenue));
         res.status(200).json({ rows });
+        return;
+      }
+      case "lookupCustomer": {
+        // ใช้ในหน้าจองแทนลูกค้า: ใส่เบอร์แล้วดึงชื่อเดิม + สถานะ (ผูก LINE แล้วไหม / เคยจองกี่ครั้ง)
+        const { phone } = p;
+        if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
+        const { body: cust } = await sb(`customers?customer_id=eq.${phone}&select=customer_name`);
+        const { body: line } = await sb(`line_users?phone=eq.${phone}&select=display_name,customer_name&limit=1`);
+        const { body: hist } = await sb(`bookings?customer_id=eq.${phone}&status=in.(confirmed,reviewing)&select=id&limit=50`);
+        res.status(200).json({
+          name: (cust || [])[0]?.customer_name || null,
+          linked: (line || []).length > 0,
+          lineName: (line || [])[0]?.display_name || null,
+          bookingsCount: (hist || []).length,
+        });
+        return;
+      }
+      case "createAdminBooking": {
+        // แอดมินจองแทนลูกค้า (โทรมาจอง/ไม่มี LINE) — ไม่ต้องล็อกอิน LINE, ไม่มีโปรอัตโนมัติ, แอดมินกำหนดราคาต่อสนามเอง
+        // ถ้าภายหลังลูกค้าล็อกอิน LINE แล้วผูกเบอร์นี้ ชื่อ LINE จะแทนชื่อที่แอดมินใส่ในข้อมูลลูกค้า (ดู lineLinkPhone)
+        const { customerId, customerName, courtIds, bookingDate, hour, startMinute, durationMinutes, price, status } = p;
+        if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid phone" }); return; }
+        const name = String(customerName || "").trim();
+        if (name.length < 1 || name.length > 40) { res.status(400).json({ error: "invalid name" }); return; }
+        const ids = Array.isArray(courtIds) ? [...new Set(courtIds.map(Number))].sort() : [];
+        if (ids.length < 1 || ids.length > 2 || ids.some(c => c !== 1 && c !== 2)) { res.status(400).json({ error: "invalid courts" }); return; }
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(bookingDate || "")) { res.status(400).json({ error: "invalid date" }); return; }
+        if (!Number.isInteger(hour) || hour < 0 || hour > 23 || ![0, 30].includes(startMinute || 0)) { res.status(400).json({ error: "invalid time" }); return; }
+        if (![30, 60, 90, 120].includes(durationMinutes)) { res.status(400).json({ error: "invalid duration" }); return; }
+        const unit = Number(price);
+        if (!Number.isFinite(unit) || unit < 0 || unit > 20000) { res.status(400).json({ error: "invalid price" }); return; }
+        if (!["confirmed", "reviewing"].includes(status)) { res.status(400).json({ error: "invalid status" }); return; }
+
+        const startMin = hour * 60 + (startMinute || 0);
+        const endMin = startMin + durationMinutes;
+        for (const cid of ids) {
+          const taken = await getActiveIntervals(bookingDate, cid);
+          if (taken.some(([s, e]) => startMin < e && endMin > s)) { res.status(409).json({ error: "slot_taken", court: cid }); return; }
+        }
+
+        // ลูกค้าใหม่ → สร้างข้อมูลลูกค้าด้วยชื่อที่แอดมินใส่ / ลูกค้าเดิม → ไม่ทับชื่อเดิม
+        await sb(`customers`, { method: "POST", headers: { Prefer: "resolution=ignore-duplicates" }, body: JSON.stringify({ customer_id: customerId, customer_name: name }) });
+
+        const groupId = ids.length > 1 ? crypto.randomUUID() : null;
+        const baseRow = (cid) => ({
+          court_id: cid, customer_id: customerId, customer_name: name,
+          booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
+          price: Math.round(unit), discount_amount: 0, status, ...(groupId ? { group_id: groupId } : {}),
+        });
+        let ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(ids.map(c => ({ ...baseRow(c), booked_by: "admin" }))) });
+        if (!ins.ok) {
+          // คอลัมน์ booked_by ยังไม่ถูกสร้าง (ยังไม่ได้รัน SQL) — บันทึกการจองให้ก่อน ไม่ให้งานหลักพัง
+          console.error("createAdminBooking: insert with booked_by failed — run add-booked-by-column.sql");
+          ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(ids.map(baseRow)) });
+        }
+        if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== ids.length) { res.status(500).json({ error: "insert_failed" }); return; }
+
+        await notifyTelegram(
+          `📞 <b>แอดมินจองให้ลูกค้า</b>\n\n` +
+          `👤 ${name}\n📞 ${customerId}\n` +
+          `🎾 ${ids.map(c => `Court ${c}`).join(" + ")}\n📅 ${bookingDate}\n` +
+          `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n` +
+          `💰 ฿${(Math.round(unit) * ids.length).toLocaleString()} (${status === "confirmed" ? "ชำระแล้ว" : "รอชำระ"})`
+        );
+        res.status(200).json({ ok: true, bookings: ins.body });
+        return;
+      }
+      case "updateBookingName": {
+        // แก้ชื่อที่พิมพ์ผิดในการจองที่มีอยู่ (การจองคู่แก้ทั้งคู่) — ไม่แตะเบอร์/ราคา/สถานะ
+        const { id, name } = p;
+        const clean = String(name || "").trim();
+        if (!id || clean.length < 1 || clean.length > 40) { res.status(400).json({ error: "invalid" }); return; }
+        const { body } = await sb(`bookings?id=eq.${id}&select=group_id`);
+        const gid = (body || [])[0]?.group_id;
+        await sb(gid ? `bookings?group_id=eq.${encodeURIComponent(gid)}` : `bookings?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ customer_name: clean }) });
+        res.status(200).json({ ok: true });
+        return;
+      }
+      case "unlinkLinePhone": {
+        // ปลดล็อกเบอร์ที่ผูกกับบัญชี LINE (เช่นลูกค้ากรอกเบอร์ผิดตอนผูก หรือเปลี่ยนเบอร์จริง) — ลูกค้าจะได้ผูกเบอร์ใหม่ตอนจองครั้งถัดไป
+        const { phone } = p;
+        if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
+        await sb(`line_users?phone=eq.${phone}`, { method: "PATCH", body: JSON.stringify({ phone: null }) });
+        res.status(200).json({ ok: true });
         return;
       }
       case "packagesQueue": {
