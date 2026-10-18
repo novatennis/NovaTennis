@@ -41,11 +41,11 @@ const db = {
     if (error || !bookings?.length) return { error: error || "insert_failed" };
     return { booking: bookings[0], bookings }; // booking = แถวแรก (ใช้ id นี้ส่งสลิป เซิร์ฟเวอร์จะครอบคลุมทั้งกลุ่มให้เอง)
   },
-  async createBookingWithPackage({ courtId, customerId, customerName, bookingDate, hour, startMinute, packageId }) {
-    const { booking, error } = await callBookingAction("createBooking", {
-      courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes: 60, packageId,
+  async createBookingWithPackage({ courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, packageId }) {
+    const { booking, error, available, needed } = await callBookingAction("createBooking", {
+      courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, packageId,
     });
-    if (error) return { error };
+    if (error) return { error, available, needed };
     return { booking };
   },
   async createPackage({ tier, credits, customerId, customerName }) {
@@ -300,7 +300,13 @@ const saveLineSession = (s) => { try { localStorage.setItem(LINE_SESSION_KEY, JS
 const clearLineSession = () => { try { localStorage.removeItem(LINE_SESSION_KEY); } catch { /* no-op */ } };
 
 // ตัดชื่อให้ไม่เกิน 16 ตัวอักษร (ตามกฎของฟอร์ม) โดยไม่ตัดกลาง emoji
-const toFormName = (s) => (s || "").slice(0, 16).replace(/[\uD800-\uDBFF]$/, "").trim();
+// ชื่อจาก LINE ไม่เกิน 20 ตัวอักษร (ข้อกำหนดของ LINE) — นับเป็น "ตัวอักษรที่ตามองเห็น" ชื่อไทยที่มีสระ/วรรณยุกต์และ emoji จึงไม่ถูกตัดผิด
+const graphemeList = (s) => {
+  const str = String(s ?? "");
+  try { return Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(str), (x) => x.segment); }
+  catch { return Array.from(str); }
+};
+const toFormName = (s) => graphemeList(String(s || "").trim()).slice(0, 20).join("").trim();
 
 // pendingCheckout = ข้อมูลที่ลูกค้าเลือกไว้ (วัน/สนาม/เวลา) เก็บไว้ก่อนเด้งไปหน้า LINE แล้วคืนให้ตอนกลับมา
 function startLineLogin(returnTarget = "home", pendingCheckout = null) {
@@ -1054,13 +1060,15 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
   const courts = booking.courts; // มี 2 สนามเมื่อเป็นการจองพร้อมกัน (โอนครั้งเดียว)
   const isGroup = !!(courts && courts.length > 1);
   // ถ้าล็อกอิน LINE อยู่ กรอกชื่อ/เบอร์ให้อัตโนมัติ (แก้ไขเองได้เสมอ)
-  const [name, setName] = useState(() => toFormName(lineSession?.name || lineSession?.displayName));
+  const lineName = toFormName(lineSession?.displayName || lineSession?.name) || "ลูกค้า LINE"; // ชื่อในการจอง = ชื่อ LINE เสมอ (เซิร์ฟเวอร์ก็ใช้ชื่อนี้ ไม่เชื่อชื่อที่ส่งมาจากหน้าเว็บ)
+  const [name, setName] = useState(lineName);
+  useEffect(() => { setName(lineName); }, [lineName]);
   const [phone, setPhone] = useState(() => lineSession?.phone || "");
   const [discountCode, setDiscountCode] = useState("");
   const [discount, setDiscount] = useState(null);
   const [discountMsg, setDiscountMsg] = useState("");
   const [checkingCode, setCheckingCode] = useState(false);
-  const nameOk = name.trim().length >= 1 && name.length <= 16;
+  const nameOk = name.trim().length >= 1; // ชื่อมาจาก LINE (ตัดที่ 20 ตัวอักษรไว้แล้ว)
   const phoneOk = /^[0-9]{10}$/.test(phone);
   const phoneLocked = !!lineSession?.phone;
   useEffect(() => { if (lineSession?.phone) setPhone(lineSession.phone); }, [lineSession?.phone]); // ผูกกับบัญชี LINE แล้ว → ล็อก ไม่ให้แก้ (เซิร์ฟเวอร์ก็ใช้เบอร์ที่ผูกไว้เสมอ)
@@ -1068,25 +1076,39 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
   const [linkErr, setLinkErr] = useState("");
   const ok = nameOk && phoneOk;
 
-  // เช็คว่ามีสิทธิ์แพ็คเกจที่ใช้กับช่วงเวลานี้ได้ไหม (ต้องจอง 60 นาทีพอดี + tier ตรงกัน + ยังไม่หมดอายุ)
+  // เช็คว่ามีสิทธิ์แพ็คเกจที่ใช้กับรายการนี้ได้ไหม: จอง 60 นาที (ตัด 1 ครั้ง) หรือ 120 นาที (ตัด 2 ครั้ง) + ยังไม่หมดอายุ
+  // + สิทธิ์เหลือพอ (หักที่จองค้างรอแอดมินยืนยันแล้ว) + ทุกชั่วโมงที่จองอยู่ในช่วงที่แพ็คครอบคลุม (เซิร์ฟเวอร์ตรวจซ้ำอีกชั้น)
   const [matchedPkg, setMatchedPkg] = useState(null);
+  const [pkgNote, setPkgNote] = useState(""); // มีแพ็คเกจ แต่ใช้ไม่ได้เพราะอะไร (ไว้บอกลูกค้า)
   const [useCredit, setUseCredit] = useState(false);
   const [checkingPkg, setCheckingPkg] = useState(false);
+  const pkgUnits = slot.durationMinutes === 120 ? 2 : slot.durationMinutes === 60 ? 1 : 0;
   useEffect(() => {
-    setMatchedPkg(null); setUseCredit(false);
-    if (!phoneOk || slot.durationMinutes !== 60 || isGroup) return;
+    setMatchedPkg(null); setPkgNote(""); setUseCredit(false);
+    if (!phoneOk || isGroup) return;
+    let cancelled = false;
     setCheckingPkg(true);
     db.myPackages(phone).then(rows => {
+      if (cancelled) return;
       const today = toIso(new Date());
+      const live = (rows || []).filter(p => p.status === "active" && (!p.expiry_date || p.expiry_date >= today) && p.remaining_credits - (p.reserved_credits || 0) > 0);
+      if (live.length === 0) { setCheckingPkg(false); return; }
+      if (pkgUnits === 0) { setPkgNote(lang==="th" ? "แพ็คเกจใช้จองได้เฉพาะ 60 หรือ 120 นาที (ตอนนี้เลือกอยู่ " + slot.durationMinutes + " นาที)" : "Packages can only book 60 or 120 minutes."); setCheckingPkg(false); return; }
+      const wkend = date.getDay() === 0 || date.getDay() === 6;
+      const hourPeak = (i) => wkend || (slot.hour + i) >= 16;
+      const tierCovers = (p) => Array.from({ length: pkgUnits }, (_, i) => i).every(i => p.tier === "peak" || !hourPeak(i));
       const slotTier = slot.peak ? "peak" : "offpeak";
-      // แพ็ค Peak ใช้ได้ทั้ง Peak และ Off Peak — แพ็ค Off Peak ใช้ได้เฉพาะช่วง Off Peak
-      const usable = (rows || []).filter(p => p.status === "active" && p.remaining_credits > 0 && (!p.expiry_date || p.expiry_date >= today) && (p.tier === "peak" || p.tier === slotTier));
+      const usable = live.filter(p => tierCovers(p) && p.remaining_credits - (p.reserved_credits || 0) >= pkgUnits);
       // ใช้แพ็คที่ตรงช่วงเวลาก่อน (เก็บแพ็ค Peak ไว้ใช้ช่วงที่จำเป็น) แล้วเรียงตามวันหมดอายุใกล้สุดก่อน
       usable.sort((x, y) => ((x.tier === slotTier ? 0 : 1) - (y.tier === slotTier ? 0 : 1)) || String(x.expiry_date || "").localeCompare(String(y.expiry_date || "")));
-      setMatchedPkg(usable[0] || null);
+      if (usable[0]) setMatchedPkg({ ...usable[0], available: usable[0].remaining_credits - (usable[0].reserved_credits || 0) });
+      else if (!live.some(tierCovers)) setPkgNote(lang==="th" ? "แพ็คเกจของคุณใช้กับช่วงเวลานี้ไม่ได้ (แพ็ค Off Peak ใช้ได้เฉพาะ จ.–ศ. ก่อน 16:00 ทุกชั่วโมงที่จอง)" : "Your package doesn't cover this time (Off Peak packages: Mon–Fri before 16:00, every hour booked).");
+      else setPkgNote(lang==="th" ? `สิทธิ์ในแพ็คเกจไม่พอสำหรับรายการนี้ (ต้องใช้ ${pkgUnits} ครั้ง ไม่นับสิทธิ์ที่จองไว้รอแอดมินยืนยัน)` : `Not enough package credits (need ${pkgUnits}; credits waiting for admin confirmation are reserved).`);
       setCheckingPkg(false);
-    }).catch(() => setCheckingPkg(false));
-  }, [phone, phoneOk, slot.durationMinutes, slot.peak, isGroup]);
+    }).catch(() => { if (!cancelled) setCheckingPkg(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phone, phoneOk, slot.durationMinutes, slot.peak, slot.hour, isGroup]);
 
   // โปรโมชั่นจองครั้งแรก — เฉพาะ 60 นาที และยังไม่เคยจองที่ไม่ถูกยกเลิกมาก่อนเลย (เซิร์ฟเวอร์เป็นคนชี้ขาดตอนยืนยันจริงอีกชั้น)
   const [firstTimePrice, setFirstTimePrice] = useState(null);
@@ -1180,9 +1202,9 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
         )}
         <div>
           <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.name}</label>
-          <input value={name} onChange={e => setName(e.target.value)} maxLength={16} placeholder={lang==="th"?"กรอกชื่อของท่าน":"Enter your name"}
-            style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:`1.5px solid ${name&&!nameOk?"#c0392b":"var(--dv)"}`,color:"var(--tx)",outline:"none"}} />
-          <p style={{fontSize:11,color:"var(--mu)",marginTop:5,textAlign:"right"}}>{name.length}/16</p>
+          <input value={name} readOnly placeholder={lang==="th"?"ชื่อจาก LINE":"Name from LINE"}
+            style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"var(--cr2)",border:"1.5px solid var(--dv)",color:"var(--mu)",outline:"none"}} />
+          <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>{lang==="th" ? "👤 ใช้ชื่อจากบัญชี LINE ของคุณ (เปลี่ยนชื่อได้ที่แอป LINE แล้วเข้าสู่ระบบใหม่)" : "👤 Taken from your LINE account (change it in the LINE app, then sign in again)."}</p>
         </div>
         <div>
           <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.phone}</label>
@@ -1195,10 +1217,13 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
             <div style={{width:20,height:20,borderRadius:6,flexShrink:0,marginTop:1,border:`2px solid ${useCredit?"var(--or)":"var(--dv)"}`,background:useCredit?"var(--or)":"#fff",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,fontWeight:800}}>{useCredit?"✓":""}</div>
             <div>
               <p style={{fontSize:13.5,fontWeight:700,color:"var(--br)"}}>🎟 {lang==="th"?"ใช้สิทธิ์จากแพ็คเกจ":"Use package credit"}</p>
-              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือ ${matchedPkg.remaining_credits} ครั้ง — ไม่ต้องชำระเงินเพิ่ม`:`${matchedPkg.remaining_credits} sessions left — no extra payment needed`}</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`รายการนี้ใช้ ${pkgUnits} ครั้ง (${slot.durationMinutes} นาที) • ใช้ได้ ${matchedPkg.available} ครั้ง — ไม่ต้องชำระเงินเพิ่ม`:`This booking uses ${pkgUnits} credit(s) (${slot.durationMinutes} min) • ${matchedPkg.available} available — no extra payment`}</p>
               <p style={{fontSize:11,color:"var(--mu)",marginTop:3}}>{lang==="th"?"* รอแอดมินยืนยันก่อน ถึงจะหักสิทธิ์จริง (เหมือนการจองปกติ)":"* Admin confirmation required before a credit is actually deducted"}</p>
             </div>
           </div>
+        )}
+        {!matchedPkg && pkgNote && (
+          <p style={{fontSize:12,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:10,padding:"9px 11px",lineHeight:1.6}}>🎟 {pkgNote}</p>
         )}
         {!useCredit && firstTimeEligible && (
           <div style={{display:"flex",gap:10,alignItems:"flex-start",padding:"13px 14px",borderRadius:10,border:"1.5px solid #2d7a4f",background:"rgba(45,122,79,.08)"}}>
@@ -1540,7 +1565,9 @@ function Dot({ color, label }) {
 function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
   const t = T[lang];
   const [selected, setSelected] = useState(null); // { tier, credits, price, days }
-  const [name, setName] = useState(() => toFormName(lineSession?.name || lineSession?.displayName));
+  const lineName = toFormName(lineSession?.displayName || lineSession?.name) || "ลูกค้า LINE"; // ชื่อในการจอง = ชื่อ LINE เสมอ (เซิร์ฟเวอร์ก็ใช้ชื่อนี้ ไม่เชื่อชื่อที่ส่งมาจากหน้าเว็บ)
+  const [name, setName] = useState(lineName);
+  useEffect(() => { setName(lineName); }, [lineName]);
   const [phone, setPhone] = useState(() => lineSession?.phone || "");
   const [creating, setCreating] = useState(false);
   const [createErr, setCreateErr] = useState("");
@@ -1560,7 +1587,7 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lineSession?.phone]);
 
-  const nameOk = name.trim().length >= 1 && name.length <= 16;
+  const nameOk = name.trim().length >= 1; // ชื่อมาจาก LINE (ตัดที่ 20 ตัวอักษรไว้แล้ว)
   const phoneOk = /^[0-9]{10}$/.test(phone);
   const phoneLocked = !!lineSession?.phone;
   useEffect(() => { if (lineSession?.phone) { setPhone(lineSession.phone); setLookupPhone(lineSession.phone); } }, [lineSession?.phone]);
@@ -1596,7 +1623,7 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
   };
 
   if (pkg) {
-    return <PackagePaymentView pkg={pkg} lang={lang} onDone={() => { setPkg(null); setSelected(null); setName(toFormName(lineSession?.name || lineSession?.displayName)); setPhone(lineSession?.phone || ""); }} />;
+    return <PackagePaymentView pkg={pkg} lang={lang} onDone={() => { setPkg(null); setSelected(null); setName(lineName); setPhone(lineSession?.phone || ""); }} />;
   }
 
   const pkgStatusInfo = (s) => {
@@ -1671,7 +1698,7 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
                     </div>
                     {p.status==="active" && !expired && (
                       <>
-                        <Row label={lang==="th"?"เหลือ":"Remaining"} val={`${p.remaining_credits} / ${p.total_credits} ${lang==="th"?"ครั้ง":"sessions"}`} />
+                        <Row label={lang==="th"?"เหลือ":"Remaining"} val={`${p.remaining_credits} / ${p.total_credits} ${lang==="th"?"ครั้ง":"sessions"}${p.reserved_credits > 0 ? (lang==="th" ? ` (จองรอยืนยัน ${p.reserved_credits})` : ` (${p.reserved_credits} pending)`) : ""}`} />
                         <Row label={lang==="th"?"หมดอายุ":"Expires"} val={new Date(p.expiry_date).toLocaleDateString(lang==="th"?"th-TH":"en-GB",{year:"numeric",month:"short",day:"numeric"})} />
                       </>
                     )}
@@ -1741,8 +1768,9 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
             )}
             <div>
               <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.name}</label>
-              <input value={name} onChange={e => setName(e.target.value)} maxLength={16} placeholder={lang==="th"?"กรอกชื่อของท่าน":"Enter your name"}
-                style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:`1.5px solid ${name&&!nameOk?"#c0392b":"var(--dv)"}`,color:"var(--tx)",outline:"none"}} />
+              <input value={name} readOnly placeholder={lang==="th"?"ชื่อจาก LINE":"Name from LINE"}
+                style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"var(--cr2)",border:"1.5px solid var(--dv)",color:"var(--mu)",outline:"none"}} />
+              <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>{lang==="th" ? "👤 ใช้ชื่อจากบัญชี LINE ของคุณ (เปลี่ยนชื่อได้ที่แอป LINE แล้วเข้าสู่ระบบใหม่)" : "👤 Taken from your LINE account (change it in the LINE app, then sign in again)."}</p>
             </div>
             <div>
               <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.phone}</label>
@@ -2122,7 +2150,7 @@ export default function AppV2() {
     db.lineMe(s.token).then(r => {
       if (r?.error === "invalid_session") { clearLineSession(); setLineSession(null); return; }
       if (r?.profile) {
-        const next = { ...s, displayName: r.profile.displayName || s.displayName, name: r.profile.name || s.name, phone: r.profile.phone || s.phone,
+        const next = { ...s, displayName: r.profile.displayName || s.displayName, name: r.profile.name || s.name, phone: r.profile.phone || "", // เซิร์ฟเวอร์เป็นตัวตัดสิน: ถ้าแอดมินปลดล็อกเบอร์แล้ว ต้องล้างเบอร์เก่าในเครื่องลูกค้าด้วย
           isFriend: typeof r.profile.isFriend === "boolean" ? r.profile.isFriend : (s.isFriend ?? null) };
         saveLineSession(next); setLineSession(next);
       }
@@ -2169,15 +2197,16 @@ export default function AppV2() {
     if (!booking || pkgBookingBusy) return;
     setPkgBookingBusy(true);
     const { slot, court, date } = booking;
-    const { error } = await db.createBookingWithPackage({
+    const { error, available, needed } = await db.createBookingWithPackage({
       courtId: court.courtId, customerId: phone, customerName: name,
-      bookingDate: toIso(date), hour: slot.hour, startMinute: slot.startMinute, packageId,
+      bookingDate: toIso(date), hour: slot.hour, startMinute: slot.startMinute, durationMinutes: slot.durationMinutes, packageId,
     });
     setPkgBookingBusy(false);
     if (error) {
       const msg = {
         slot_taken: lang==="th" ? "ช่วงเวลานี้เพิ่งถูกจองไปก่อนหน้าแล้ว กรุณาเลือกช่วงเวลาใหม่" : "This slot was just booked by someone else. Please choose another time.",
-        package_no_credits: lang==="th" ? "สิทธิ์ในแพ็คเกจหมดแล้ว" : "No credits left in this package",
+        package_no_credits: lang==="th" ? `สิทธิ์ในแพ็คเกจไม่พอ (ต้องใช้ ${needed ?? "?"} ครั้ง ใช้ได้ ${available ?? 0} ครั้ง — ไม่นับสิทธิ์ที่จองไว้รอแอดมินยืนยัน)` : `Not enough credits (need ${needed ?? "?"}, ${available ?? 0} available — credits waiting for admin confirmation are reserved)`,
+        package_duration: lang==="th" ? "แพ็คเกจใช้จองได้เฉพาะ 60 หรือ 120 นาที" : "Packages can only book 60 or 120 minutes",
         package_expired: lang==="th" ? "แพ็คเกจหมดอายุแล้ว" : "This package has expired",
         package_wrong_tier: lang==="th" ? "แพ็คเกจนี้ใช้กับช่วงเวลานี้ไม่ได้" : "This package cannot be used for this time slot",
       }[error] || accountErrMsg(error, lang) || (lang==="th" ? "จองไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Booking failed, please try again");
@@ -2326,7 +2355,7 @@ export default function AppV2() {
           <div onClick={e=>e.stopPropagation()} style={{display:"flex",gap:4,alignItems:"center"}}>
             {lineSession ? (
               <button onClick={handleLineLogout} title={lang==="th"?"ออกจากระบบ LINE":"Log out"} style={{padding:"5px 9px",borderRadius:8,border:"1.5px solid #06C755",background:"#fff",color:"#06A04A",fontWeight:700,fontSize:11.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",maxWidth:110,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                👤 {toFormName(lineSession.displayName).slice(0,8) || "LINE"}
+                👤 {graphemeList(toFormName(lineSession.displayName)).slice(0,8).join("") || "LINE"}
               </button>
             ) : (
               <button onClick={() => handleLineLogin(null)} style={{padding:"5px 10px",borderRadius:8,border:"none",background:"#06C755",color:"#fff",fontWeight:700,fontSize:11.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
@@ -2479,12 +2508,36 @@ function AdminDashboard({ token, onLogout }) {
     const n = window.prompt("แก้ชื่อลูกค้า (1–40 ตัวอักษร)", b.customer_name || "");
     if (n == null) return;
     const clean = n.trim();
-    if (!clean || clean.length > 40) { alert("ชื่อต้องมี 1–40 ตัวอักษร"); return; }
+    if (!clean || Array.from(clean).length > 40) { alert("ชื่อต้องมี 1–40 ตัวอักษร"); return; }
     const r = await callAdminAction("updateBookingName", token, { id: b.id, name: clean });
     if (r?.ok) { loadBookings(); loadQueue(); }
   };
-  // ลูกค้า: เบอร์ที่ผูกกับ LINE + ปลดล็อก
+  // ลูกค้า: ค้นหา / แก้ชื่อ / แก้เบอร์ / เบอร์ที่ผูกกับ LINE + ปลดล็อก
   const [linkedPhones, setLinkedPhones] = useState({});
+  const [custQuery, setCustQuery] = useState("");
+  const editCustomerName = async (c) => {
+    const n = window.prompt(`แก้ชื่อลูกค้า (1–40 ตัวอักษร)\nจะแก้ในข้อมูลลูกค้า แพ็คเกจ และการจองทุกรายการของเบอร์ ${c.customer_id}`, c.customer_name || "");
+    if (n == null) return;
+    const clean = n.trim();
+    if (!clean || Array.from(clean).length > 40) { alert("ชื่อต้องมี 1–40 ตัวอักษร"); return; }
+    const r = await callAdminAction("updateCustomerName", token, { phone: c.customer_id, name: clean });
+    if (r?.ok) loadCustomers();
+    else alert(r?.error === "name_from_line" ? "ลูกค้าคนนี้ผูก LINE แล้ว ใช้ชื่อจาก LINE แก้ที่นี่ไม่ได้" : "แก้ชื่อไม่สำเร็จ ลองใหม่อีกครั้ง");
+  };
+  const changeCustomerPhone = async (c) => {
+    const input = window.prompt(`เปลี่ยนเบอร์ของ ${c.customer_name || "-"}\nเบอร์เดิม ${c.customer_id}\n\nพิมพ์เบอร์ใหม่ 10 หลัก:`, "");
+    if (input == null) return;
+    const np = input.replace(/\D/g, "");
+    if (!/^[0-9]{10}$/.test(np)) { alert("เบอร์ใหม่ต้องเป็นตัวเลข 10 หลัก"); return; }
+    if (!window.confirm(`ย้ายข้อมูลทั้งหมด (ข้อมูลลูกค้า การจอง แพ็คเกจ และการผูก LINE ถ้ามี) จาก ${c.customer_id} ไปเป็น ${np}?\n\nเบอร์ใหม่ต้องยังไม่มีข้อมูลในระบบ ถ้าทำผิดแก้ได้โดยเปลี่ยนเบอร์กลับ`)) return;
+    const r = await callAdminAction("changeCustomerPhone", token, { oldPhone: c.customer_id, newPhone: np });
+    if (r?.ok) { alert("เปลี่ยนเบอร์เรียบร้อย"); loadCustomers(); return; }
+    alert({
+      phone_exists: "เบอร์ใหม่มีข้อมูลในระบบอยู่แล้ว (ยังไม่รองรับการรวมข้อมูลสองเบอร์)",
+      same_phone: "เบอร์ใหม่ซ้ำกับเบอร์เดิม", invalid_phone: "เบอร์ไม่ถูกต้อง",
+      rpc_missing: "ยังไม่ได้รัน SQL ไฟล์ add-change-phone-function.sql ที่ Supabase",
+    }[r?.error] || "เปลี่ยนเบอร์ไม่สำเร็จ ลองใหม่อีกครั้ง");
+  };
   const unlinkPhone = async (phone) => {
     if (!window.confirm(`ปลดล็อกเบอร์ ${phone} จากบัญชี LINE?\n\nลูกค้าจะผูกเบอร์ใหม่ (หรือเบอร์เดิม) ได้อีกครั้งตอนจองครั้งถัดไป ประวัติการจองเดิมยังอยู่กับเบอร์เดิม`)) return;
     const r = await callAdminAction("unlinkLinePhone", token, { phone });
@@ -3293,25 +3346,51 @@ function AdminDashboard({ token, onLogout }) {
             </div>
           )}
 
-          {tab==="customers" && (
-            <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
-              <table className="adm-table">
-                <thead><tr><th>#</th><th>ชื่อ</th><th>เบอร์โทร</th><th>LINE</th></tr></thead>
-                <tbody>
-                  {customers.map((c,i) => (
-                    <tr key={c.customer_id}>
-                      <td style={{color:"var(--mu)"}}>{i+1}</td>
-                      <td style={{fontWeight:600}}>{c.customer_name}</td>
-                      <td style={{fontFamily:"monospace"}}>{c.customer_id}</td>
-                      <td>{linkedPhones[c.customer_id]
-                        ? <span style={{fontSize:12}}>🔗 {linkedPhones[c.customer_id]} <button onClick={() => unlinkPhone(c.customer_id)} style={{marginLeft:6,padding:"3px 8px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:11,cursor:"pointer"}}>ปลดล็อกเบอร์</button></span>
-                        : <span style={{fontSize:12,color:"var(--mu)"}}>ยังไม่ผูก</span>}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+          {tab==="customers" && (() => {
+            const q = custQuery.trim().toLowerCase();
+            const digits = q.replace(/\D/g, "");
+            const shown = !q ? customers : customers.filter(c =>
+              String(c.customer_name || "").toLowerCase().includes(q) ||
+              String(linkedPhones[c.customer_id] || "").toLowerCase().includes(q) ||
+              (digits.length > 0 && String(c.customer_id).includes(digits)));
+            return (
+              <div>
+                <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:12,flexWrap:"wrap"}}>
+                  <input value={custQuery} onChange={e => setCustQuery(e.target.value)} placeholder="🔍 ค้นหาชื่อหรือเบอร์โทร..."
+                    style={{flex:1,minWidth:200,padding:"10px 14px",borderRadius:10,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}} />
+                  <span style={{fontSize:12,color:"var(--mu)"}}>แสดง {shown.length} จาก {customers.length} คน</span>
+                </div>
+                <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                  {shown.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่พบลูกค้าที่ตรงกับคำค้นหา</p> : (
+                    <table className="adm-table">
+                      <thead><tr><th>#</th><th>ชื่อ</th><th>เบอร์โทร</th><th>LINE</th><th>จัดการ</th></tr></thead>
+                      <tbody>
+                        {shown.map((c,i) => {
+                          const lineName = linkedPhones[c.customer_id];
+                          return (
+                            <tr key={c.customer_id}>
+                              <td style={{color:"var(--mu)"}}>{i+1}</td>
+                              <td style={{fontWeight:600}}>{c.customer_name}</td>
+                              <td style={{fontFamily:"monospace"}}>{c.customer_id}</td>
+                              <td>{lineName
+                                ? <span style={{fontSize:12}}>🔗 {lineName} <button onClick={() => unlinkPhone(c.customer_id)} style={{marginLeft:6,padding:"3px 8px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:11,cursor:"pointer"}}>ปลดล็อกเบอร์</button></span>
+                                : <span style={{fontSize:12,color:"var(--mu)"}}>ยังไม่ผูก</span>}</td>
+                              <td>
+                                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                                  <button onClick={() => editCustomerName(c)} disabled={!!lineName} title={lineName ? "ผูก LINE แล้ว ใช้ชื่อจาก LINE" : "แก้ชื่อ"} style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:lineName?"var(--cr2)":"var(--br)",fontSize:11.5,cursor:lineName?"not-allowed":"pointer"}}>✏️ ชื่อ</button>
+                                  <button onClick={() => changeCustomerPhone(c)} title="เปลี่ยนเบอร์ (ย้ายการจอง/แพ็คเกจ/การผูก LINE ไปเบอร์ใหม่)" style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--br)",fontSize:11.5,cursor:"pointer"}}>✏️ เบอร์</button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
         </div>
       </div>
     </>
