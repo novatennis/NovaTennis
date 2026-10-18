@@ -28,6 +28,7 @@ async function sb(path, options = {}) {
   return { ok: res.ok, body };
 }
 
+const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); // กันอักขระ < > & ในชื่อทำให้ข้อความ Telegram ส่งไม่ผ่าน
 async function notifyTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !ADMIN_TELEGRAM_CHAT_IDS) return;
   const chatIds = ADMIN_TELEGRAM_CHAT_IDS.split(",").map(s => s.trim()).filter(Boolean);
@@ -70,7 +71,7 @@ export default async function handler(req, res) {
       const text =
         `⏰ <b>ลูกค้าไม่ชำระเงินภายใน 5 นาที</b>\n` +
         `ช่วงเวลาถูกปล่อยกลับให้จองใหม่แล้ว — ลองติดต่อลูกค้าดูได้ครับ\n\n` +
-        `👤 ${b.customer_name || "-"}\n` +
+        `👤 ${esc(b.customer_name || "-")}\n` +
         `📞 ${b.customer_id}\n` +
         `🎾 Court ${b.court_id}\n` +
         `📅 ${b.booking_date}\n` +
