@@ -96,6 +96,18 @@ function getDurationPrice(startHour, dateObj, durationMinutes) {
 
 // โปรโมชั่นจองครั้งแรก (ต่อชั่วโมง) — จันทร์-ศุกร์ ฿450 / เสาร์-อาทิตย์ ฿490 ไม่ว่าช่วง Off Peak/Peak
 // นับตาม "วันที่เล่น" (booking_date) ใช้ได้ถึงวันที่เล่น 31 ต.ค. 2569 (รวมวันนั้น) — ต้องแก้ให้ตรงกับ FIRST_TIME_PROMO ใน nova-tennis.jsx ด้วยถ้าเปลี่ยน
+// การจอง/ซื้อแพ็คเกจต้องมาจากบัญชี LINE ที่ผูกเบอร์แล้วเท่านั้น — เซิร์ฟเวอร์ใช้ "เบอร์ที่ผูกไว้" เสมอ ไม่เชื่อเบอร์ที่ส่งมาจากหน้าเว็บ
+// ผลคือลูกค้าเปลี่ยนเบอร์เองไม่ได้ (ล็อกจริงที่เซิร์ฟเวอร์ ไม่ใช่แค่ซ่อนช่องในหน้าจอ)
+async function getLinkedCustomer(sessionToken) {
+  const userId = verifyLineSession(sessionToken);
+  if (!userId) return { error: "line_required" };
+  const { body } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}&select=*`);
+  const row = (body || [])[0];
+  if (!row) return { error: "line_required" };
+  if (!row.phone) return { error: "phone_not_linked" };
+  return { userId, phone: row.phone, name: row.customer_name || "" };
+}
+
 const FIRST_TIME_PROMO = { weekday: 450, weekend: 490, lastPlayDate: "2026-10-31" };
 function getFirstTimePrice(bookingDate) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(bookingDate || "")) return null;
@@ -195,8 +207,11 @@ export default async function handler(req, res) {
       }
 
       case "createBooking": {
-        const { courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId, packageId } = p;
-        if (!courtId || !customerId || !customerName || !bookingDate || hour == null || !durationMinutes) {
+        const { courtId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId, packageId } = p;
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        const customerId = who.phone; // เบอร์ที่ผูกกับบัญชี LINE เท่านั้น
+        if (!courtId || !customerName || !bookingDate || hour == null || !durationMinutes) {
           res.status(400).json({ error: "missing params" }); return;
         }
         if (!/^[0-9]{10}$/.test(customerId)) { res.status(400).json({ error: "invalid phone" }); return; }
@@ -233,7 +248,7 @@ export default async function handler(req, res) {
 
           await sb(`customers`, {
             method: "POST",
-            headers: { Prefer: "resolution=merge-duplicates" },
+            headers: { Prefer: "resolution=ignore-duplicates" },
             body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
           });
 
@@ -281,7 +296,7 @@ export default async function handler(req, res) {
 
         let discountAmount = 0;
         let discountRow = null;
-        if (discountCodeId) {
+        if (discountCodeId && !isFirstTimePromo) { // โปรจองครั้งแรกไม่ร่วมกับโค้ดส่วนลด
           const { body: discRows } = await sb(`discount_codes?id=eq.${discountCodeId}&active=eq.true&select=*`);
           const d = (discRows || [])[0];
           if (d && d.used_count < d.max_uses) {
@@ -293,7 +308,7 @@ export default async function handler(req, res) {
 
         await sb(`customers`, {
           method: "POST",
-          headers: { Prefer: "resolution=merge-duplicates" },
+          headers: { Prefer: "resolution=ignore-duplicates" },
           body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
         });
 
@@ -324,10 +339,13 @@ export default async function handler(req, res) {
       case "createBookingMulti": {
         // จอง 2 สนามช่วงเวลาเดียวกันในครั้งเดียว — สร้าง 2 แถวพร้อมกัน (all-or-nothing) ใช้ group_id เดียวกัน โอนทีเดียว
         // ข้อจำกัดโดยตั้งใจ: ราคาปกติเท่านั้น (ไม่ร่วมกับแพ็คเกจ/โค้ดส่วนลด/โปรจองครั้งแรก) เพื่อให้ยอดรวมชัดเจน ไม่สับสน
-        const { courtIds, customerId, customerName, bookingDate, hour, startMinute, durationMinutes } = p;
+        const { courtIds, customerName, bookingDate, hour, startMinute, durationMinutes } = p;
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        const customerId = who.phone;
         const ids = Array.isArray(courtIds) ? [...new Set(courtIds.map(Number))].sort() : [];
         if (ids.length !== 2 || ids[0] !== 1 || ids[1] !== 2) { res.status(400).json({ error: "invalid courts" }); return; }
-        if (!customerId || !customerName || !bookingDate || hour == null || ![30, 60, 90, 120].includes(durationMinutes)) {
+        if (!customerName || !bookingDate || hour == null || ![30, 60, 90, 120].includes(durationMinutes)) {
           res.status(400).json({ error: "missing params" }); return;
         }
         if (!/^[0-9]{10}$/.test(customerId)) { res.status(400).json({ error: "invalid phone" }); return; }
@@ -346,7 +364,7 @@ export default async function handler(req, res) {
 
         await sb(`customers`, {
           method: "POST",
-          headers: { Prefer: "resolution=merge-duplicates" },
+          headers: { Prefer: "resolution=ignore-duplicates" },
           body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
         });
 
@@ -436,7 +454,10 @@ export default async function handler(req, res) {
 
       case "createPackage": {
         // ซื้อแพ็คเกจใหม่ — เซิร์ฟเวอร์เป็นคนตัดสินราคา/วันหมดอายุเองเสมอ ไม่เชื่อค่าจาก client
-        const { tier, credits, customerId, customerName } = p;
+        const { tier, credits, customerName } = p;
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        const customerId = who.phone;
         if (!["offpeak", "peak"].includes(tier)) { res.status(400).json({ error: "invalid tier" }); return; }
         const def = PACKAGE_PRICES[tier]?.[credits];
         if (!def) { res.status(400).json({ error: "invalid credits" }); return; }
@@ -447,7 +468,7 @@ export default async function handler(req, res) {
 
         await sb(`customers`, {
           method: "POST",
-          headers: { Prefer: "resolution=merge-duplicates" },
+          headers: { Prefer: "resolution=ignore-duplicates" },
           body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
         });
 
@@ -584,17 +605,80 @@ export default async function handler(req, res) {
       }
 
       case "lineLinkPhone": {
-        // ผูกชื่อ+เบอร์กับบัญชี LINE นี้ไว้ ครั้งต่อไปจะกรอกให้อัตโนมัติ
+        // ผูกเบอร์ + ชื่อกับบัญชี LINE นี้ "ครั้งแรกครั้งเดียว" แล้วล็อกถาวร
+        //  - 1 เบอร์ผูกได้กับ 1 บัญชี LINE เท่านั้น / 1 บัญชี LINE มีได้ 1 เบอร์ (เปลี่ยนเบอร์ต้องให้แอดมินทำ)
+        //  - ชื่อที่ส่งมา (ค่าตั้งต้น = ชื่อ LINE) จะแทนชื่อเดิมในข้อมูลลูกค้าของเบอร์นี้ (เช่นชื่อที่แอดมินใส่ตอนจองให้) เพื่อไม่ให้ข้อมูลซ้ำซ้อน
+        //  - ถ้าเบอร์นี้มีประวัติเดิมอยู่ (เช่นแอดมินเคยจองให้) แจ้ง Telegram ให้แอดมินตรวจว่าเป็นเจ้าของเบอร์จริง
         const userId = verifyLineSession(p.session);
         if (!userId) { res.status(401).json({ error: "invalid_session" }); return; }
         const { name, phone } = p;
         if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
-        if (!name || String(name).trim().length < 1 || String(name).length > 16) { res.status(400).json({ error: "invalid name" }); return; }
-        await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}`, {
-          method: "PATCH",
-          body: JSON.stringify({ customer_name: String(name).trim(), phone }),
+        const cleanName = String(name || "").trim();
+        if (cleanName.length < 1 || cleanName.length > 16) { res.status(400).json({ error: "invalid name" }); return; }
+
+        const { body: meRows } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}&select=*`);
+        const me = (meRows || [])[0];
+        if (me?.phone) {
+          // ผูกไว้แล้ว: เบอร์เดิมเท่านั้น (ส่งเบอร์เดิมซ้ำ = ไม่เป็นไร / ส่งเบอร์ใหม่ = ปฏิเสธ)
+          if (me.phone === phone) { res.status(200).json({ ok: true, phone: me.phone, name: me.customer_name || cleanName, already: true }); return; }
+          res.status(409).json({ error: "phone_locked", phone: me.phone }); return;
+        }
+
+        const { body: others } = await sb(`line_users?phone=eq.${phone}&line_user_id=neq.${encodeURIComponent(userId)}&select=line_user_id&limit=1`);
+        if (others && others.length > 0) { res.status(409).json({ error: "phone_linked_elsewhere" }); return; }
+
+        // ดูประวัติเดิมของเบอร์นี้ก่อนผูก (ไว้แจ้งแอดมิน)
+        const { body: oldCust } = await sb(`customers?customer_id=eq.${phone}&select=customer_name`);
+        const { body: oldBookings } = await sb(`bookings?customer_id=eq.${phone}&status=neq.cancelled&select=id,customer_name&limit=50`);
+        const { body: oldPkgs } = await sb(`packages?customer_id=eq.${phone}&status=neq.cancelled&select=id&limit=50`);
+
+        const link = await sb(`line_users`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates" },
+          body: JSON.stringify({ line_user_id: userId, phone, customer_name: cleanName }),
         });
-        res.status(200).json({ ok: true });
+        if (!link.ok) { res.status(500).json({ error: "link_failed" }); return; }
+
+        // ชื่อในข้อมูลลูกค้า = ชื่อที่ลงทะเบียนกับ LINE (แทนชื่อที่แอดมินใส่ครั้งแรก)
+        await sb(`customers`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates" },
+          body: JSON.stringify({ customer_id: phone, customer_name: cleanName }),
+        });
+
+        const hadHistory = (oldCust || []).length > 0 || (oldBookings || []).length > 0 || (oldPkgs || []).length > 0;
+        if (hadHistory) {
+          const oldName = (oldCust || [])[0]?.customer_name || (oldBookings || [])[0]?.customer_name || "-";
+          await notifyTelegram(
+            `🔗 <b>มีลูกค้าผูกเบอร์ที่มีประวัติเดิม</b>\n\n` +
+            `📞 ${phone}\n` +
+            `👤 ชื่อเดิมในระบบ: ${oldName} → ชื่อใหม่: ${cleanName}\n` +
+            `📋 ประวัติเดิม: จอง ${(oldBookings || []).length} รายการ, แพ็คเกจ ${(oldPkgs || []).length} รายการ\n\n` +
+            `กรุณาตรวจสอบว่าเป็นเจ้าของเบอร์จริง (เช่นทักถามผ่าน LINE) ถ้าไม่ใช่ ให้เปลี่ยนเบอร์ที่ผูกในหน้า Admin`
+          );
+        }
+        res.status(200).json({ ok: true, phone, name: cleanName, hadHistory });
+        return;
+      }
+
+      case "recordSource": {
+        // บันทึกแหล่งที่มา (UTM จากโฆษณา) ติดกับการจอง/แพ็คเกจ — ทำแยกหลังสร้างรายการเสร็จ ถ้าล้มเหลว (เช่นยังไม่ได้รัน SQL) การจองหลักไม่กระทบ
+        const { kind, id } = p;
+        const ALLOWED = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"];
+        const utm = {};
+        if (p.utm && typeof p.utm === "object") {
+          for (const k of ALLOWED) { const v = p.utm[k]; if (typeof v === "string" && v.trim()) utm[k] = v.trim().slice(0, 80); }
+        }
+        if (!id || !["booking", "package"].includes(kind) || Object.keys(utm).length === 0) { res.status(200).json({ ok: false }); return; }
+        const table = kind === "package" ? "packages" : "bookings";
+        // เขียนได้ครั้งเดียว (utm ต้องยังว่าง) — กันถูกเขียนทับภายหลัง
+        const { ok, body } = await sb(`${table}?id=eq.${encodeURIComponent(id)}&utm=is.null`, {
+          method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ utm }),
+        });
+        if (ok && kind === "booking" && body?.[0]?.group_id) {
+          await sb(`bookings?group_id=eq.${encodeURIComponent(body[0].group_id)}&utm=is.null`, { method: "PATCH", body: JSON.stringify({ utm }) });
+        }
+        res.status(200).json({ ok: !!ok });
         return;
       }
 
