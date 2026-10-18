@@ -4,6 +4,7 @@
 // ADMIN_TELEGRAM_CHAT_IDS (comma-separated chat IDs). No monthly message
 // limit on Telegram, unlike LINE's free tier.
 
+const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); // กันอักขระ < > & ในชื่อทำให้ข้อความ Telegram ส่งไม่ผ่าน
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed" });
@@ -31,11 +32,11 @@ export default async function handler(req, res) {
 
     const text =
       `🔔 มีลูกค้าส่งสลิปใหม่\n\n` +
-      `🎾 สนาม: ${courtName || "-"}\n` +
+      `🎾 สนาม: ${esc(courtName || "-")}\n` +
       `📅 วันที่: ${date || "-"}\n` +
       `🕐 เวลา: ${time || "-"}\n` +
       `💰 ยอด: ฿${price ?? "-"}\n` +
-      `👤 ชื่อ: ${name || "-"}\n` +
+      `👤 ชื่อ: ${esc(name || "-")}\n` +
       `📞 เบอร์: ${phone || "-"}\n` +
       `🕓 ส่งสลิปเมื่อเวลา: ${sentAtStr} น. (ไทย)\n\n` +
       `สถานะ: รอการตรวจสอบ\nกรุณาเข้าไปตรวจสอบและยืนยันที่หน้า Admin Dashboard`;
