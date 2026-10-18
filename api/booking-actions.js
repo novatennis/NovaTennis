@@ -98,6 +98,24 @@ function getDurationPrice(startHour, dateObj, durationMinutes) {
 // นับตาม "วันที่เล่น" (booking_date) ใช้ได้ถึงวันที่เล่น 31 ต.ค. 2569 (รวมวันนั้น) — ต้องแก้ให้ตรงกับ FIRST_TIME_PROMO ใน nova-tennis.jsx ด้วยถ้าเปลี่ยน
 // การจอง/ซื้อแพ็คเกจต้องมาจากบัญชี LINE ที่ผูกเบอร์แล้วเท่านั้น — เซิร์ฟเวอร์ใช้ "เบอร์ที่ผูกไว้" เสมอ ไม่เชื่อเบอร์ที่ส่งมาจากหน้าเว็บ
 // ผลคือลูกค้าเปลี่ยนเบอร์เองไม่ได้ (ล็อกจริงที่เซิร์ฟเวอร์ ไม่ใช่แค่ซ่อนช่องในหน้าจอ)
+// ชื่อที่ใช้ในการจอง = ชื่อ LINE (ตัดไม่เกิน 16 ตัวอักษรตามกติกาเดิม โดยไม่ตัดกลาง emoji)
+const NAME_MAX = 20; // ข้อกำหนดชื่อ LINE: ไม่เกิน 20 ตัวอักษร
+// นับเป็น "ตัวอักษรที่ตามองเห็น" (ไม่ใช่จำนวนรหัสตัวอักษร) — ชื่อไทยที่มีสระ/วรรณยุกต์ หรือ emoji จึงไม่ถูกตัดผิดตำแหน่ง/ผิดจำนวน
+const graphemes = (s) => {
+  const str = String(s ?? "");
+  try { return Array.from(new Intl.Segmenter("th", { granularity: "grapheme" }).segment(str), (x) => x.segment); }
+  catch { return Array.from(str); }
+};
+const toBookingName = (s) => graphemes(String(s || "").trim()).slice(0, NAME_MAX).join("").trim();
+// ชื่อจาก LINE อาจมีอักขระ < > & ซึ่งทำให้ข้อความ Telegram (โหมด HTML) ส่งไม่ผ่าน — escape ก่อนใส่ในข้อความ
+const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// สิทธิ์แพ็คเกจที่ถูกจองค้างไว้ (การจองสถานะ "รอการยืนยัน" ที่ยังไม่ถูกหัก) — 60 นาที = 1 ครั้ง, 120 นาที = 2 ครั้ง
+async function getReservedCredits(packageId) {
+  const { body } = await sb(`bookings?package_id=eq.${packageId}&status=eq.reviewing&select=duration_minutes`);
+  return (body || []).reduce((s, b) => s + Math.max(1, Math.round((b.duration_minutes || 60) / 60)), 0);
+}
+
 async function getLinkedCustomer(sessionToken) {
   const userId = verifyLineSession(sessionToken);
   if (!userId) return { error: "line_required" };
@@ -105,7 +123,8 @@ async function getLinkedCustomer(sessionToken) {
   const row = (body || [])[0];
   if (!row) return { error: "line_required" };
   if (!row.phone) return { error: "phone_not_linked" };
-  return { userId, phone: row.phone, name: row.customer_name || "" };
+  // ชื่อในการจองมาจาก LINE เสมอ (ไม่เชื่อชื่อที่ส่งมาจากหน้าเว็บ) — ชื่อ LINE ล่าสุดที่บันทึกตอนล็อกอิน
+  return { userId, phone: row.phone, name: toBookingName(row.display_name) || toBookingName(row.customer_name) || "ลูกค้า LINE" };
 }
 
 const FIRST_TIME_PROMO = { weekday: 450, weekend: 490, lastPlayDate: "2026-10-31" };
@@ -207,15 +226,16 @@ export default async function handler(req, res) {
       }
 
       case "createBooking": {
-        const { courtId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId, packageId } = p;
+        const { courtId, bookingDate, hour, startMinute, durationMinutes, discountCodeId, packageId } = p;
         const who = await getLinkedCustomer(p.session);
         if (who.error) { res.status(403).json({ error: who.error }); return; }
         const customerId = who.phone; // เบอร์ที่ผูกกับบัญชี LINE เท่านั้น
+        const customerName = who.name; // ชื่อจากบัญชี LINE เท่านั้น
         if (!courtId || !customerName || !bookingDate || hour == null || !durationMinutes) {
           res.status(400).json({ error: "missing params" }); return;
         }
         if (!/^[0-9]{10}$/.test(customerId)) { res.status(400).json({ error: "invalid phone" }); return; }
-        if (String(customerName).trim().length < 1 || String(customerName).length > 16) {
+        if (String(customerName).trim().length < 1) {
           res.status(400).json({ error: "invalid name" }); return;
         }
 
@@ -236,15 +256,21 @@ export default async function handler(req, res) {
         // ไม่ตัดสิทธิ์ทันที — สร้างเป็นสถานะ "รอการยืนยัน" ก่อน แจ้งเตือนแอดมินทันที
         // สิทธิ์จะถูกหักจริงก็ต่อเมื่อแอดมินกดยืนยัน (ป้องกันลูกค้ากดจองมั่ว/พลาด แล้วเสียสิทธิ์ฟรี)
         if (packageId) {
-          if (durationMinutes !== 60) { res.status(400).json({ error: "package_60min_only" }); return; }
+          // จองด้วยแพ็คเกจได้ 60 นาที (ตัด 1 ครั้ง) หรือ 120 นาที (ตัด 2 ครั้ง) เท่านั้น
+          if (![60, 120].includes(durationMinutes)) { res.status(400).json({ error: "package_duration" }); return; }
+          const units = durationMinutes / 60;
           const { body: pkgRows } = await sb(`packages?id=eq.${packageId}&customer_id=eq.${customerId}&select=*`);
           const pkg = (pkgRows || [])[0];
           if (!pkg || pkg.status !== "active") { res.status(400).json({ error: "package_not_active" }); return; }
-          if (pkg.remaining_credits <= 0) { res.status(400).json({ error: "package_no_credits" }); return; }
           if (pkg.expiry_date && new Date(pkg.expiry_date + "T23:59:59") < new Date()) { res.status(400).json({ error: "package_expired" }); return; }
-          // แพ็ค Peak ใช้จองได้ทั้งช่วง Peak และ Off Peak — แพ็ค Off Peak ใช้ได้เฉพาะช่วง Off Peak เท่านั้น
-          const slotTier = isPeak ? "peak" : "offpeak";
-          if (!(pkg.tier === "peak" || pkg.tier === slotTier)) { res.status(400).json({ error: "package_wrong_tier" }); return; }
+          // สิทธิ์ที่ใช้ได้จริง = คงเหลือ − สิทธิ์ที่จองค้างรอแอดมินยืนยันอยู่ (ยังไม่ถูกหัก) กันส่งหลายออเดอร์ซ้อนจนเล่นเกินสิทธิ์
+          const reserved = await getReservedCredits(packageId);
+          if (pkg.remaining_credits - reserved < units) { res.status(400).json({ error: "package_no_credits", available: Math.max(0, pkg.remaining_credits - reserved), needed: units }); return; }
+          // แต่ละชั่วโมงที่จองต้องอยู่ในช่วงที่แพ็คครอบคลุม: แพ็ค Peak ใช้ได้ทุกชั่วโมง / แพ็ค Off Peak ใช้ได้เฉพาะชั่วโมงที่เป็น Off Peak (จ.–ศ. ก่อน 16:00)
+          // เช่น แพ็ค Off Peak จอง 15:00–17:00 ไม่ได้ เพราะชั่วโมงหลังเป็น Peak
+          const hourIsPeak = (h) => isWeekend || h >= 16;
+          const allHoursOk = Array.from({ length: units }, (_, i) => hour + i).every((h) => pkg.tier === "peak" || !hourIsPeak(h));
+          if (!allHoursOk) { res.status(400).json({ error: "package_wrong_tier" }); return; }
 
           await sb(`customers`, {
             method: "POST",
@@ -257,7 +283,7 @@ export default async function handler(req, res) {
             headers: { Prefer: "return=representation" },
             body: JSON.stringify({
               court_id: courtId, customer_id: customerId, customer_name: customerName,
-              booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: 60,
+              booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
               price: 0, package_id: packageId, status: "reviewing", // รอแอดมินกดยืนยันก่อนถึงจะหักสิทธิ์จริง
             }),
           });
@@ -269,12 +295,12 @@ export default async function handler(req, res) {
           const text =
             `🎟 <b>มีการจองด้วยสิทธิ์แพ็คเกจ</b>\n` +
             `รอการยืนยันจากแอดมิน (จะหักสิทธิ์ก็ต่อเมื่อกดยืนยันแล้วเท่านั้น)\n\n` +
-            `👤 ${customerName}\n` +
+            `👤 ${esc(customerName)}\n` +
             `📞 ${customerId}\n` +
             `🎾 Court ${courtId}\n` +
             `📅 ${bookingDate}\n` +
             `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n` +
-            `🎫 สิทธิ์เหลือก่อนจอง: ${pkg.remaining_credits} / ${pkg.total_credits} ครั้ง\n` +
+            `🎫 จองครั้งนี้ใช้ ${units} ครั้ง • สิทธิ์เหลือก่อนจอง: ${pkg.remaining_credits} / ${pkg.total_credits} ครั้ง\n` +
             `🕓 กดจองเมื่อเวลา ${timeStr} น. (ไทย)`;
           await notifyTelegram(text);
 
@@ -339,17 +365,18 @@ export default async function handler(req, res) {
       case "createBookingMulti": {
         // จอง 2 สนามช่วงเวลาเดียวกันในครั้งเดียว — สร้าง 2 แถวพร้อมกัน (all-or-nothing) ใช้ group_id เดียวกัน โอนทีเดียว
         // ข้อจำกัดโดยตั้งใจ: ราคาปกติเท่านั้น (ไม่ร่วมกับแพ็คเกจ/โค้ดส่วนลด/โปรจองครั้งแรก) เพื่อให้ยอดรวมชัดเจน ไม่สับสน
-        const { courtIds, customerName, bookingDate, hour, startMinute, durationMinutes } = p;
+        const { courtIds, bookingDate, hour, startMinute, durationMinutes } = p;
         const who = await getLinkedCustomer(p.session);
         if (who.error) { res.status(403).json({ error: who.error }); return; }
         const customerId = who.phone;
+        const customerName = who.name;
         const ids = Array.isArray(courtIds) ? [...new Set(courtIds.map(Number))].sort() : [];
         if (ids.length !== 2 || ids[0] !== 1 || ids[1] !== 2) { res.status(400).json({ error: "invalid courts" }); return; }
         if (!customerName || !bookingDate || hour == null || ![30, 60, 90, 120].includes(durationMinutes)) {
           res.status(400).json({ error: "missing params" }); return;
         }
         if (!/^[0-9]{10}$/.test(customerId)) { res.status(400).json({ error: "invalid phone" }); return; }
-        if (String(customerName).trim().length < 1 || String(customerName).length > 16) { res.status(400).json({ error: "invalid name" }); return; }
+        if (String(customerName).trim().length < 1) { res.status(400).json({ error: "invalid name" }); return; }
 
         const startMin = hour * 60 + (startMinute || 0);
         const endMin = startMin + durationMinutes;
@@ -440,7 +467,7 @@ export default async function handler(req, res) {
           const dur = row.duration_minutes || 60;
           const text =
             `❌ <b>ลูกค้ายกเลิกการจองเอง</b>\n\n` +
-            `👤 ${row.customer_name || "-"}\n` +
+            `👤 ${esc(row.customer_name || "-")}\n` +
             `📞 ${row.customer_id}\n` +
             `🎾 ${courtLabel}\n` +
             `📅 ${row.booking_date}\n` +
@@ -454,15 +481,16 @@ export default async function handler(req, res) {
 
       case "createPackage": {
         // ซื้อแพ็คเกจใหม่ — เซิร์ฟเวอร์เป็นคนตัดสินราคา/วันหมดอายุเองเสมอ ไม่เชื่อค่าจาก client
-        const { tier, credits, customerName } = p;
+        const { tier, credits } = p;
         const who = await getLinkedCustomer(p.session);
         if (who.error) { res.status(403).json({ error: who.error }); return; }
         const customerId = who.phone;
+        const customerName = who.name;
         if (!["offpeak", "peak"].includes(tier)) { res.status(400).json({ error: "invalid tier" }); return; }
         const def = PACKAGE_PRICES[tier]?.[credits];
         if (!def) { res.status(400).json({ error: "invalid credits" }); return; }
         if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid phone" }); return; }
-        if (!customerName || String(customerName).trim().length < 1 || String(customerName).length > 16) {
+        if (!customerName || String(customerName).trim().length < 1) {
           res.status(400).json({ error: "invalid name" }); return;
         }
 
@@ -513,7 +541,7 @@ export default async function handler(req, res) {
         if (ok && row) {
           const text =
             `❌ <b>ลูกค้ายกเลิกการซื้อแพ็คเกจเอง</b>\n\n` +
-            `👤 ${row.customer_name || "-"}\n` +
+            `👤 ${esc(row.customer_name || "-")}\n` +
             `📞 ${row.customer_id}\n` +
             `🎟 ${row.tier === "peak" ? "Peak" : "Off Peak"} × ${row.total_credits} ครั้ง\n` +
             `💰 ฿${row.price?.toLocaleString?.() || row.price}`;
@@ -527,7 +555,8 @@ export default async function handler(req, res) {
         const { phone } = p;
         if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
         const { body } = await sb(`packages?customer_id=eq.${phone}&select=*&order=created_time.desc`);
-        res.status(200).json({ packages: body || [] });
+        const pkgs = await Promise.all((body || []).map(async (pk) => (pk.status === "active" ? { ...pk, reserved_credits: await getReservedCredits(pk.id) } : pk)));
+        res.status(200).json({ packages: pkgs });
         return;
       }
 
@@ -587,6 +616,15 @@ export default async function handler(req, res) {
         }
         const { body: rows } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(prof.userId)}&select=*`);
         const row = (rows || [])[0] || {};
+        if (row.phone && prof.displayName) {
+          const lineName = toBookingName(prof.displayName);
+          if (lineName && lineName !== row.customer_name) {
+            await sb(`line_users?line_user_id=eq.${encodeURIComponent(prof.userId)}`, { method: "PATCH", body: JSON.stringify({ customer_name: lineName }) });
+            await sb(`customers?customer_id=eq.${row.phone}`, { method: "PATCH", body: JSON.stringify({ customer_name: lineName }) });
+            await sb(`packages?customer_id=eq.${row.phone}`, { method: "PATCH", body: JSON.stringify({ customer_name: lineName }) });
+            row.customer_name = lineName;
+          }
+        }
         res.status(200).json({
           session: signLineSession(prof.userId),
           profile: { displayName: prof.displayName || "", pictureUrl: prof.pictureUrl || "", name: row.customer_name || "", phone: row.phone || "", isFriend: isFriend ?? (typeof row.is_friend === "boolean" ? row.is_friend : null) },
@@ -611,13 +649,14 @@ export default async function handler(req, res) {
         //  - ถ้าเบอร์นี้มีประวัติเดิมอยู่ (เช่นแอดมินเคยจองให้) แจ้ง Telegram ให้แอดมินตรวจว่าเป็นเจ้าของเบอร์จริง
         const userId = verifyLineSession(p.session);
         if (!userId) { res.status(401).json({ error: "invalid_session" }); return; }
-        const { name, phone } = p;
+        const { phone } = p;
         if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
-        const cleanName = String(name || "").trim();
-        if (cleanName.length < 1 || cleanName.length > 16) { res.status(400).json({ error: "invalid name" }); return; }
 
         const { body: meRows } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}&select=*`);
         const me = (meRows || [])[0];
+        // ชื่อ = ชื่อ LINE ของบัญชีนี้ (ถ้ายังไม่มีในฐานข้อมูลจริงๆ ใช้ชื่อที่หน้าเว็บส่งมาเป็นตัวสำรอง)
+        const cleanName = toBookingName(me?.display_name) || toBookingName(p.name);
+        if (cleanName.length < 1) { res.status(400).json({ error: "invalid name" }); return; }
         if (me?.phone) {
           // ผูกไว้แล้ว: เบอร์เดิมเท่านั้น (ส่งเบอร์เดิมซ้ำ = ไม่เป็นไร / ส่งเบอร์ใหม่ = ปฏิเสธ)
           if (me.phone === phone) { res.status(200).json({ ok: true, phone: me.phone, name: me.customer_name || cleanName, already: true }); return; }
@@ -645,6 +684,7 @@ export default async function handler(req, res) {
           headers: { Prefer: "resolution=merge-duplicates" },
           body: JSON.stringify({ customer_id: phone, customer_name: cleanName }),
         });
+        await sb(`packages?customer_id=eq.${phone}`, { method: "PATCH", body: JSON.stringify({ customer_name: cleanName }) });
 
         const hadHistory = (oldCust || []).length > 0 || (oldBookings || []).length > 0 || (oldPkgs || []).length > 0;
         if (hadHistory) {
@@ -652,7 +692,7 @@ export default async function handler(req, res) {
           await notifyTelegram(
             `🔗 <b>มีลูกค้าผูกเบอร์ที่มีประวัติเดิม</b>\n\n` +
             `📞 ${phone}\n` +
-            `👤 ชื่อเดิมในระบบ: ${oldName} → ชื่อใหม่: ${cleanName}\n` +
+            `👤 ชื่อเดิมในระบบ: ${esc(oldName)} → ชื่อ LINE: ${esc(cleanName)}\n` +
             `📋 ประวัติเดิม: จอง ${(oldBookings || []).length} รายการ, แพ็คเกจ ${(oldPkgs || []).length} รายการ\n\n` +
             `กรุณาตรวจสอบว่าเป็นเจ้าของเบอร์จริง (เช่นทักถามผ่าน LINE) ถ้าไม่ใช่ ให้เปลี่ยนเบอร์ที่ผูกในหน้า Admin`
           );
