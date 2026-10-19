@@ -81,8 +81,8 @@ const db = {
   },
   async checkDiscount(code) {
     const result = await callBookingAction("checkDiscount", { code });
-    if (!result.valid) return null;
-    return result; // { id, code, discount_amount, discount_percent }
+    if (!result.valid) return { error: result.reason || "invalid", expires_at: result.expires_at };
+    return result; // { id, code, discount_amount, discount_percent, expires_at }
   },
   async myBookings(phone) {
     const { bookings } = await callBookingAction("myBookings", { phone });
@@ -1054,7 +1054,7 @@ function BookingPage({ onProceed, lang="th" }) {
   );
 }
 
-function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, lineSession, onLineLogin, onLinkPhone, lang="th" }) {
+function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onConfirmFree, lineSession, onLineLogin, onLinkPhone, lang="th" }) {
   const t = T[lang];
   const { date, court, slot } = booking;
   const courts = booking.courts; // มี 2 สนามเมื่อเป็นการจองพร้อมกัน (โอนครั้งเดียว)
@@ -1140,16 +1140,19 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
     setCheckingCode(true);
     setDiscountMsg("");
     const result = await db.checkDiscount(discountCode.trim());
-    if (result) {
+    if (result && !result.error) {
       setDiscount(result);
       const saved = result.discount_amount > 0 ? result.discount_amount : Math.round(slot.price * result.discount_percent / 100);
       const label = result.discount_amount > 0
         ? (lang==="th" ? `ส่วนลด ฿${result.discount_amount}` : `฿${result.discount_amount} off`)
         : (lang==="th" ? `ส่วนลด ${result.discount_percent}%` : `${result.discount_percent}% off`);
-      setDiscountMsg(`✅ ${label} — ${t.saveDiscount} ฿${saved}`);
+      const expTxt = result.expires_at ? (lang==="th" ? ` • ใช้ได้ถึง ${new Date(result.expires_at+"T00:00:00").toLocaleDateString("th-TH",{day:"numeric",month:"short",year:"numeric"})}` : ` • valid until ${new Date(result.expires_at+"T00:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`) : "";
+      setDiscountMsg(`✅ ${label} — ${t.saveDiscount} ฿${saved}${expTxt}`);
     } else {
       setDiscount(null);
-      setDiscountMsg(t.invalidCode);
+      setDiscountMsg(result?.error === "expired" ? (lang==="th" ? "โค้ดนี้หมดอายุแล้ว" : "This code has expired")
+        : result?.error === "used" ? (lang==="th" ? "โค้ดนี้ถูกใช้ไปแล้ว" : "This code has already been used")
+        : t.invalidCode);
     }
     setCheckingCode(false);
   };
@@ -1249,6 +1252,9 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
         )}
       </div>
 
+      {finalPrice===0 && discount && !firstTimeEligible && !isGroup && !useCredit && (
+        <p style={{fontSize:12,color:"var(--mu)",marginBottom:10,lineHeight:1.6}}>🎁 {lang==="th" ? "โค้ดนี้ครอบคลุมยอดทั้งหมด ไม่ต้องโอนเงิน — ระบบจะส่งคำขอให้แอดมินยืนยัน" : "This code covers the full amount — nothing to pay. We'll send the request to the admin for confirmation."}</p>
+      )}
       {linkErr && <p style={{fontSize:12.5,color:"#c0392b",marginBottom:10,lineHeight:1.6}}>{linkErr}</p>}
       <div style={{display:"flex",gap:12}}>
         <button onClick={onCancel} style={{flex:1,padding:"14px",borderRadius:"var(--r)",border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:15,cursor:"pointer"}}>{t.cancel}</button>
@@ -1273,8 +1279,13 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, line
             const confirmed = window.confirm(lang==="th" ? "การใช้โค้ดส่วนลด หากกดดำเนินการต่อแล้วจะไม่สามารถใช้โค้ดนี้ซ้ำได้อีก" : "Once you proceed, this discount code cannot be used again.");
             if (!confirmed) return;
           }
+          // โค้ดครอบคลุมทั้งยอด (ไม่เหลือยอดให้โอน) → ไม่ต้องไปหน้า QR/แนบสลิป ส่งเป็นคำขอรอแอดมินยืนยันเลย
+          if (finalPrice === 0 && discount && !firstTimeEligible && !isGroup) {
+            onConfirmFree({ name: name.trim(), phone, discount });
+            return;
+          }
           onConfirm({name:name.trim(),phone,discount:firstTimeEligible?null:discount,finalPrice,discountAmount});
-        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:(ok&&!ftChecking&&!checkingPkg&&!linking)?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:(ok&&!ftChecking&&!checkingPkg&&!linking)?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:(ok&&!ftChecking&&!checkingPkg&&!linking)?"pointer":"not-allowed"}}>{linking?(lang==="th"?"กำลังผูกเบอร์...":"Linking..."):(ok&&(ftChecking||checkingPkg))?(lang==="th"?"กำลังตรวจสอบสิทธิ์...":"Checking eligibility..."):useCredit?(lang==="th"?"ยืนยันการจอง (ใช้สิทธิ์) ✓":"Confirm Booking (Use Credit) ✓"):t.confirmBooking}</button>
+        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:(ok&&!ftChecking&&!checkingPkg&&!linking)?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:(ok&&!ftChecking&&!checkingPkg&&!linking)?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:(ok&&!ftChecking&&!checkingPkg&&!linking)?"pointer":"not-allowed"}}>{linking?(lang==="th"?"กำลังผูกเบอร์...":"Linking..."):(finalPrice===0&&discount&&!firstTimeEligible&&!isGroup&&!useCredit&&ok&&!ftChecking&&!checkingPkg)?(lang==="th"?"ยืนยันการจอง (ใช้โค้ดเต็มจำนวน) ✓":"Confirm Booking (full-value code) ✓"):(ok&&(ftChecking||checkingPkg))?(lang==="th"?"กำลังตรวจสอบสิทธิ์...":"Checking eligibility..."):useCredit?(lang==="th"?"ยืนยันการจอง (ใช้สิทธิ์) ✓":"Confirm Booking (Use Credit) ✓"):t.confirmBooking}</button>
       </div>
     </div>
   );
@@ -1332,7 +1343,8 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
       const { booking: b, error } = result;
       if (error) {
         // บัญชี/เบอร์มีปัญหา → บอกสาเหตุ / นอกนั้นคือช่วงเวลาเพิ่งถูกจองไปโดยคนอื่น (แข่งกันจองพร้อมกัน)
-        alert(accountErrMsg(error, lang) || (lang==="th" ? "ขออภัย ช่วงเวลานี้เพิ่งถูกจองไปแล้ว กรุณาเลือกช่วงเวลาใหม่" : "Sorry, this time slot was just booked. Please choose another time."));
+        alert(error === "discount_invalid" ? (lang==="th" ? "โค้ดส่วนลดนี้ใช้ไม่ได้แล้ว (หมดอายุหรือถูกใช้ไปแล้ว) กรุณากลับไปตรวจสอบโค้ดอีกครั้ง" : "This discount code can no longer be used (expired or already used).")
+          : (accountErrMsg(error, lang) || (lang==="th" ? "ขออภัย ช่วงเวลานี้เพิ่งถูกจองไปแล้ว กรุณาเลือกช่วงเวลาใหม่" : "Sorry, this time slot was just booked. Please choose another time.")));
         onDone(customer.phone);
         return;
       }
@@ -2193,6 +2205,33 @@ export default function AppV2() {
 
   // จองด้วยสิทธิ์แพ็คเกจ — จ่ายไว้ล่วงหน้าแล้ว ยืนยันทันทีไม่ต้องผ่านหน้า QR/แนบสลิปอีก
   const [pkgBookingBusy, setPkgBookingBusy] = useState(false);
+  // จองด้วยโค้ดส่วนลดที่ครอบคลุมทั้งยอด (฿0): สร้างการจองเป็น "รอแอดมินยืนยัน" ทันที ไม่ผ่านหน้า QR
+  const handleConfirmFree = async ({ name, phone, discount }) => {
+    if (!booking || pkgBookingBusy) return;
+    setPkgBookingBusy(true);
+    const { slot, court, date } = booking;
+    const { booking: b, error } = await db.createBooking({
+      courtId: court.courtId, customerId: phone, customerName: name, bookingDate: toIso(date),
+      hour: slot.hour, startMinute: slot.startMinute, durationMinutes: slot.durationMinutes, discountCodeId: discount.id,
+    });
+    setPkgBookingBusy(false);
+    if (error || !b) {
+      alert(error === "discount_invalid" ? (lang==="th" ? "โค้ดส่วนลดนี้ใช้ไม่ได้แล้ว (หมดอายุหรือถูกใช้ไปแล้ว) กรุณาตรวจสอบโค้ด" : "This discount code can no longer be used (expired or already used).")
+        : error === "slot_taken" ? (lang==="th" ? "ช่วงเวลานี้เพิ่งถูกจองไปก่อนหน้าแล้ว กรุณาเลือกช่วงเวลาใหม่" : "This slot was just booked by someone else. Please choose another time.")
+        : (accountErrMsg(error, lang) || (lang==="th" ? "จองไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Booking failed, please try again")));
+      return;
+    }
+    if (b.status === "reviewing" && (b.price || 0) === 0) {
+      alert(lang==="th" ? "✅ ส่งคำขอจองแล้ว! ใช้โค้ดส่วนลดเต็มจำนวน รอแอดมินยืนยันการจอง" : "✅ Booking request sent with a full-value code! Awaiting admin confirmation.");
+      setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
+      setPrefillPhone(phone || ""); setTab("cancel"); clearResumeParam();
+      return;
+    }
+    // เซิร์ฟเวอร์คิดยอดได้มากกว่า 0 (ต่างจากที่หน้าเว็บคำนวณ) → ไปหน้าชำระเงินของการจองที่เพิ่งสร้างนี้ต่อ (ไม่สร้างซ้ำ)
+    setCustomer({ name, phone, finalPrice: b.price, discountAmount: b.discount_amount || 0, discount });
+    setResumeBooking({ id: b.id, createdAt: b.created_time });
+    setPage("payment");
+  };
   const handleConfirmWithPackage = async ({ name, phone, packageId }) => {
     if (!booking || pkgBookingBusy) return;
     setPkgBookingBusy(true);
@@ -2376,7 +2415,7 @@ export default function AppV2() {
           {tab==="home" && <HomePage goBook={() => goTab("book")} goPackage={() => goTab("package")} lang={lang} />}
           {!blockedByLine && tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} lang={lang} />}
           {!blockedByLine && tab==="book" && page==="checkout" && booking && (
-            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} onConfirmWithPackage={handleConfirmWithPackage} lineSession={lineSession} onLineLogin={handleLineLogin} onLinkPhone={handleLinkPhone} lang={lang} />
+            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} onConfirmWithPackage={handleConfirmWithPackage} onConfirmFree={handleConfirmFree} lineSession={lineSession} onLineLogin={handleLineLogin} onLinkPhone={handleLinkPhone} lang={lang} />
           )}
           {!blockedByLine && tab==="book" && page==="payment" && booking && customer && (
             <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} resumeBooking={resumeBooking} onCreated={(id, createdAt) => setResumeBooking({ id, createdAt })} onStartOver={resetBookingFlow} />
@@ -2401,6 +2440,7 @@ function AdminDashboard({ token, onLogout }) {
   const [newCode, setNewCode] = useState("");
   const [newAmt, setNewAmt] = useState("50");
   const [newMax, setNewMax] = useState("1");
+  const [newExp, setNewExp] = useState(""); // วันหมดอายุ (เว้นว่าง = ไม่หมดอายุ)
 
   const [queue, setQueue] = useState([]);
   const [queueLoading, setQueueLoading] = useState(true);
@@ -2695,13 +2735,20 @@ function AdminDashboard({ token, onLogout }) {
 
   const createCode = async () => {
     if (!newCode.trim()) return;
-    await callAdminAction("createDiscount", token, { code: newCode, amount: newAmt, maxUses: newMax });
+    const r = await callAdminAction("createDiscount", token, { code: newCode, amount: newAmt, maxUses: newMax, expiresAt: newExp || null });
+    if (!r?.ok) { alert(r?.error === "invalid_date" ? "รูปแบบวันหมดอายุไม่ถูกต้อง" : "สร้างโค้ดไม่สำเร็จ (ถ้าตั้งวันหมดอายุ ต้องรัน SQL เพิ่มคอลัมน์ expires_at ที่ Supabase ก่อน)"); return; }
     setNewCode(""); loadDiscounts();
   };
 
   const genCode = () => {
     const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     setNewCode(Array.from({length:8}, () => c[Math.floor(Math.random()*c.length)]).join(""));
+  };
+
+  const resetDiscount = async (c) => {
+    if (!window.confirm(`รีเซ็ตโค้ด ${c.code}? จำนวนครั้งที่ใช้จะกลับเป็น 0 และโค้ดกลับมาใช้ได้ (ใช้เมื่อต้องการคืนโค้ดให้ลูกค้า)`)) return;
+    await callAdminAction("resetDiscountUse", token, { id: c.id });
+    loadDiscounts();
   };
 
   const toggleDiscount = async (id, active) => {
@@ -3323,21 +3370,32 @@ function AdminDashboard({ token, onLogout }) {
                       style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
                   </div>
                 </div>
+                <div style={{marginBottom:14}}>
+                  <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>วันหมดอายุ (เว้นว่าง = ไม่หมดอายุ — ใช้ได้ถึงสิ้นวันที่เลือก)</label>
+                  <input type="date" value={newExp} onChange={e=>setNewExp(e.target.value)}
+                    style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                </div>
                 <button onClick={createCode} disabled={!newCode.trim()} style={{width:"100%",padding:"12px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
                   สร้างรหัส
                 </button>
               </div>
               <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
                 <table className="adm-table">
-                  <thead><tr><th>รหัส</th><th>ส่วนลด</th><th>ใช้แล้ว/ทั้งหมด</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                  <thead><tr><th>รหัส</th><th>ส่วนลด</th><th>ใช้แล้ว/ทั้งหมด</th><th>หมดอายุ</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
                   <tbody>
                     {discounts.map(c => (
                       <tr key={c.id}>
                         <td style={{fontWeight:700,fontFamily:"monospace"}}>{c.code}</td>
                         <td style={{fontWeight:700,color:"var(--or)"}}>฿{c.discount_amount||`${c.discount_percent}%`}</td>
                         <td>{c.used_count}/{c.max_uses}</td>
-                        <td><span style={{fontSize:12,fontWeight:600,color:c.active?"#2d7a4f":"#c0392b",background:c.active?"rgba(45,122,79,.1)":"rgba(192,57,43,.1)",padding:"3px 8px",borderRadius:20}}>{c.active?"ใช้งานได้":"ปิดใช้งาน"}</span></td>
-                        <td><button onClick={()=>toggleDiscount(c.id,!c.active)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:c.active?"rgba(192,57,43,.1)":"rgba(45,122,79,.1)",color:c.active?"#c0392b":"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{c.active?"ปิด":"เปิด"}</button></td>
+                        <td style={{fontSize:12}}>{c.expires_at ? new Date(c.expires_at+"T00:00:00").toLocaleDateString("th-TH",{day:"numeric",month:"short",year:"2-digit"}) : "ไม่หมดอายุ"}</td>
+                        <td>{(() => {
+                          const expired = !!c.expires_at && c.expires_at.slice(0,10) < toIso(new Date());
+                          const used = c.used_count >= c.max_uses;
+                          const [txt, col] = !c.active ? ["ปิดใช้งาน","#c0392b"] : expired ? ["หมดอายุแล้ว","#c0392b"] : used ? ["ใช้ครบแล้ว","#8a5a00"] : ["ใช้งานได้","#2d7a4f"];
+                          return <span style={{fontSize:12,fontWeight:600,color:col,background:`${col}1a`,padding:"3px 8px",borderRadius:20}}>{txt}</span>;
+                        })()}</td>
+                        <td><button onClick={()=>toggleDiscount(c.id,!c.active)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:c.active?"rgba(192,57,43,.1)":"rgba(45,122,79,.1)",color:c.active?"#c0392b":"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{c.active?"ปิด":"เปิด"}</button>{c.used_count > 0 && <button onClick={()=>resetDiscount(c)} title="รีเซ็ตจำนวนที่ใช้เป็น 0" style={{marginLeft:6,padding:"5px 10px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:12,cursor:"pointer"}}>รีเซ็ต</button>}</td>
                       </tr>
                     ))}
                   </tbody>
