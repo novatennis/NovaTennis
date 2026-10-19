@@ -70,6 +70,14 @@ async function sb(path, options = {}) {
   return { ok: res.ok, body };
 }
 
+// คืนสิทธิ์ใช้โค้ด 1 ครั้ง (ยกเลิกรายการที่ยังไม่ได้ยืนยัน = ยังไม่เคยได้ใช้ส่วนลดจริง)
+async function releaseDiscountByCode(code) {
+  if (!code) return;
+  const { body } = await sb(`discount_codes?code=eq.${encodeURIComponent(code)}&select=id,used_count`);
+  const d = (body || [])[0];
+  if (d && d.used_count > 0) await sb(`discount_codes?id=eq.${d.id}`, { method: "PATCH", body: JSON.stringify({ used_count: d.used_count - 1 }) });
+}
+
 async function getActiveIntervals(bookingDate, courtId) {
   const { body } = await sb(
     `bookings?booking_date=eq.${bookingDate}&court_id=eq.${courtId}&status=neq.cancelled&select=hour,start_minute,duration_minutes,status,created_time`
@@ -155,6 +163,9 @@ export default async function handler(req, res) {
           await sb(`bookings?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status }) });
         }
 
+        if (status === "cancelled" && before?.discount_code && before.status !== "confirmed") {
+          await releaseDiscountByCode(before.discount_code); // รายการที่ยังไม่เคยยืนยัน = ยังไม่ได้ใช้ส่วนลดจริง → คืนสิทธิ์ (ถ้ายืนยันไปแล้วไม่คืนอัตโนมัติ ใช้ปุ่ม "รีเซ็ต" ที่หน้า ส่วนลด)
+        }
         if (before?.package_id) {
           const wasConfirmed = before.status === "confirmed";
           // ยืนยันครั้งแรก (ยังไม่เคยเป็น confirmed มาก่อน) → หักสิทธิ์จริงตอนนี้
@@ -356,11 +367,20 @@ export default async function handler(req, res) {
         return;
       }
       case "createDiscount": {
-        const { code, amount, maxUses } = p;
-        await sb(`discount_codes`, {
-          method: "POST",
-          body: JSON.stringify({ code: String(code).toUpperCase(), discount_amount: parseInt(amount), discount_percent: 0, max_uses: parseInt(maxUses), active: true }),
-        });
+        const { code, amount, maxUses, expiresAt } = p;
+        if (expiresAt && !/^\d{4}-\d{2}-\d{2}$/.test(expiresAt)) { res.status(400).json({ error: "invalid_date" }); return; }
+        const row = { code: String(code).toUpperCase(), discount_amount: parseInt(amount), discount_percent: 0, max_uses: parseInt(maxUses), active: true };
+        if (expiresAt) row.expires_at = expiresAt;
+        const ins = await sb(`discount_codes`, { method: "POST", body: JSON.stringify(row) });
+        if (!ins.ok) { res.status(500).json({ error: "insert_failed" }); return; } // เช่นยังไม่ได้รัน SQL เพิ่มคอลัมน์ expires_at
+        res.status(200).json({ ok: true });
+        return;
+      }
+      case "resetDiscountUse": {
+        // รีเซ็ตจำนวนครั้งที่ใช้โค้ดกลับเป็น 0 (เช่นคืนโค้ดให้ลูกค้าหลังยกเลิกรายการที่ยืนยันไปแล้ว)
+        const { id } = p;
+        if (!id) { res.status(400).json({ error: "missing id" }); return; }
+        await sb(`discount_codes?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ used_count: 0 }) });
         res.status(200).json({ ok: true });
         return;
       }
