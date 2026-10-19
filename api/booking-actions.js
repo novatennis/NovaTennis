@@ -110,6 +110,42 @@ const toBookingName = (s) => graphemes(String(s || "").trim()).slice(0, NAME_MAX
 // ชื่อจาก LINE อาจมีอักขระ < > & ซึ่งทำให้ข้อความ Telegram (โหมด HTML) ส่งไม่ผ่าน — escape ก่อนใส่ในข้อความ
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+// ─── โค้ดส่วนลด: วันหมดอายุ / ล็อกการใช้ / คืนโค้ด ───
+const todayBangkok = () => new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
+// หมดอายุ = วันที่ปัจจุบัน (เวลาไทย) เลยวันที่ในคอลัมน์ expires_at ไปแล้ว — ใช้ได้ถึงสิ้นวันที่ระบุ / ไม่ใส่ = ไม่หมดอายุ
+const isDiscountExpired = (d) => !!d.expires_at && String(d.expires_at).slice(0, 10) < todayBangkok();
+
+// ล็อกการใช้โค้ด "ก่อน" สร้างการจอง ด้วยการอัปเดตแบบมีเงื่อนไข (used_count ต้องยังเท่าค่าที่เพิ่งอ่าน)
+// ถ้ามีคนใช้ตัดหน้าไปพร้อมกัน เงื่อนไขจะไม่ตรง → อ่านใหม่แล้วตรวจอีกรอบ จึงไม่มีทางที่โค้ดใช้ได้ครั้งเดียวถูกใช้ซ้ำสองครั้ง
+async function claimDiscount(discountId, basePrice) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { body } = await sb(`discount_codes?id=eq.${encodeURIComponent(discountId)}&select=*`);
+    const d = (body || [])[0];
+    if (!d || !d.active) return { error: "invalid" };
+    if (isDiscountExpired(d)) return { error: "expired" };
+    if (d.used_count >= d.max_uses) return { error: "used" };
+    const { ok, body: upd } = await sb(`discount_codes?id=eq.${d.id}&used_count=eq.${d.used_count}`, {
+      method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ used_count: d.used_count + 1 }),
+    });
+    if (ok && upd && upd.length > 0) {
+      const amount = d.discount_amount > 0 ? d.discount_amount : Math.round(basePrice * d.discount_percent / 100);
+      return { row: upd[0], amount };
+    }
+  }
+  return { error: "used" };
+}
+// คืนสิทธิ์การใช้โค้ด 1 ครั้ง (ใช้ตอนสร้างการจองไม่สำเร็จ หรือยกเลิกรายการที่ยังไม่ได้ชำระ/ยังไม่ได้ยืนยัน)
+async function releaseDiscountById(id) {
+  const { body } = await sb(`discount_codes?id=eq.${encodeURIComponent(id)}&select=id,used_count`);
+  const d = (body || [])[0];
+  if (d && d.used_count > 0) await sb(`discount_codes?id=eq.${d.id}`, { method: "PATCH", body: JSON.stringify({ used_count: d.used_count - 1 }) });
+}
+async function releaseDiscountByCode(code) {
+  if (!code) return;
+  const { body } = await sb(`discount_codes?code=eq.${encodeURIComponent(code)}&select=id`);
+  if ((body || [])[0]) await releaseDiscountById(body[0].id);
+}
+
 // สิทธิ์แพ็คเกจที่ถูกจองค้างไว้ (การจองสถานะ "รอการยืนยัน" ที่ยังไม่ถูกหัก) — 60 นาที = 1 ครั้ง, 120 นาที = 2 ครั้ง
 async function getReservedCredits(packageId) {
   const { body } = await sb(`bookings?package_id=eq.${packageId}&status=eq.reviewing&select=duration_minutes`);
@@ -215,12 +251,14 @@ export default async function handler(req, res) {
       case "checkDiscount": {
         const { code } = p;
         if (!code) { res.status(200).json({ valid: false }); return; }
-        const { body } = await sb(`discount_codes?code=eq.${String(code).toUpperCase()}&active=eq.true&select=*`);
+        const { body } = await sb(`discount_codes?code=eq.${encodeURIComponent(String(code).trim().toUpperCase())}&select=*`);
         const d = (body || [])[0];
-        if (!d || d.used_count >= d.max_uses) { res.status(200).json({ valid: false }); return; }
+        if (!d || !d.active) { res.status(200).json({ valid: false, reason: "invalid" }); return; }
+        if (isDiscountExpired(d)) { res.status(200).json({ valid: false, reason: "expired", expires_at: d.expires_at }); return; }
+        if (d.used_count >= d.max_uses) { res.status(200).json({ valid: false, reason: "used" }); return; }
         res.status(200).json({
           valid: true, id: d.id, code: d.code,
-          discount_amount: d.discount_amount, discount_percent: d.discount_percent,
+          discount_amount: d.discount_amount, discount_percent: d.discount_percent, expires_at: d.expires_at || null,
         });
         return;
       }
@@ -322,15 +360,15 @@ export default async function handler(req, res) {
 
         let discountAmount = 0;
         let discountRow = null;
-        if (discountCodeId && !isFirstTimePromo) { // โปรจองครั้งแรกไม่ร่วมกับโค้ดส่วนลด
-          const { body: discRows } = await sb(`discount_codes?id=eq.${discountCodeId}&active=eq.true&select=*`);
-          const d = (discRows || [])[0];
-          if (d && d.used_count < d.max_uses) {
-            discountAmount = d.discount_amount > 0 ? d.discount_amount : Math.round(basePrice * d.discount_percent / 100);
-            discountRow = d;
-          }
+        if (discountCodeId && !isFirstTimePromo) { // โปรจองครั้งแรกไม่ร่วมกับโค้ดส่วนลด (โค้ดที่ส่งมาจะไม่ถูกใช้/ไม่ถูกตัดสิทธิ์)
+          const claim = await claimDiscount(discountCodeId, basePrice);
+          if (claim.error) { res.status(400).json({ error: "discount_invalid", reason: claim.error }); return; } // โค้ดหมดอายุ/ถูกใช้แล้ว/ใช้ไม่ได้ — ไม่แอบคิดราคาเต็มโดยลูกค้าไม่รู้
+          discountAmount = claim.amount;
+          discountRow = claim.row;
         }
         const finalPrice = Math.max(0, basePrice - discountAmount);
+        // โค้ดครอบคลุมทั้งยอด (เหลือ 0 บาท) = ไม่มีอะไรให้โอน/แนบสลิป → ส่งเป็น "รอแอดมินยืนยัน" ตรงๆ เหมือนการจองด้วยแพ็คเกจ
+        const isFree = finalPrice === 0 && !!discountRow;
 
         await sb(`customers`, {
           method: "POST",
@@ -345,20 +383,24 @@ export default async function handler(req, res) {
             court_id: courtId, customer_id: customerId, customer_name: customerName,
             booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
             price: finalPrice, discount_code: discountRow?.code || null, discount_amount: discountAmount,
-            status: "pending",
+            status: isFree ? "reviewing" : "pending",
           }),
         });
         const bookingRow = (created || [])[0];
-        if (!bookingRow) { res.status(500).json({ error: "insert_failed" }); return; }
-
-        if (discountRow) {
-          await sb(`discount_codes?id=eq.${discountRow.id}`, {
-            method: "PATCH",
-            body: JSON.stringify({ used_count: discountRow.used_count + 1 }),
-          });
+        if (!bookingRow) {
+          if (discountRow) await releaseDiscountById(discountRow.id); // สร้างการจองไม่สำเร็จ → คืนสิทธิ์โค้ด
+          res.status(500).json({ error: "insert_failed" }); return;
         }
 
-        res.status(200).json({ booking: bookingRow, isFirstTimePromo });
+        if (isFree) {
+          await notifyTelegram(
+            `🎁 <b>มีการจองด้วยโค้ดส่วนลดเต็มจำนวน</b>\n` +
+            `ไม่มียอดที่ต้องโอน — รอแอดมินยืนยัน\n\n` +
+            `👤 ${esc(customerName)}\n📞 ${customerId}\n🎾 Court ${courtId}\n📅 ${bookingDate}\n` +
+            `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n🏷 โค้ด ${esc(discountRow.code)} (฿${discountAmount})`
+          );
+        }
+        res.status(200).json({ booking: bookingRow, isFirstTimePromo, free: isFree });
         return;
       }
 
@@ -451,6 +493,7 @@ export default async function handler(req, res) {
         });
         const row = (body || [])[0] || null;
         if (ok && row) {
+          if (row.discount_code) await releaseDiscountByCode(row.discount_code); // ยกเลิกรายการที่ยังไม่ได้ชำระ/ยังไม่ยืนยัน → คืนสิทธิ์ใช้โค้ด
           let courtLabel = `Court ${row.court_id}`;
           let totalPrice = row.price || 0;
           if (row.group_id) {
