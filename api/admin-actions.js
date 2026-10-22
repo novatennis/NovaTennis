@@ -70,6 +70,13 @@ async function sb(path, options = {}) {
   return { ok: res.ok, body };
 }
 
+// สิทธิ์แพ็คเกจที่ถูกจองค้างไว้ (การจองของลูกค้าสถานะ "รอการยืนยัน" ที่ยังไม่ถูกหัก) — 60 นาที = 1 ครั้ง, 120 นาที = 2 ครั้ง
+async function getReservedCredits(packageId) {
+  const { body } = await sb(`bookings?package_id=eq.${packageId}&status=eq.reviewing&select=duration_minutes`);
+  return (body || []).reduce((s, b) => s + Math.max(1, Math.round((b.duration_minutes || 60) / 60)), 0);
+}
+const todayBangkok = () => new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
 // คืนสิทธิ์ใช้โค้ด 1 ครั้ง (ยกเลิกรายการที่ยังไม่ได้ยืนยัน = ยังไม่เคยได้ใช้ส่วนลดจริง)
 async function releaseDiscountByCode(code) {
   if (!code) return;
@@ -222,18 +229,29 @@ export default async function handler(req, res) {
         const { body: cust } = await sb(`customers?customer_id=eq.${phone}&select=customer_name`);
         const { body: line } = await sb(`line_users?phone=eq.${phone}&select=display_name,customer_name&limit=1`);
         const { body: hist } = await sb(`bookings?customer_id=eq.${phone}&status=in.(confirmed,reviewing)&select=id&limit=50`);
+        // แพ็คเกจที่ยังใช้ได้ (active + ยังไม่หมดอายุ + ยังมีสิทธิ์เหลือ) พร้อมจำนวนที่จองค้างรอยืนยันอยู่
+        const { body: pk } = await sb(`packages?customer_id=eq.${phone}&status=eq.active&select=id,tier,total_credits,remaining_credits,expiry_date&order=created_time.asc`);
+        const today = todayBangkok();
+        const packages = [];
+        for (const x of (pk || [])) {
+          if (x.expiry_date && String(x.expiry_date).slice(0, 10) < today) continue;
+          const reserved = await getReservedCredits(x.id);
+          if (x.remaining_credits - reserved > 0) packages.push({ ...x, reserved_credits: reserved, available: x.remaining_credits - reserved });
+        }
         res.status(200).json({
           name: (cust || [])[0]?.customer_name || null,
           linked: (line || []).length > 0,
           lineName: (line || [])[0]?.display_name || null,
           bookingsCount: (hist || []).length,
+          packages,
         });
         return;
       }
       case "createAdminBooking": {
         // แอดมินจองแทนลูกค้า (โทรมาจอง/ไม่มี LINE) — ไม่ต้องล็อกอิน LINE, ไม่มีโปรอัตโนมัติ, แอดมินกำหนดราคาต่อสนามเอง
         // ถ้าภายหลังลูกค้าล็อกอิน LINE แล้วผูกเบอร์นี้ ชื่อ LINE จะแทนชื่อที่แอดมินใส่ในข้อมูลลูกค้า (ดู lineLinkPhone)
-        const { customerId, customerName, courtIds, bookingDate, hour, startMinute, durationMinutes, price, status } = p;
+        const { customerId, customerName, courtIds, bookingDate, hour, startMinute, durationMinutes, packageId } = p;
+        let { price, status } = p;
         if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid phone" }); return; }
         const name = String(customerName || "").trim();
         if (name.length < 1 || nameLen(name) > 40) { res.status(400).json({ error: "invalid name" }); return; }
@@ -242,6 +260,26 @@ export default async function handler(req, res) {
         if (!/^\d{4}-\d{2}-\d{2}$/.test(bookingDate || "")) { res.status(400).json({ error: "invalid date" }); return; }
         if (!Number.isInteger(hour) || hour < 0 || hour > 23 || ![0, 30].includes(startMinute || 0)) { res.status(400).json({ error: "invalid time" }); return; }
         if (![30, 60, 90, 120].includes(durationMinutes)) { res.status(400).json({ error: "invalid duration" }); return; }
+
+        // ── ตัดสิทธิ์แพ็คเกจ (ถ้าเลือก): ราคา 0 / ยืนยันทันที / หักสิทธิ์ทันที (แอดมินเป็นคนยืนยันเอง) ──
+        let pkg = null, units = 0;
+        if (packageId) {
+          if (ids.length !== 1) { res.status(400).json({ error: "package_one_court" }); return; }
+          if (![60, 120].includes(durationMinutes)) { res.status(400).json({ error: "package_duration" }); return; }
+          units = durationMinutes / 60; // 60 นาที = 1 ครั้ง, 120 นาที = 2 ครั้ง
+          const { body: pkgRows } = await sb(`packages?id=eq.${encodeURIComponent(packageId)}&customer_id=eq.${customerId}&select=*`);
+          pkg = (pkgRows || [])[0];
+          if (!pkg || pkg.status !== "active") { res.status(400).json({ error: "package_not_active" }); return; }
+          if (pkg.expiry_date && String(pkg.expiry_date).slice(0, 10) < todayBangkok()) { res.status(400).json({ error: "package_expired" }); return; }
+          const reserved = await getReservedCredits(pkg.id);
+          if (pkg.remaining_credits - reserved < units) { res.status(400).json({ error: "package_no_credits", available: Math.max(0, pkg.remaining_credits - reserved), needed: units }); return; }
+          // ทุกชั่วโมงที่จองต้องอยู่ในช่วงที่แพ็คครอบคลุม: แพ็ค Peak ได้ทุกชั่วโมง / แพ็ค Off Peak เฉพาะ จ.–ศ. ก่อน 16:00
+          const dow = new Date(bookingDate + "T00:00:00").getDay();
+          const weekend = dow === 0 || dow === 6;
+          const covered = Array.from({ length: units }, (_, i) => hour + i).every((h) => pkg.tier === "peak" || !(weekend || h >= 16));
+          if (!covered) { res.status(400).json({ error: "package_wrong_tier" }); return; }
+          price = 0; status = "confirmed";
+        }
         const unit = Number(price);
         if (!Number.isFinite(unit) || unit < 0 || unit > 20000) { res.status(400).json({ error: "invalid price" }); return; }
         if (!["confirmed", "reviewing"].includes(status)) { res.status(400).json({ error: "invalid status" }); return; }
@@ -253,6 +291,26 @@ export default async function handler(req, res) {
           if (taken.some(([s, e]) => startMin < e && endMin > s)) { res.status(409).json({ error: "slot_taken", court: cid }); return; }
         }
 
+        let remainingAfter = null;
+        if (pkg) {
+          let claimed = false;
+          for (let attempt = 0; attempt < 3 && !claimed; attempt++) {
+            const { body: cur } = await sb(`packages?id=eq.${pkg.id}&select=remaining_credits`);
+            const rem = (cur || [])[0]?.remaining_credits ?? 0;
+            const reserved = await getReservedCredits(pkg.id);
+            if (rem - reserved < units) { res.status(400).json({ error: "package_no_credits", available: Math.max(0, rem - reserved), needed: units }); return; }
+            const upd = await sb(`packages?id=eq.${pkg.id}&remaining_credits=eq.${rem}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ remaining_credits: rem - units }) });
+            if (upd.ok && upd.body && upd.body.length > 0) { claimed = true; remainingAfter = rem - units; }
+          }
+          if (!claimed) { res.status(409).json({ error: "package_busy" }); return; }
+        }
+        const restoreCredits = async () => {
+          if (!pkg) return;
+          const { body: cur } = await sb(`packages?id=eq.${pkg.id}&select=remaining_credits,total_credits`);
+          const c = (cur || [])[0];
+          if (c) await sb(`packages?id=eq.${pkg.id}`, { method: "PATCH", body: JSON.stringify({ remaining_credits: Math.min(c.total_credits, c.remaining_credits + units) }) });
+        };
+
         // ลูกค้าใหม่ → สร้างข้อมูลลูกค้าด้วยชื่อที่แอดมินใส่ / ลูกค้าเดิม → ไม่ทับชื่อเดิม
         await sb(`customers`, { method: "POST", headers: { Prefer: "resolution=ignore-duplicates" }, body: JSON.stringify({ customer_id: customerId, customer_name: name }) });
 
@@ -260,7 +318,7 @@ export default async function handler(req, res) {
         const baseRow = (cid) => ({
           court_id: cid, customer_id: customerId, customer_name: name,
           booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
-          price: Math.round(unit), discount_amount: 0, status, ...(groupId ? { group_id: groupId } : {}),
+          price: Math.round(unit), discount_amount: 0, status, ...(groupId ? { group_id: groupId } : {}), ...(pkg ? { package_id: pkg.id } : {}),
         });
         let ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(ids.map(c => ({ ...baseRow(c), booked_by: "admin" }))) });
         if (!ins.ok) {
@@ -268,27 +326,18 @@ export default async function handler(req, res) {
           console.error("createAdminBooking: insert with booked_by failed — run add-booked-by-column.sql");
           ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(ids.map(baseRow)) });
         }
-        if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== ids.length) { res.status(500).json({ error: "insert_failed" }); return; }
+        if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== ids.length) { await restoreCredits(); res.status(500).json({ error: "insert_failed" }); return; }
 
         await notifyTelegram(
           `📞 <b>แอดมินจองให้ลูกค้า</b>\n\n` +
           `👤 ${esc(name)}\n📞 ${customerId}\n` +
           `🎾 ${ids.map(c => `Court ${c}`).join(" + ")}\n📅 ${bookingDate}\n` +
           `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n` +
-          `💰 ฿${(Math.round(unit) * ids.length).toLocaleString()} (${status === "confirmed" ? "ชำระแล้ว" : "รอชำระ"})`
+          (pkg
+            ? `🎟 ตัดสิทธิ์แพ็คเกจ ${units} ครั้ง (เหลือ ${remainingAfter} / ${pkg.total_credits} ครั้ง) — ยืนยันแล้ว`
+            : `💰 ฿${(Math.round(unit) * ids.length).toLocaleString()} (${status === "confirmed" ? "ชำระแล้ว" : "รอชำระ"})`)
         );
-        res.status(200).json({ ok: true, bookings: ins.body });
-        return;
-      }
-      case "updateBookingName": {
-        // แก้ชื่อที่พิมพ์ผิดในการจองที่มีอยู่ (การจองคู่แก้ทั้งคู่) — ไม่แตะเบอร์/ราคา/สถานะ
-        const { id, name } = p;
-        const clean = String(name || "").trim();
-        if (!id || clean.length < 1 || nameLen(clean) > 40) { res.status(400).json({ error: "invalid" }); return; }
-        const { body } = await sb(`bookings?id=eq.${id}&select=group_id`);
-        const gid = (body || [])[0]?.group_id;
-        await sb(gid ? `bookings?group_id=eq.${encodeURIComponent(gid)}` : `bookings?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ customer_name: clean }) });
-        res.status(200).json({ ok: true });
+        res.status(200).json({ ok: true, bookings: ins.body, ...(pkg ? { creditsUsed: units, remaining: remainingAfter } : {}) });
         return;
       }
       case "updateCustomerName": {
