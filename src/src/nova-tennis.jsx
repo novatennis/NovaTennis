@@ -2501,6 +2501,8 @@ function AdminDashboard({ token, onLogout }) {
   const START_OPTS = (() => { const o = []; for (let m = DAY_START_MIN; m < DAY_END_MIN; m += 30) o.push(m); return o; })();
   const [nb, setNb] = useState({ phone: "", name: "", date: toIso(new Date()), courts: [1], startMin: 10 * 60, duration: 60, price: "", status: "reviewing", packageId: "" });
   const [nbInfo, setNbInfo] = useState(null);
+  const nbAutoName = useRef(""); // ชื่อที่ระบบเติมให้อัตโนมัติจากเบอร์ (ใช้แยกจากชื่อที่แอดมินพิมพ์เอง)
+  const [nbInfoErr, setNbInfoErr] = useState(null); // ค้นหาข้อมูลลูกค้าไม่สำเร็จ (บอกสาเหตุ ไม่ปล่อยให้หน้าเงียบ)
   const [nbBusy, setNbBusy] = useState(false);
   const [nbMsg, setNbMsg] = useState(null);
   const nbAutoUnit = nb.date ? getDurationPrice(Math.floor(nb.startMin / 60), new Date(nb.date + "T00:00:00"), nb.duration).price : 0;
@@ -2528,15 +2530,20 @@ function AdminDashboard({ token, onLogout }) {
     return { ...prev, packageId: best ? String(best.id) : "", duration: [60, 120].includes(prev.duration) ? prev.duration : 60, courts: prev.courts.slice(0, 1) };
   });
   useEffect(() => {
-    setNbInfo(null);
-    setNb(prev => (prev.packageId ? { ...prev, packageId: "" } : prev));
+    setNbInfo(null); setNbInfoErr(null);
+    setNb(prev => {
+      const clearName = !!nbAutoName.current && prev.name === nbAutoName.current; // ชื่อเดิมถูกเติมโดยระบบ ไม่ใช่ที่แอดมินพิมพ์ → ล้าง
+      if (clearName) nbAutoName.current = "";
+      return (prev.packageId || clearName) ? { ...prev, packageId: "", ...(clearName ? { name: "" } : {}) } : prev;
+    });
     if (!/^[0-9]{10}$/.test(nb.phone)) return;
     let cancelled = false;
     callAdminAction("lookupCustomer", token, { phone: nb.phone }).then(r => {
-      if (cancelled || !r || r.error) return;
+      if (cancelled) return;
+      if (!r || r.error) { setNbInfoErr(`ค้นหาข้อมูลลูกค้าไม่สำเร็จ (${r?.error || "ไม่มีข้อมูลตอบกลับ"}) — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว และดู Vercel → Logs`); return; }
       setNbInfo(r);
-      if (r.name) setNb(prev => (prev.phone === nb.phone && !prev.name ? { ...prev, name: r.name } : prev)); // เบอร์เดิม → เติมชื่อเดิมให้ (แก้ได้)
-    });
+      if (r.name) setNb(prev => { if (prev.phone !== nb.phone || prev.name) return prev; nbAutoName.current = r.name; return { ...prev, name: r.name }; }); // เบอร์เดิม → เติมชื่อเดิมให้ (แก้ได้)
+    }).catch(() => { if (!cancelled) setNbInfoErr("เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ (deploy ไม่ครบหรือมีข้อผิดพลาดฝั่งเซิร์ฟเวอร์) — ตรวจว่า deploy ทั้ง nova-tennis.jsx และ api/admin-actions.js แล้ว และดู Vercel → Logs"); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nb.phone]);
@@ -2552,11 +2559,12 @@ function AdminDashboard({ token, onLogout }) {
         : `ยอดรวม ฿${total.toLocaleString()} • ${nb.status === "confirmed" ? "ชำระแล้ว (ยืนยันทันที)" : "รอชำระ"}\n\nยืนยันการจอง?`));
     if (!ok) return;
     setNbBusy(true); setNbMsg(null);
-    const r = await callAdminAction("createAdminBooking", token, {
+    let r = null;
+    try { r = await callAdminAction("createAdminBooking", token, {
       customerId: nb.phone, customerName: nb.name.trim(), courtIds: nb.courts, bookingDate: nb.date,
       hour: Math.floor(nb.startMin / 60), startMinute: nb.startMin % 60, durationMinutes: nb.duration, price: Math.round(nbUnit), status: nb.status,
       ...(nbUsePkg ? { packageId: nb.packageId } : {}),
-    });
+    }); } catch { r = { error: "network_or_server" }; }
     setNbBusy(false);
     if (r?.ok) {
       setNbMsg({ ok: true, text: `✅ จองให้ ${nb.name.trim()} เรียบร้อย (${nb.courts.map(c => "Court " + c).join(" + ")} ${nb.date} ${minutesToLabel(nb.startMin)})${r.creditsUsed ? ` • ตัดสิทธิ์แพ็คเกจ ${r.creditsUsed} ครั้ง เหลือ ${r.remaining} ครั้ง` : ""}` });
@@ -2571,7 +2579,8 @@ function AdminDashboard({ token, onLogout }) {
         : r?.error === "package_expired" ? "❌ แพ็คเกจหมดอายุแล้ว"
         : r?.error === "package_busy" ? "❌ มีการตัดสิทธิ์แพ็คเกจนี้พร้อมกัน กรุณาลองใหม่อีกครั้ง"
         : r?.error === "package_not_active" ? "❌ แพ็คเกจนี้ใช้ไม่ได้ (ไม่ใช่ของเบอร์นี้ หรือยังไม่เปิดใช้งาน)"
-        : "❌ บันทึกไม่สำเร็จ ตรวจข้อมูลแล้วลองใหม่อีกครั้ง" });
+        : r?.error === "network_or_server" ? "❌ เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว และดู Vercel → Logs"
+        : `❌ บันทึกไม่สำเร็จ (${r?.error || "ไม่ทราบสาเหตุ"}) ตรวจข้อมูลแล้วลองใหม่อีกครั้ง` });
     }
   };
   // ลูกค้า: ค้นหา / แก้ชื่อ / แก้เบอร์ / เบอร์ที่ผูกกับ LINE + ปลดล็อก
@@ -2622,6 +2631,36 @@ function AdminDashboard({ token, onLogout }) {
     setAllPkgs(rows || []);
     setAllPkgsLoading(false);
   };
+  // ── แพ็คเกจ: ค้นหา / กรอง "เฉพาะที่ยังใช้ได้" / สรุป ──
+  const [pkgQuery, setPkgQuery] = useState("");
+  const [pkgOnlyUsable, setPkgOnlyUsable] = useState(true);
+  const pkgToday = toIso(new Date());
+  const pkgUsable = (pk) => pk.status === "active" && pk.remaining_credits > 0 && !(pk.expiry_date && String(pk.expiry_date).slice(0, 10) < pkgToday);
+  const pkQ = pkgQuery.trim().toLowerCase();
+  const pkDigits = pkQ.replace(/\D/g, "");
+  const visiblePkgs = allPkgs.filter(pk => (!pkgOnlyUsable || pkgUsable(pk)) && (!pkQ || String(pk.customer_name || "").toLowerCase().includes(pkQ) || (pkDigits.length > 0 && String(pk.customer_id).includes(pkDigits))));
+  const usableAll = allPkgs.filter(pkgUsable);
+  const usableCustomers = new Set(usableAll.map(pk => pk.customer_id)).size;
+  const usableCredits = usableAll.reduce((s, pk) => s + pk.remaining_credits, 0);
+
+  // ── ประวัติลูกค้า: แพ็คเกจ + วันเวลาที่ใช้สิทธิ์ + ประวัติการจองทั้งหมดของเบอร์นั้น ──
+  const [histPhone, setHistPhone] = useState(null);
+  const [hist, setHist] = useState(null);
+  const [histLoading, setHistLoading] = useState(false);
+  const [histAll, setHistAll] = useState(false);
+  const openHistory = async (phone) => {
+    setHistPhone(phone); setHist(null); setHistAll(false); setHistLoading(true);
+    const r = await callAdminAction("customerHistory", token, { phone });
+    setHist(r && !r.error ? r : { error: true });
+    setHistLoading(false);
+  };
+  const closeHistory = () => { setHistPhone(null); setHist(null); };
+  const fmtDay = (iso) => iso ? new Date(String(iso).slice(0, 10) + "T00:00:00").toLocaleDateString("th-TH", { weekday: "short", day: "numeric", month: "short", year: "2-digit" }) : "-";
+  const fmtRange = (b) => `${minutesToLabel(b.hour * 60 + (b.start_minute || 0))}–${minutesToLabel(b.hour * 60 + (b.start_minute || 0) + (b.duration_minutes || 60))}`;
+  const bookedAt = (b) => b.created_time ? parseUtc(b.created_time).toLocaleDateString("th-TH", { day: "numeric", month: "short", timeZone: "Asia/Bangkok" }) : "";
+  const histStatus = (b) => b.status === "confirmed" ? ["✅ ยืนยันแล้ว", "#2d7a4f"] : b.status === "reviewing" ? ["🔍 รอยืนยัน", "#e67e22"] : b.status === "cancelled" ? ["❌ ยกเลิก", "#c0392b"]
+    : b.status === "pending" ? (Date.now() - new Date(b.created_time).getTime() < 5 * 60 * 1000 ? ["⏳ รอชำระ", "#8a5a00"] : ["⌛ หมดเวลา ไม่ได้ชำระ", "var(--mu)"]) : [b.status, "var(--mu)"];
+
   const confirmPackage = async (id) => {
     if (!window.confirm("ยืนยันการซื้อแพ็คเกจนี้ใช่หรือไม่? จะเริ่มนับวันหมดอายุตั้งแต่ตอนนี้")) return;
     await callAdminAction("confirmPackage", token, { id });
@@ -3033,6 +3072,23 @@ function AdminDashboard({ token, onLogout }) {
                       {" • "}{nbInfo.linked ? `🔗 ผูก LINE แล้ว (${nbInfo.lineName || "LINE"})` : "ยังไม่ผูก LINE"}
                     </p>
                   )}
+                  {nbInfoErr && <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"#c0392b",fontWeight:600}}>⚠️ {nbInfoErr}</p>}
+                  {nbInfo && !Array.isArray(nbInfo.packages) && (
+                    <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"#c0392b",fontWeight:600}}>⚠️ เซิร์ฟเวอร์ยังเป็นเวอร์ชันเก่า (ยังไม่ได้อัปเดตไฟล์ api/admin-actions.js) จึงยังตัดแพ็คเกจไม่ได้</p>
+                  )}
+                  {nbInfo?.packagesError && (
+                    <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"#c0392b",fontWeight:600}}>⚠️ ดึงข้อมูลแพ็คเกจของเบอร์นี้ไม่สำเร็จ (ดู Vercel → Logs) — ตัดแพ็คเกจไม่ได้ในตอนนี้</p>
+                  )}
+                  {nbInfo && Array.isArray(nbInfo.packages) && !nbInfo.packagesError && nbInfo.packages.length === 0 && (
+                    (nbInfo.packageIssues || []).length > 0 ? (
+                      <div style={{fontSize:12,marginTop:8,lineHeight:1.7,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:8,padding:"8px 10px"}}>
+                        <b>🎟 ลูกค้ามีแพ็คเกจ แต่ตัดสิทธิ์ไม่ได้ตอนนี้:</b>
+                        {nbInfo.packageIssues.map(i => <div key={i.id}>• {i.label} — {i.issue}</div>)}
+                      </div>
+                    ) : (
+                      <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"var(--mu)"}}>🎟 ไม่พบแพ็คเกจของเบอร์นี้ (ตรวจว่าเป็นเบอร์เดียวกับที่ซื้อแพ็คเกจ — ดูที่แท็บ 🎟 แพ็คเกจ)</p>
+                    )
+                  )}
                 </div>
                 <div>
                   <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ชื่อลูกค้า (ไม่เกิน 40 ตัวอักษร)</label>
@@ -3157,13 +3213,24 @@ function AdminDashboard({ token, onLogout }) {
                 <p style={{fontWeight:700,color:"var(--br)",fontSize:15}}>📋 แพ็คเกจทั้งหมด (ล่าสุด 200 รายการ)</p>
                 <button onClick={loadAllPkgs} style={{padding:"6px 12px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontWeight:600,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
               </div>
+              <div style={{background:"var(--or-bg)",border:"1px solid var(--dv)",borderRadius:10,padding:"10px 14px",marginBottom:12,fontSize:13,color:"var(--br)",lineHeight:1.7}}>
+                ตอนนี้มีแพ็คเกจที่ <b>ยังใช้ได้ {usableAll.length} แพ็คเกจ</b> ({usableCustomers} คน) • สิทธิ์คงเหลือรวม <b style={{color:"var(--or)"}}>{usableCredits} ครั้ง</b>
+              </div>
+              <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",marginBottom:12}}>
+                <input value={pkgQuery} onChange={e => setPkgQuery(e.target.value)} placeholder="🔍 ค้นหาชื่อหรือเบอร์โทร..."
+                  style={{flex:1,minWidth:200,padding:"10px 14px",borderRadius:10,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}} />
+                <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,color:"var(--br)",cursor:"pointer",whiteSpace:"nowrap"}}>
+                  <input type="checkbox" checked={pkgOnlyUsable} onChange={e => setPkgOnlyUsable(e.target.checked)} /> เฉพาะที่ยังใช้ได้
+                </label>
+                <span style={{fontSize:12,color:"var(--mu)"}}>แสดง {visiblePkgs.length} จาก {allPkgs.length}</span>
+              </div>
               <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
                 {allPkgsLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
-                allPkgs.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ยังไม่มีแพ็คเกจ</p> : (
+                allPkgs.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ยังไม่มีแพ็คเกจ</p> : visiblePkgs.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่พบแพ็คเกจที่ตรงกับเงื่อนไข (ลองปิด "เฉพาะที่ยังใช้ได้")</p> : (
                   <table className="adm-table">
-                    <thead><tr><th>ชื่อลูกค้า</th><th>เบอร์</th><th>แพ็คเกจ</th><th>ใช้ไป</th><th>คงเหลือ</th><th>ซื้อสำเร็จเมื่อ</th><th>หมดอายุ</th><th>สถานะ</th></tr></thead>
+                    <thead><tr><th>ชื่อลูกค้า</th><th>เบอร์</th><th>แพ็คเกจ</th><th>ใช้ไป</th><th>คงเหลือ</th><th>ซื้อสำเร็จเมื่อ</th><th>หมดอายุ</th><th>สถานะ</th><th>ประวัติ</th></tr></thead>
                     <tbody>
-                      {allPkgs.map(pk => {
+                      {visiblePkgs.map(pk => {
                         const expired = pk.status==="active" && pk.expiry_date && new Date(pk.expiry_date+"T23:59:59") < new Date();
                         const used = pk.status==="active" || pk.status==="cancelled" ? (pk.total_credits - pk.remaining_credits) : null;
                         return (
@@ -3180,6 +3247,7 @@ function AdminDashboard({ token, onLogout }) {
                                 {expired ? "หมดอายุแล้ว" : pk.status==="active" ? "ใช้งานได้" : pk.status==="cancelled" ? "ยกเลิกแล้ว" : pk.status==="reviewing" ? "รอการยืนยัน" : "รอชำระ"}
                               </span>
                             </td>
+                            <td><button onClick={() => openHistory(pk.customer_id)} title="ดูวันเวลาที่ใช้สิทธิ์ และประวัติการจอง" style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:700,fontSize:11.5,cursor:"pointer",whiteSpace:"nowrap"}}>📋 ดู</button></td>
                           </tr>
                         );
                       })}
@@ -3489,6 +3557,7 @@ function AdminDashboard({ token, onLogout }) {
                                 : <span style={{fontSize:12,color:"var(--mu)"}}>ยังไม่ผูก</span>}</td>
                               <td>
                                 <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                                  <button onClick={() => openHistory(c.customer_id)} title="ดูแพ็คเกจ การใช้สิทธิ์ และประวัติการจอง" style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:700,fontSize:11.5,cursor:"pointer"}}>📋 ประวัติ</button>
                                   <button onClick={() => editCustomerName(c)} disabled={!!lineName} title={lineName ? "ผูก LINE แล้ว ใช้ชื่อจาก LINE" : "แก้ชื่อ"} style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:lineName?"var(--cr2)":"var(--br)",fontSize:11.5,cursor:lineName?"not-allowed":"pointer"}}>✏️ ชื่อ</button>
                                   <button onClick={() => changeCustomerPhone(c)} title="เปลี่ยนเบอร์ (ย้ายการจอง/แพ็คเกจ/การผูก LINE ไปเบอร์ใหม่)" style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--br)",fontSize:11.5,cursor:"pointer"}}>✏️ เบอร์</button>
                                 </div>
@@ -3505,6 +3574,96 @@ function AdminDashboard({ token, onLogout }) {
           })()}
         </div>
       </div>
+
+      {histPhone && (
+        <div onClick={closeHistory} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(40,22,12,.55)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"20px 10px",overflowY:"auto"}}>
+          <div onClick={e => e.stopPropagation()} style={{background:"#fff",borderRadius:16,width:"100%",maxWidth:760,boxShadow:"0 12px 48px rgba(0,0,0,.35)",overflow:"hidden"}}>
+            <div style={{background:"var(--br)",color:"#fff",padding:"14px 18px",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+              <div style={{minWidth:0}}>
+                <p style={{fontWeight:800,fontSize:16,margin:0,overflow:"hidden",textOverflow:"ellipsis"}}>{hist?.name || "ลูกค้า"}</p>
+                <p style={{fontSize:12,opacity:.85,margin:"2px 0 0"}}>📞 {histPhone}{hist?.lineName ? ` • 🔗 LINE: ${hist.lineName}` : ""}</p>
+              </div>
+              <button onClick={closeHistory} style={{border:"none",background:"rgba(255,255,255,.18)",color:"#fff",width:34,height:34,borderRadius:17,fontSize:16,cursor:"pointer"}}>✕</button>
+            </div>
+            <div style={{padding:16}}>
+              {histLoading ? <p style={{textAlign:"center",color:"var(--mu)",padding:24}}>⏳ กำลังโหลด...</p>
+              : !hist || hist.error ? <p style={{textAlign:"center",color:"#c0392b",padding:24}}>โหลดข้อมูลไม่สำเร็จ ลองใหม่อีกครั้ง</p>
+              : (() => {
+                const bks = hist.bookings || [];
+                const shown = histAll ? bks : bks.slice(0, 30);
+                const cnt = (st) => bks.filter(b => b.status === st).length;
+                return (
+                  <>
+                    <p style={{fontWeight:700,color:"var(--br)",fontSize:14,margin:"0 0 10px"}}>🎟 แพ็คเกจ ({(hist.packages || []).length})</p>
+                    {(hist.packages || []).length === 0 && <p style={{fontSize:13,color:"var(--mu)",margin:"0 0 16px"}}>ลูกค้าคนนี้ไม่เคยซื้อแพ็คเกจ</p>}
+                    {(hist.packages || []).map(pk => {
+                      const expired = pk.status === "active" && pk.expiry_date && String(pk.expiry_date).slice(0, 10) < pkgToday;
+                      const [stTxt, stCol] = expired ? ["หมดอายุแล้ว", "#c0392b"] : pk.status === "active" ? ["ใช้งานได้", "#2d7a4f"] : pk.status === "cancelled" ? ["ยกเลิกแล้ว", "#c0392b"] : pk.status === "reviewing" ? ["รอการยืนยัน", "#e67e22"] : ["รอชำระ", "var(--mu)"];
+                      return (
+                        <div key={pk.id} style={{border:"1px solid var(--dv)",borderRadius:12,padding:12,marginBottom:12}}>
+                          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                            <p style={{fontWeight:800,color:"var(--br)",margin:0}}>{pk.tier === "peak" ? "Peak" : "Off Peak"} × {pk.total_credits} ครั้ง</p>
+                            <span style={{fontSize:12,fontWeight:700,color:stCol}}>{stTxt}</span>
+                          </div>
+                          <p style={{fontSize:12,color:"var(--mu)",margin:"4px 0 8px",lineHeight:1.6}}>
+                            ราคา ฿{(pk.price || 0).toLocaleString()} • เปิดใช้ {pk.activated_at ? parseUtc(pk.activated_at).toLocaleDateString("th-TH", { day: "numeric", month: "short", year: "2-digit", timeZone: "Asia/Bangkok" }) : "-"} • หมดอายุ {pk.expiry_date ? fmtDay(pk.expiry_date) : "-"}
+                          </p>
+                          {pk.status === "active" && (
+                            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+                              <span style={{background:"rgba(45,122,79,.12)",color:"#2d7a4f",fontWeight:700,fontSize:12.5,padding:"4px 10px",borderRadius:20}}>คงเหลือ {pk.remaining_credits} / {pk.total_credits}</span>
+                              <span style={{background:"var(--or-bg)",color:"var(--or)",fontWeight:700,fontSize:12.5,padding:"4px 10px",borderRadius:20}}>ตัดไปแล้ว {pk.usedByCredits} ครั้ง</span>
+                              {pk.pendingUnits > 0 && <span style={{background:"rgba(230,126,34,.14)",color:"#c0651a",fontWeight:700,fontSize:12.5,padding:"4px 10px",borderRadius:20}}>จองรอยืนยัน {pk.pendingUnits} ครั้ง (ยังไม่ตัด)</span>}
+                            </div>
+                          )}
+                          {pk.mismatch && <p style={{fontSize:12,color:"#c0392b",fontWeight:600,margin:"0 0 8px",lineHeight:1.6}}>⚠️ จำนวนที่ตัด ({pk.usedByCredits}) ไม่ตรงกับรายการที่ใช้สิทธิ์ที่ยืนยันแล้ว ({pk.usedConfirmed}) — อาจมีการแก้สิทธิ์ด้วยมือ ควรตรวจสอบ</p>}
+                          {(pk.uses || []).length === 0 ? <p style={{fontSize:12.5,color:"var(--mu)",margin:0}}>ยังไม่มีการใช้สิทธิ์</p> : (
+                            <div style={{borderTop:"1px solid var(--dv)"}}>
+                              {pk.uses.map(u => { const [t, c] = histStatus(u); return (
+                                <div key={u.id} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,padding:"9px 2px",borderBottom:"1px solid var(--dv)"}}>
+                                  <div style={{minWidth:0}}>
+                                    <div style={{fontWeight:700,fontSize:13.5,color:"var(--br)"}}>{fmtDay(u.booking_date)} • {fmtRange(u)}</div>
+                                    <div style={{fontSize:11.5,color:"var(--mu)",marginTop:2}}>Court {u.court_id} • จองเมื่อ {bookedAt(u)}</div>
+                                  </div>
+                                  <div style={{textAlign:"right",flexShrink:0}}>
+                                    <div style={{fontSize:12.5,fontWeight:700,color:c}}>{u.status === "confirmed" ? "✅ ตัดสิทธิ์แล้ว" : u.status === "reviewing" ? "🔍 รอยืนยัน" : t}</div>
+                                    <div style={{fontSize:11.5,color:"var(--mu)",marginTop:2}}>{u.status === "confirmed" ? "ตัด " : u.status === "reviewing" ? "จะตัด " : ""}{u.units} ครั้ง{u.status === "reviewing" ? " (ยังไม่ตัด)" : ""}</div>
+                                  </div>
+                                </div>
+                              ); })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+
+                    <p style={{fontWeight:700,color:"var(--br)",fontSize:14,margin:"18px 0 4px"}}>📅 ประวัติการจอง ({bks.length} รายการ)</p>
+                    <p style={{fontSize:12,color:"var(--mu)",margin:"0 0 10px"}}>ยืนยันแล้ว {cnt("confirmed")} • รอยืนยัน {cnt("reviewing")} • ยกเลิก {cnt("cancelled")} • เรียงจากวันที่เล่นล่าสุดก่อน</p>
+                    {bks.length === 0 ? <p style={{fontSize:13,color:"var(--mu)"}}>ยังไม่มีประวัติการจอง</p> : (
+                      <div>
+                        <div style={{borderTop:"1px solid var(--dv)"}}>
+                          {shown.map(b => { const [t, c] = histStatus(b); const units = Math.max(1, Math.round((b.duration_minutes || 60) / 60)); return (
+                            <div key={b.id} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,padding:"9px 2px",borderBottom:"1px solid var(--dv)"}}>
+                              <div style={{minWidth:0}}>
+                                <div style={{fontWeight:700,fontSize:13.5,color:"var(--br)"}}>{fmtDay(b.booking_date)} • {fmtRange(b)}</div>
+                                <div style={{fontSize:11.5,color:"var(--mu)",marginTop:2}}>Court {b.court_id}{b.group_id ? " 🔗 คู่" : ""} • จองเมื่อ {bookedAt(b)}{b.booked_by === "admin" ? " • 📞 แอดมินจอง" : ""}</div>
+                              </div>
+                              <div style={{textAlign:"right",flexShrink:0}}>
+                                <div style={{fontSize:12.5,fontWeight:700,color:c}}>{t}</div>
+                                <div style={{fontSize:11.5,color:"var(--mu)",marginTop:2}}>{b.package_id ? `🎟 แพ็คเกจ ${units} ครั้ง` : `฿${(b.price || 0).toLocaleString()}`}{b.discount_code ? ` • 🏷 ${b.discount_code}` : ""}</div>
+                              </div>
+                            </div>
+                          ); })}
+                        </div>
+                        {bks.length > 30 && !histAll && <button onClick={() => setHistAll(true)} style={{marginTop:10,width:"100%",padding:"9px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--br)",fontWeight:700,fontSize:13,cursor:"pointer"}}>แสดงทั้งหมด ({bks.length} รายการ)</button>}
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
