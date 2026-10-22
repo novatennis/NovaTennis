@@ -73,7 +73,7 @@ async function sb(path, options = {}) {
 // สิทธิ์แพ็คเกจที่ถูกจองค้างไว้ (การจองของลูกค้าสถานะ "รอการยืนยัน" ที่ยังไม่ถูกหัก) — 60 นาที = 1 ครั้ง, 120 นาที = 2 ครั้ง
 async function getReservedCredits(packageId) {
   const { body } = await sb(`bookings?package_id=eq.${packageId}&status=eq.reviewing&select=duration_minutes`);
-  return (body || []).reduce((s, b) => s + Math.max(1, Math.round((b.duration_minutes || 60) / 60)), 0);
+  return (Array.isArray(body) ? body : []).reduce((s, b) => s + Math.max(1, Math.round((b.duration_minutes || 60) / 60)), 0);
 }
 const todayBangkok = () => new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
@@ -229,22 +229,64 @@ export default async function handler(req, res) {
         const { body: cust } = await sb(`customers?customer_id=eq.${phone}&select=customer_name`);
         const { body: line } = await sb(`line_users?phone=eq.${phone}&select=display_name,customer_name&limit=1`);
         const { body: hist } = await sb(`bookings?customer_id=eq.${phone}&status=in.(confirmed,reviewing)&select=id&limit=50`);
-        // แพ็คเกจที่ยังใช้ได้ (active + ยังไม่หมดอายุ + ยังมีสิทธิ์เหลือ) พร้อมจำนวนที่จองค้างรอยืนยันอยู่
-        const { body: pk } = await sb(`packages?customer_id=eq.${phone}&status=eq.active&select=id,tier,total_credits,remaining_credits,expiry_date&order=created_time.asc`);
-        const today = todayBangkok();
+        // แพ็คเกจของเบอร์นี้: ที่ใช้ได้ไปอยู่ใน packages / ที่ใช้ไม่ได้อธิบายเหตุผลไว้ใน packageIssues (ไม่ปล่อยให้หน้าเว็บเงียบโดยไม่รู้สาเหตุ)
+        // ครอบด้วย try/catch: ถ้าดึงแพ็คเกจไม่สำเร็จ ยังส่งชื่อ/สถานะลูกค้ากลับไปได้ตามปกติ และบอกด้วย packagesError
         const packages = [];
-        for (const x of (pk || [])) {
-          if (x.expiry_date && String(x.expiry_date).slice(0, 10) < today) continue;
-          const reserved = await getReservedCredits(x.id);
-          if (x.remaining_credits - reserved > 0) packages.push({ ...x, reserved_credits: reserved, available: x.remaining_credits - reserved });
+        const packageIssues = [];
+        let packagesError = false;
+        try {
+          const pq = await sb(`packages?customer_id=eq.${phone}&status=neq.cancelled&select=id,tier,status,total_credits,remaining_credits,expiry_date&order=created_time.asc`);
+          if (!pq.ok || !Array.isArray(pq.body)) throw new Error("packages query failed");
+          const today = todayBangkok();
+          for (const x of pq.body) {
+            const label = `${x.tier === "peak" ? "Peak" : "Off Peak"} เหลือ ${x.remaining_credits}/${x.total_credits}`;
+            const issue = (text) => packageIssues.push({ id: x.id, label, issue: text });
+            if (x.status === "pending") { issue("ยังไม่ได้ส่งสลิปชำระเงินค่าแพ็คเกจ"); continue; }
+            if (x.status === "reviewing") { issue('รอแอดมินยืนยันการซื้อแพ็คเกจ (ไปที่แท็บ "🎟 แพ็คเกจ" แล้วกด ✅)'); continue; }
+            if (x.status !== "active") { issue(`สถานะแพ็คเกจ: ${x.status}`); continue; }
+            if (x.expiry_date && String(x.expiry_date).slice(0, 10) < today) { issue(`หมดอายุแล้ว (${String(x.expiry_date).slice(0, 10)})`); continue; }
+            if (x.remaining_credits <= 0) { issue("สิทธิ์หมดแล้ว"); continue; }
+            const reserved = await getReservedCredits(x.id);
+            if (x.remaining_credits - reserved <= 0) { issue(`สิทธิ์ที่เหลือ ${x.remaining_credits} ครั้ง ถูกจองค้างรอยืนยันครบแล้ว (${reserved} ครั้ง) — ไปแท็บ "การจอง" เพื่อยืนยันหรือยกเลิกรายการที่ค้างอยู่`); continue; }
+            packages.push({ id: x.id, tier: x.tier, total_credits: x.total_credits, remaining_credits: x.remaining_credits, expiry_date: x.expiry_date, reserved_credits: reserved, available: x.remaining_credits - reserved });
+          }
+        } catch (e) {
+          console.error("lookupCustomer packages error:", e);
+          packagesError = true;
         }
         res.status(200).json({
-          name: (cust || [])[0]?.customer_name || null,
-          linked: (line || []).length > 0,
-          lineName: (line || [])[0]?.display_name || null,
-          bookingsCount: (hist || []).length,
+          name: Array.isArray(cust) ? (cust[0]?.customer_name || null) : null,
+          linked: Array.isArray(line) && line.length > 0,
+          lineName: Array.isArray(line) ? (line[0]?.display_name || null) : null,
+          bookingsCount: Array.isArray(hist) ? hist.length : 0,
           packages,
+          packageIssues,
+          packagesError,
         });
+        return;
+      }
+      case "customerHistory": {
+        // ประวัติของลูกค้า 1 เบอร์: แพ็คเกจทั้งหมด (พร้อมรายการที่ใช้สิทธิ์/วันเวลาที่ใช้) + การจองทั้งหมดย้อนหลัง
+        const { phone } = p;
+        if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
+        const { body: cust } = await sb(`customers?customer_id=eq.${phone}&select=customer_name`);
+        const { body: line } = await sb(`line_users?phone=eq.${phone}&select=display_name&limit=1`);
+        const { body: pkgs } = await sb(`packages?customer_id=eq.${phone}&select=*&order=created_time.desc`);
+        const cols = "id,court_id,booking_date,hour,start_minute,duration_minutes,price,status,package_id,discount_code,discount_amount,group_id,created_time";
+        let bq = await sb(`bookings?customer_id=eq.${phone}&select=${cols},booked_by&order=booking_date.desc,hour.desc&limit=300`);
+        if (!bq.ok) bq = await sb(`bookings?customer_id=eq.${phone}&select=${cols}&order=booking_date.desc,hour.desc&limit=300`); // ยังไม่ได้รัน SQL คอลัมน์ booked_by
+        const bookings = (bq.body || []).slice().sort((a, b) => String(b.booking_date).localeCompare(String(a.booking_date)) || (b.hour - a.hour) || ((b.start_minute || 0) - (a.start_minute || 0)));
+        const unitsOf = (b) => Math.max(1, Math.round((b.duration_minutes || 60) / 60)); // 60 นาที = 1 ครั้ง, 120 นาที = 2 ครั้ง
+        const packages = (pkgs || []).map((pk) => {
+          const uses = bookings.filter((b) => b.package_id === pk.id).map((b) => ({ ...b, units: unitsOf(b) }));
+          const usedConfirmed = uses.filter((u) => u.status === "confirmed").reduce((s, u) => s + u.units, 0); // ตัดสิทธิ์แล้วจริง
+          const pendingUnits = uses.filter((u) => u.status === "reviewing").reduce((s, u) => s + u.units, 0);  // จองไว้รอยืนยัน (ยังไม่ตัด)
+          const usedByCredits = pk.status === "active" || pk.status === "cancelled" ? pk.total_credits - pk.remaining_credits : null;
+          return { ...pk, uses, usedConfirmed, pendingUnits, usedByCredits,
+            // จำนวนที่ตัดจริงในแพ็คเกจ ไม่ตรงกับรายการจองที่ใช้สิทธิ์ (เช่นมีการแก้สิทธิ์ด้วยมือใน Supabase / มีรายการที่ยกเลิกพร้อมคืนสิทธิ์) → ให้แอดมินตรวจ
+            mismatch: usedByCredits != null && usedByCredits !== usedConfirmed };
+        });
+        res.status(200).json({ name: (cust || [])[0]?.customer_name || null, lineName: (line || [])[0]?.display_name || null, packages, bookings });
         return;
       }
       case "createAdminBooking": {
