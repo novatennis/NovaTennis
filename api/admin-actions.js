@@ -78,6 +78,12 @@ async function releaseDiscountByCode(code) {
   if (d && d.used_count > 0) await sb(`discount_codes?id=eq.${d.id}`, { method: "PATCH", body: JSON.stringify({ used_count: d.used_count - 1 }) });
 }
 
+// สิทธิ์แพ็คเกจที่ถูกจองค้างไว้ (การจองสถานะ "รอการยืนยัน" ที่ยังไม่ถูกหัก) — 60 นาที = 1 ครั้ง, 120 นาที = 2 ครั้ง (เหมือนใน booking-actions.js)
+async function getReservedCredits(packageId) {
+  const { body } = await sb(`bookings?package_id=eq.${packageId}&status=eq.reviewing&select=duration_minutes`);
+  return (body || []).reduce((s, b) => s + Math.max(1, Math.round((b.duration_minutes || 60) / 60)), 0);
+}
+
 async function getActiveIntervals(bookingDate, courtId) {
   const { body } = await sb(
     `bookings?booking_date=eq.${bookingDate}&court_id=eq.${courtId}&status=neq.cancelled&select=hour,start_minute,duration_minutes,status,created_time`
@@ -222,7 +228,14 @@ export default async function handler(req, res) {
         const { body: cust } = await sb(`customers?customer_id=eq.${phone}&select=customer_name`);
         const { body: line } = await sb(`line_users?phone=eq.${phone}&select=display_name,customer_name&limit=1`);
         const { body: hist } = await sb(`bookings?customer_id=eq.${phone}&status=in.(confirmed,reviewing)&select=id&limit=50`);
+        // แพ็คเกจที่ยังใช้ได้ (active + ยังไม่หมดอายุ) พร้อมสิทธิ์ที่ใช้ได้จริง (หักที่จองค้างรอยืนยันแล้ว) — ไว้ให้แอดมินเลือกตัดสิทธิ์ตอนจองแทน
+        const today = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().split("T")[0];
+        const { body: pkgRows } = await sb(`packages?customer_id=eq.${phone}&status=eq.active&select=id,tier,total_credits,remaining_credits,expiry_date&order=expiry_date.asc`);
+        const packages = await Promise.all((pkgRows || [])
+          .filter(pk => !pk.expiry_date || pk.expiry_date >= today)
+          .map(async (pk) => ({ ...pk, available: Math.max(0, pk.remaining_credits - await getReservedCredits(pk.id)) })));
         res.status(200).json({
+          packages,
           name: (cust || [])[0]?.customer_name || null,
           linked: (line || []).length > 0,
           lineName: (line || [])[0]?.display_name || null,
@@ -233,7 +246,8 @@ export default async function handler(req, res) {
       case "createAdminBooking": {
         // แอดมินจองแทนลูกค้า (โทรมาจอง/ไม่มี LINE) — ไม่ต้องล็อกอิน LINE, ไม่มีโปรอัตโนมัติ, แอดมินกำหนดราคาต่อสนามเอง
         // ถ้าภายหลังลูกค้าล็อกอิน LINE แล้วผูกเบอร์นี้ ชื่อ LINE จะแทนชื่อที่แอดมินใส่ในข้อมูลลูกค้า (ดู lineLinkPhone)
-        const { customerId, customerName, courtIds, bookingDate, hour, startMinute, durationMinutes, price, status } = p;
+        // packageId = ตัดสิทธิ์จากแพ็คเกจของลูกค้าแทนการชำระเงิน (1 สนาม, 60/120 นาที) → ยืนยันและหักสิทธิ์ทันที
+        const { customerId, customerName, courtIds, bookingDate, hour, startMinute, durationMinutes, price, status, packageId } = p;
         if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid phone" }); return; }
         const name = String(customerName || "").trim();
         if (name.length < 1 || nameLen(name) > 40) { res.status(400).json({ error: "invalid name" }); return; }
@@ -253,6 +267,36 @@ export default async function handler(req, res) {
           if (taken.some(([s, e]) => startMin < e && endMin > s)) { res.status(409).json({ error: "slot_taken", court: cid }); return; }
         }
 
+        // ─── ตัดสิทธิ์จากแพ็คเกจ — ใช้กติกาเดียวกับลูกค้าจองเอง (ดู createBooking ใน booking-actions.js) ───
+        let pkg = null;
+        const units = durationMinutes / 60;
+        if (packageId) {
+          if (ids.length !== 1) { res.status(400).json({ error: "package_one_court" }); return; }
+          if (![60, 120].includes(durationMinutes)) { res.status(400).json({ error: "package_duration" }); return; }
+          const { body: pkgRows } = await sb(`packages?id=eq.${encodeURIComponent(packageId)}&customer_id=eq.${customerId}&select=*`);
+          pkg = (pkgRows || [])[0];
+          if (!pkg || pkg.status !== "active") { res.status(400).json({ error: "package_not_active" }); return; }
+          if (pkg.expiry_date && new Date(pkg.expiry_date + "T23:59:59+07:00") < new Date()) { res.status(400).json({ error: "package_expired" }); return; }
+          const available = pkg.remaining_credits - await getReservedCredits(pkg.id);
+          if (available < units) { res.status(400).json({ error: "package_no_credits", available: Math.max(0, available), needed: units }); return; }
+          const day = new Date(bookingDate + "T00:00:00Z").getUTCDay();
+          const isWeekend = day === 0 || day === 6;
+          const allHoursOk = Array.from({ length: units }, (_, i) => hour + i).every((h) => pkg.tier === "peak" || !(isWeekend || h >= 16));
+          if (!allHoursOk) { res.status(400).json({ error: "package_wrong_tier" }); return; }
+          // หักสิทธิ์ก่อนสร้างการจอง (เงื่อนไข remaining_credits=eq. กันแอดมินสองคนกดพร้อมกันแล้วหักซ้อน)
+          const dec = await sb(`packages?id=eq.${pkg.id}&remaining_credits=eq.${pkg.remaining_credits}`, {
+            method: "PATCH", headers: { Prefer: "return=representation" },
+            body: JSON.stringify({ remaining_credits: pkg.remaining_credits - units }),
+          });
+          if (!dec.ok || !Array.isArray(dec.body) || dec.body.length !== 1) { res.status(409).json({ error: "package_busy" }); return; }
+        }
+        const refundPackage = async () => {
+          if (!pkg) return;
+          const { body: rows } = await sb(`packages?id=eq.${pkg.id}&select=remaining_credits,total_credits`);
+          const cur = (rows || [])[0];
+          if (cur) await sb(`packages?id=eq.${pkg.id}`, { method: "PATCH", body: JSON.stringify({ remaining_credits: Math.min(cur.total_credits, cur.remaining_credits + units) }) });
+        };
+
         // ลูกค้าใหม่ → สร้างข้อมูลลูกค้าด้วยชื่อที่แอดมินใส่ / ลูกค้าเดิม → ไม่ทับชื่อเดิม
         await sb(`customers`, { method: "POST", headers: { Prefer: "resolution=ignore-duplicates" }, body: JSON.stringify({ customer_id: customerId, customer_name: name }) });
 
@@ -260,7 +304,8 @@ export default async function handler(req, res) {
         const baseRow = (cid) => ({
           court_id: cid, customer_id: customerId, customer_name: name,
           booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
-          price: Math.round(unit), discount_amount: 0, status, ...(groupId ? { group_id: groupId } : {}),
+          price: pkg ? 0 : Math.round(unit), discount_amount: 0, status: pkg ? "confirmed" : status,
+          ...(pkg ? { package_id: pkg.id } : {}), ...(groupId ? { group_id: groupId } : {}),
         });
         let ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(ids.map(c => ({ ...baseRow(c), booked_by: "admin" }))) });
         if (!ins.ok) {
@@ -268,14 +313,16 @@ export default async function handler(req, res) {
           console.error("createAdminBooking: insert with booked_by failed — run add-booked-by-column.sql");
           ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(ids.map(baseRow)) });
         }
-        if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== ids.length) { res.status(500).json({ error: "insert_failed" }); return; }
+        if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== ids.length) { await refundPackage(); res.status(500).json({ error: "insert_failed" }); return; }
 
         await notifyTelegram(
           `📞 <b>แอดมินจองให้ลูกค้า</b>\n\n` +
           `👤 ${esc(name)}\n📞 ${customerId}\n` +
           `🎾 ${ids.map(c => `Court ${c}`).join(" + ")}\n📅 ${bookingDate}\n` +
           `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n` +
-          `💰 ฿${(Math.round(unit) * ids.length).toLocaleString()} (${status === "confirmed" ? "ชำระแล้ว" : "รอชำระ"})`
+          (pkg
+            ? `🎟 ตัดสิทธิ์แพ็คเกจ ${pkg.tier === "peak" ? "Peak" : "Off Peak"} ${units} ครั้ง • เหลือ ${pkg.remaining_credits - units} / ${pkg.total_credits} ครั้ง`
+            : `💰 ฿${(Math.round(unit) * ids.length).toLocaleString()} (${status === "confirmed" ? "ชำระแล้ว" : "รอชำระ"})`)
         );
         res.status(200).json({ ok: true, bookings: ins.body });
         return;

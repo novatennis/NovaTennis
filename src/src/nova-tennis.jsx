@@ -2499,7 +2499,7 @@ function AdminDashboard({ token, onLogout }) {
 
   // ── จองแทนลูกค้า (ลูกค้าโทรมาจอง / ไม่มี LINE) ──
   const START_OPTS = (() => { const o = []; for (let m = DAY_START_MIN; m < DAY_END_MIN; m += 30) o.push(m); return o; })();
-  const [nb, setNb] = useState({ phone: "", name: "", date: toIso(new Date()), courts: [1], startMin: 10 * 60, duration: 60, price: "", status: "reviewing" });
+  const [nb, setNb] = useState({ phone: "", name: "", date: toIso(new Date()), courts: [1], startMin: 10 * 60, duration: 60, price: "", status: "reviewing", pkgId: "" });
   const [nbInfo, setNbInfo] = useState(null);
   const [nbBusy, setNbBusy] = useState(false);
   const [nbMsg, setNbMsg] = useState(null);
@@ -2507,9 +2507,20 @@ function AdminDashboard({ token, onLogout }) {
   const nbUnit = nb.price !== "" ? Number(nb.price) : nbAutoUnit; // ราคาต่อสนาม (ว่าง = ราคาปกติ)
   const nbNameOk = nb.name.trim().length >= 1 && nb.name.trim().length <= 40;
   const nbPhoneOk = /^[0-9]{10}$/.test(nb.phone);
-  const nbCanSubmit = nbPhoneOk && nbNameOk && nb.courts.length > 0 && nb.date && Number.isFinite(nbUnit) && nbUnit >= 0 && !nbBusy;
+  // ตัดสิทธิ์จากแพ็คเกจ (pkgId ว่าง = ชำระเงินปกติ) — กติกาเดียวกับลูกค้าจองเอง: 1 สนาม, 60/120 นาที, แพ็ค Off Peak ใช้ได้เฉพาะ จ.–ศ. ก่อน 16:00 ทุกชั่วโมง
+  const nbPkgs = nbInfo?.packages || [];
+  const nbPkg = nbPkgs.find(pk => pk.id === nb.pkgId) || null;
+  const nbPkgUnits = nb.duration / 60;
+  const nbPkgProblem = !nbPkg ? null
+    : nb.courts.length !== 1 ? "ตัดแพ็คเกจได้ครั้งละ 1 สนาม"
+    : ![60, 120].includes(nb.duration) ? "ตัดแพ็คเกจได้เฉพาะ 60 หรือ 120 นาที"
+    : nbPkg.tier !== "peak" && (() => { const d = new Date(nb.date + "T00:00:00").getDay(); return d === 0 || d === 6 || Math.floor(nb.startMin / 60) + nbPkgUnits > 16; })() ? "แพ็ค Off Peak ใช้ได้เฉพาะ จ.–ศ. ก่อน 16:00 (ทุกชั่วโมงที่จอง)"
+    : nbPkg.available < nbPkgUnits ? `สิทธิ์ไม่พอ (ต้องใช้ ${nbPkgUnits} ครั้ง ใช้ได้ ${nbPkg.available} ครั้ง)`
+    : null;
+  const nbCanSubmit = nbPhoneOk && nbNameOk && nb.courts.length > 0 && nb.date && (nbPkg ? !nbPkgProblem : Number.isFinite(nbUnit) && nbUnit >= 0) && !nbBusy;
   useEffect(() => {
     setNbInfo(null);
+    setNb(prev => (prev.pkgId ? { ...prev, pkgId: "" } : prev));
     if (!/^[0-9]{10}$/.test(nb.phone)) return;
     let cancelled = false;
     callAdminAction("lookupCustomer", token, { phone: nb.phone }).then(r => {
@@ -2527,30 +2538,29 @@ function AdminDashboard({ token, onLogout }) {
     const ok = window.confirm(
       `จองให้ ${nb.name.trim()} (${nb.phone})\n` +
       `${nb.courts.map(c => "Court " + c).join(" + ")} • ${nb.date} • ${minutesToLabel(nb.startMin)}–${minutesToLabel(nb.startMin + nb.duration)}\n` +
-      `ยอดรวม ฿${total.toLocaleString()} • ${nb.status === "confirmed" ? "ชำระแล้ว (ยืนยันทันที)" : "รอชำระ"}\n\nยืนยันการจอง?`);
+      (nbPkg
+        ? `🎟 ตัดสิทธิ์แพ็คเกจ ${nbPkg.tier === "peak" ? "Peak" : "Off Peak"} ${nbPkgUnits} ครั้ง (เหลือ ${nbPkg.available - nbPkgUnits} ครั้ง) • ยืนยันทันที`
+        : `ยอดรวม ฿${total.toLocaleString()} • ${nb.status === "confirmed" ? "ชำระแล้ว (ยืนยันทันที)" : "รอชำระ"}`) + `\n\nยืนยันการจอง?`);
     if (!ok) return;
     setNbBusy(true); setNbMsg(null);
     const r = await callAdminAction("createAdminBooking", token, {
       customerId: nb.phone, customerName: nb.name.trim(), courtIds: nb.courts, bookingDate: nb.date,
-      hour: Math.floor(nb.startMin / 60), startMinute: nb.startMin % 60, durationMinutes: nb.duration, price: Math.round(nbUnit), status: nb.status,
+      hour: Math.floor(nb.startMin / 60), startMinute: nb.startMin % 60, durationMinutes: nb.duration,
+      price: nbPkg ? 0 : Math.round(nbUnit), status: nbPkg ? "confirmed" : nb.status, ...(nbPkg ? { packageId: nbPkg.id } : {}),
     });
     setNbBusy(false);
     if (r?.ok) {
-      setNbMsg({ ok: true, text: `✅ จองให้ ${nb.name.trim()} เรียบร้อย (${nb.courts.map(c => "Court " + c).join(" + ")} ${nb.date} ${minutesToLabel(nb.startMin)})` });
-      setNb(prev => ({ ...prev, phone: "", name: "", price: "" })); setNbInfo(null);
+      setNbMsg({ ok: true, text: `✅ จองให้ ${nb.name.trim()} เรียบร้อย (${nb.courts.map(c => "Court " + c).join(" + ")} ${nb.date} ${minutesToLabel(nb.startMin)})${nbPkg ? ` • ตัดแพ็คเกจ ${nbPkgUnits} ครั้ง` : ""}` });
+      setNb(prev => ({ ...prev, phone: "", name: "", price: "", pkgId: "" })); setNbInfo(null);
       loadBookings(); loadQueue();
     } else {
-      setNbMsg({ ok: false, text: r?.error === "slot_taken" ? `❌ ช่วงเวลานี้มีคนจองแล้ว (Court ${r.court}) — ดูที่แท็บตารางว่าง` : "❌ บันทึกไม่สำเร็จ ตรวจข้อมูลแล้วลองใหม่อีกครั้ง" });
+      setNbMsg({ ok: false, text: r?.error === "slot_taken" ? `❌ ช่วงเวลานี้มีคนจองแล้ว (Court ${r.court}) — ดูที่แท็บตารางว่าง` : ({
+        package_no_credits: `❌ สิทธิ์ในแพ็คเกจไม่พอ (ต้องใช้ ${r.needed ?? "?"} ครั้ง ใช้ได้ ${r.available ?? 0} ครั้ง)`,
+        package_expired: "❌ แพ็คเกจหมดอายุแล้ว", package_not_active: "❌ แพ็คเกจนี้ยังไม่เปิดใช้งาน/ถูกยกเลิก",
+        package_wrong_tier: "❌ แพ็ค Off Peak ใช้กับช่วงเวลานี้ไม่ได้", package_duration: "❌ ตัดแพ็คเกจได้เฉพาะ 60 หรือ 120 นาที",
+        package_one_court: "❌ ตัดแพ็คเกจได้ครั้งละ 1 สนาม", package_busy: "❌ แพ็คเกจนี้เพิ่งถูกใช้พร้อมกัน ลองใหม่อีกครั้ง",
+      }[r?.error] || "❌ บันทึกไม่สำเร็จ ตรวจข้อมูลแล้วลองใหม่อีกครั้ง") });
     }
-  };
-  // แก้ชื่อที่พิมพ์ผิดในการจองที่มีอยู่ (การจองคู่แก้ทั้งคู่)
-  const renameBooking = async (b) => {
-    const n = window.prompt("แก้ชื่อลูกค้า (1–40 ตัวอักษร)", b.customer_name || "");
-    if (n == null) return;
-    const clean = n.trim();
-    if (!clean || Array.from(clean).length > 40) { alert("ชื่อต้องมี 1–40 ตัวอักษร"); return; }
-    const r = await callAdminAction("updateBookingName", token, { id: b.id, name: clean });
-    if (r?.ok) { loadBookings(); loadQueue(); }
   };
   // ลูกค้า: ค้นหา / แก้ชื่อ / แก้เบอร์ / เบอร์ที่ผูกกับ LINE + ปลดล็อก
   const [linkedPhones, setLinkedPhones] = useState({});
@@ -2921,7 +2931,7 @@ function AdminDashboard({ token, onLogout }) {
                               <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short"})}</td>
                               <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
                               <td>{fmtTime(b)}</td>
-                              <td style={{fontWeight:600}}>{b.customer_name || "-"} <button onClick={() => renameBooking(b)} title="แก้ชื่อ" style={{border:"none",background:"none",cursor:"pointer",fontSize:12,padding:"0 2px"}}>✏️</button>{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}</td>
+                              <td style={{fontWeight:600}}>{b.customer_name || "-"}{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}</td>
                               <td>{b.customer_id}</td>
                               <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
                               <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
@@ -2972,7 +2982,7 @@ function AdminDashboard({ token, onLogout }) {
                           <tr key={b.id} id={`bk-${b.id}`} style={highlightId === b.id ? {background:"rgba(255,213,74,.4)",outline:"2px solid #E8A200"} : undefined}>
                             <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
                             <td>{fmtTime(b)}</td>
-                            <td style={{fontWeight:600}}>{b.customer_name || "-"} <button onClick={() => renameBooking(b)} title="แก้ชื่อ" style={{border:"none",background:"none",cursor:"pointer",fontSize:12,padding:"0 2px"}}>✏️</button>{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}</td>
+                            <td style={{fontWeight:600}}>{b.customer_name || "-"}{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}</td>
                             <td>{b.customer_id}</td>
                             <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
                             <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
@@ -3045,6 +3055,23 @@ function AdminDashboard({ token, onLogout }) {
                     </div>
                   </div>
                 </div>
+                {nbPkgs.length > 0 && (
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>การชำระ</label>
+                    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                      {[{ id: "", label: "💵 ชำระเงิน (กำหนดราคาด้านล่าง)" }, ...nbPkgs.map(pk => ({ id: pk.id, label: `🎟 ตัดแพ็คเกจ ${pk.tier === "peak" ? "Peak" : "Off Peak"} — ใช้ได้ ${pk.available} / ${pk.total_credits} ครั้ง${pk.expiry_date ? ` (หมดอายุ ${pk.expiry_date})` : ""}` }))].map(o => (
+                        <button key={o.id || "pay"} onClick={() => setNb(p => ({ ...p, pkgId: o.id }))}
+                          style={{padding:"10px 12px",borderRadius:8,textAlign:"left",border:`2px solid ${nb.pkgId === o.id ? "var(--or)" : "var(--dv)"}`,background:nb.pkgId === o.id ? "var(--or-bg)" : "#fff",color:nb.pkgId === o.id ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{nb.pkgId === o.id ? "✓ " : ""}{o.label}</button>
+                      ))}
+                    </div>
+                    {nbPkg && (
+                      <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:nbPkgProblem ? "#c0392b" : "#2d7a4f",fontWeight:600}}>
+                        {nbPkgProblem ? `⚠️ ${nbPkgProblem}` : `รายการนี้ตัด ${nbPkgUnits} ครั้ง (${nb.duration} นาที) • ยืนยันและหักสิทธิ์ทันที ไม่ต้องชำระเงิน`}
+                      </p>
+                    )}
+                  </div>
+                )}
+                {!nbPkg && <>
                 <div>
                   <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ราคาต่อสนาม (บาท) — เว้นว่าง = ราคาปกติ ฿{nbAutoUnit.toLocaleString()}</label>
                   <input type="number" inputMode="numeric" value={nb.price} onChange={e => setNb(p => ({ ...p, price: e.target.value }))} placeholder={String(nbAutoUnit)}
@@ -3060,6 +3087,7 @@ function AdminDashboard({ token, onLogout }) {
                     ))}
                   </div>
                 </div>
+                </>}
                 <button onClick={submitNb} disabled={!nbCanSubmit}
                   style={{padding:"13px",borderRadius:10,border:"none",background:nbCanSubmit ? "linear-gradient(90deg,var(--or),var(--or2))" : "var(--cr2)",color:nbCanSubmit ? "#fff" : "var(--mu)",fontWeight:800,fontSize:15,cursor:nbCanSubmit ? "pointer" : "not-allowed",fontFamily:"'Noto Sans Thai',sans-serif"}}>
                   {nbBusy ? "⏳ กำลังบันทึก..." : "บันทึกการจอง"}
