@@ -53,6 +53,16 @@ const db = {
     if (error) return { error };
     return { package: pkg };
   },
+  // ─── เรียนกับโค้ช (สนาม+โค้ช) ───
+  async coachCatalog() { const r = await callBookingAction("coachCatalog", {}); return Array.isArray(r?.items) ? r.items : null; },
+  async createCoachOrder({ audience, type, sessions, learnerNote }) {
+    const r = await callBookingAction("createCoachOrder", { audience, type, sessions, learnerNote });
+    if (r?.error || !r?.order) return { error: r?.error || "failed" };
+    return { order: r.order, linePushed: !!r.linePushed };
+  },
+  async updateCoachSlip(orderId, slipUrl) { const r = await callBookingAction("updateCoachSlip", { orderId, slipUrl }); return r?.order || null; },
+  async cancelCoachOrder(orderId) { const r = await callBookingAction("cancelCoachOrder", { orderId }); return !!r?.ok; },
+  async myCoachOrders() { const r = await callBookingAction("myCoachOrders", {}); return Array.isArray(r?.orders) ? r.orders : []; },
   async updatePackageSlip(id, slipUrl) {
     const result = await callBookingAction("updatePackageSlip", { packageId: id, slipUrl });
     return result?.package || null;
@@ -568,7 +578,7 @@ function TabBar({ tab, setTab, lang="th" }) {
   const t = T[lang];
   return (
     <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:200,backgroundColor:"#fff",borderTop:"1px solid var(--dv)",display:"flex",boxShadow:"0 -3px 16px rgba(102,57,36,0.07)"}}>
-      {[["home","🏠",t.home],["book","📅",t.book],["package","🎟",lang==="th"?"แพ็คเกจ":"Packages"],["cancel","🔍",t.myBookings]].map(([id,icon,label]) => (
+      {[["home","🏠",t.home],["book","📅",t.book],["package","🎟",lang==="th"?"แพ็คเกจ":"Packages"],["coach","🎓",lang==="th"?"เรียนโค้ช":"Coaching"],["cancel","🔍",t.myBookings]].map(([id,icon,label]) => (
         <button key={id} onClick={() => setTab(id)} style={{flex:1,padding:"11px 0 8px",background:"none",border:"none",borderTop:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
           <span style={{fontSize:19}}>{icon}</span>
           <span style={{fontSize:10,fontWeight:tab===id?700:400}}>{label}</span>
@@ -604,7 +614,7 @@ function PendingPaymentBanner({ createdAt, onResume, lang="th" }) {
   );
 }
 
-function HomePage({ goBook, goPackage, lang="th" }) {
+function HomePage({ goBook, goPackage, goCoach, lang="th" }) {
   const t = T[lang];
   const now = new Date();
   const inPromo = now <= PROMO_END;
@@ -756,6 +766,19 @@ function HomePage({ goBook, goPackage, lang="th" }) {
           </div>
         );
       })()}
+
+      {goCoach && (
+        <div style={{padding:"10px 16px 0"}}>
+          <button onClick={goCoach} style={{width:"100%",display:"flex",alignItems:"center",gap:12,textAlign:"left",padding:"13px 16px",borderRadius:"var(--r)",border:"none",cursor:"pointer",color:"#fff",background:"linear-gradient(100deg,#663924 0%,#8a5433 100%)",boxShadow:"0 4px 16px rgba(102,57,36,.3)",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            <span style={{fontSize:30}}>🎓</span>
+            <span style={{flex:1}}>
+              <span style={{display:"block",fontWeight:800,fontSize:15}}>{lang==="th" ? "เรียนกับโค้ช — สนาม + โค้ช + อุปกรณ์" : "Train with a coach — court + coach + equipment"}</span>
+              <span style={{display:"block",fontSize:11.5,opacity:.9,marginTop:2}}>{lang==="th" ? "ผู้ใหญ่ & เด็ก • Private / Duo • แพ็ค 5–10 ครั้งคุ้มกว่า" : "Adults & kids • Private / Duo • 5–10 session packages save more"}</span>
+            </span>
+            <span style={{fontSize:18,fontWeight:800}}>→</span>
+          </button>
+        </div>
+      )}
 
       <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
 
@@ -1937,9 +1960,328 @@ function PackagePaymentView({ pkg, lang="th", onDone }) {
   );
 }
 
-// ─── Cancel / Check Booking Page ─────────────────────────────────────────────
-function CancelPage({ lang="th", initialPhone="", lockedPhone="" }) {
+// ─── เรียนกับโค้ช (สนาม+โค้ช) ─────────────────────────────────────────────────────
+// ลูกค้าเลือกคอร์สแล้วจ่ายเงินเลย ไม่มีการเลือกวัน/เวลา/โค้ชในเว็บ — ระบบส่งข้อความเข้า LINE OA ของลูกค้าทันที แล้วแอดมินนัดวัน-เวลากับลูกค้าในแชทนั้น
+// ราคาทั้งหมดมาจากเซิร์ฟเวอร์ (api/booking-actions.js → COACH_PRICES) แก้ราคาที่นั่นที่เดียว
+const COACH_QR = "/qr-package.png"; // QR รับเงินคอร์สโค้ช (ค่าตั้งต้นใช้อันเดียวกับแพ็คเกจ — ถ้าใช้บัญชีอื่น ให้เปลี่ยนชื่อไฟล์ตรงนี้)
+const coachLabel = (o, lang = "th") => {
+  const th = lang === "th";
+  const type = o.type === "duo" ? (th ? "Private Duo (2 คน : 1 โค้ช)" : "Private Duo (2 people : 1 coach)") : (th ? "Private (1 คน : 1 โค้ช)" : "Private (1 person : 1 coach)");
+  const who = o.audience === "kid" ? (th ? "เด็ก" : "Kids") : (th ? "ผู้ใหญ่" : "Adult");
+  const n = Number(o.sessions) === 1 ? (th ? "ครั้งเดียว" : "Single session") : (th ? `แพ็ค ${o.sessions} ครั้ง` : `${o.sessions}-session package`);
+  return `${type} • ${who} • ${n}`;
+};
+// เปิดแชท LINE OA ของร้านพร้อมข้อความที่เตรียมไว้ในช่องพิมพ์ (ลูกค้ากดส่งเอง) — รูปแบบตามเอกสาร LINE: https://line.me/R/oaMessage/{LINE ID เข้ารหัส %}/?{ข้อความเข้ารหัส %}
+const LINE_OA_ID = "@347mlhra";
+const oaChatUrl = (text) => `https://line.me/R/oaMessage/${encodeURIComponent(LINE_OA_ID)}/?${encodeURIComponent(text)}`;
+const coachChatText = (o, lang = "th") => lang === "th"
+  ? `สวัสดีค่ะ ต้องการนัดวัน-เวลาเรียนกับโค้ช\nรหัสคำสั่งซื้อ: C-${o.id}\nคอร์ส: ${coachLabel(o, "th")}\nชื่อ: ${o.customer_name}\nเบอร์: ${o.customer_id}\nวัน-เวลาที่สะดวก: `
+  : `Hello, I'd like to schedule my coaching lesson.\nOrder: C-${o.id}\nCourse: ${coachLabel(o, "en")}\nName: ${o.customer_name}\nPhone: ${o.customer_id}\nPreferred days/times: `;
+const coachStatusInfo = (s, lang = "th") => {
+  const th = lang === "th";
+  if (s === "confirmed") return { text: th ? "ยืนยันแล้ว" : "Confirmed", color: "#2d7a4f" };
+  if (s === "reviewing") return { text: th ? "รอตรวจสอบสลิป" : "Verifying slip", color: "#e67e22" };
+  if (s === "cancelled") return { text: th ? "ยกเลิกแล้ว" : "Cancelled", color: "#c0392b" };
+  return { text: th ? "รอชำระเงิน" : "Awaiting payment", color: "var(--mu)" };
+};
+
+function CoachPage({ lang="th", lineSession, onLinkPhone, resume, onResumeUsed }) {
+  const th = lang === "th";
+  const lineName = toFormName(lineSession?.displayName || lineSession?.name) || "ลูกค้า LINE";
+  const [items, setItems] = useState(null);
+  const [loadErr, setLoadErr] = useState(false);
+  const [audience, setAudience] = useState("adult");
+  const [sel, setSel] = useState(null); // { type, sessions }
+  const [note, setNote] = useState("");
+  const [phone, setPhone] = useState(() => lineSession?.phone || "");
+  const [creating, setCreating] = useState(false);
+  const [err, setErr] = useState("");
+  const [order, setOrder] = useState(null);
+  const [linePushed, setLinePushed] = useState(false);
+  const formRef = useRef();
+
+  const loadCatalog = () => { setLoadErr(false); db.coachCatalog().then(r => (r ? setItems(r) : setLoadErr(true))).catch(() => setLoadErr(true)); };
+  useEffect(() => { loadCatalog(); }, []);
+  useEffect(() => { if (lineSession?.phone) setPhone(lineSession.phone); }, [lineSession?.phone]);
+  // เปิดกลับมาจากหน้า "การจองของฉัน" เพื่อชำระเงินคำสั่งซื้อที่ค้างอยู่
+  useEffect(() => { if (resume?.order) { setOrder(resume.order); setLinePushed(!!resume.order.line_pushed); onResumeUsed?.(); } }, [resume]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const phoneOk = /^[0-9]{10}$/.test(phone);
+  const phoneLocked = !!lineSession?.phone;
+  const pick = (type, sessions) => items?.find(i => i.audience === audience && i.type === type && i.sessions === sessions) || null;
+  const selected = sel ? pick(sel.type, sel.sessions) : null;
+  const baht = (n) => `฿${Number(n).toLocaleString()}`;
+
+  const choose = (type, sessions) => {
+    setSel({ type, sessions }); setErr("");
+    setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 80);
+  };
+
+  const go = async () => {
+    if (!selected || !phoneOk || creating) return;
+    setErr(""); setCreating(true);
+    if (lineSession && !lineSession.phone) {
+      const sure = window.confirm(th
+        ? `ยืนยันเบอร์ ${phone} ใช่หรือไม่?\n\nเบอร์นี้จะถูกผูกกับบัญชี LINE ของคุณ และแก้ไขเองไม่ได้อีก (ต้องติดต่อแอดมิน)`
+        : `Confirm phone number ${phone}?\n\nIt will be linked to your LINE account and can't be changed by yourself later.`);
+      if (!sure) { setCreating(false); return; }
+      const lr = await onLinkPhone(lineName, phone);
+      if (!lr?.ok) { setCreating(false); setErr(accountErrMsg(lr?.error, lang) || (th ? "ผูกเบอร์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Couldn't link your number. Please try again.")); return; }
+    }
+    const r = await db.createCoachOrder({ audience, type: selected.type, sessions: selected.sessions, learnerNote: note.trim() });
+    setCreating(false);
+    if (!r.order) {
+      setErr(r.error === "too_many_orders" ? (th ? "สั่งซื้อบ่อยเกินไป กรุณาติดต่อร้านทาง LINE" : "Too many orders. Please contact us on LINE.")
+        : (accountErrMsg(r.error, lang) || (th ? "สร้างคำสั่งซื้อไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Couldn't create the order. Please try again.")));
+      return;
+    }
+    trackFb("InitiateCheckout", { value: r.order.price, currency: "THB", content_name: "coach" });
+    setOrder(r.order); setLinePushed(r.linePushed);
+  };
+
+  if (order) return <CoachPaymentView order={order} linePushed={linePushed} lang={lang} onDone={() => { setOrder(null); setSel(null); setNote(""); }} />;
+
+  const TYPES = [
+    { type: "duo", title: "PRIVATE DUO", sub: th ? "2 คน : 1 โค้ช" : "2 people : 1 coach", tag: th ? "เรียนเป็นคู่ สนุกขึ้น พัฒนาด้วยกัน" : "Learn together, grow together", icon: "👥", accent: "#F47E1F" },
+    { type: "private", title: "PRIVATE", sub: th ? "1 คน : 1 โค้ช" : "1 person : 1 coach", tag: th ? "โฟกัสเต็มที่ พัฒนาได้เร็วกว่า" : "Full focus, faster progress", icon: "👤", accent: "#5E97AE" },
+  ];
+  const rowLabel = (s) => (s === 1 ? (th ? "ครั้งเดียว" : "Single session") : (th ? `แพ็ค ${s} ครั้ง` : `${s}-session package`));
+
+  return (
+    <div style={{padding:"20px 16px 110px",display:"flex",flexDirection:"column",gap:18}} className="fu">
+      <section>
+        <h2 className="bb" style={{fontSize:26,color:"var(--br)",marginBottom:4}}>{th ? "เรียนกับโค้ช" : "Train with a Coach"}</h2>
+        <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7}}>{th ? "สนาม + โค้ช + อุปกรณ์ รวมในราคา — ไม่ต้องเลือกวัน-เวลาในเว็บ ชำระเงินแล้วแอดมินจะนัดวัน-เวลากับคุณทาง LINE OA" : "Court + coach + equipment all included. No need to pick a date or time here — after payment our admin will schedule it with you on LINE."}</p>
+      </section>
+
+      <section style={{background:"var(--bl-bg)",border:"1px solid rgba(141,182,199,.4)",borderRadius:12,padding:"12px 14px"}}>
+        {(th ? ["เลือกคอร์สด้านล่าง", "ชำระเงินและส่งสลิป", "กดปุ่ม \"ทักไลน์ OA\" (ข้อความถูกเตรียมไว้ให้แล้ว แค่กดส่ง) แอดมินจะนัดวัน-เวลาเรียนกับคุณในแชทนั้น"] : ["Choose a course below", "Pay and upload your slip", "Tap \"Message LINE OA\" (the text is prefilled — just send) and our admin will schedule your lesson in that chat"]).map((txt, i) => (
+          <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:i < 2 ? 5 : 0}}>
+            <span style={{fontSize:11.5,fontWeight:800,color:"var(--br)",flexShrink:0}}>{i + 1}.</span>
+            <p style={{fontSize:12,color:"var(--tx)",lineHeight:1.6}}>{txt}</p>
+          </div>
+        ))}
+      </section>
+
+      <div style={{display:"flex",gap:8}}>
+        {[["adult", th ? "🧑 ผู้ใหญ่" : "🧑 Adult"], ["kid", th ? "🧒 เด็ก" : "🧒 Kids"]].map(([v, label]) => (
+          <button key={v} onClick={() => { setAudience(v); setSel(null); }} style={{flex:1,padding:"11px 6px",borderRadius:12,border:`2px solid ${audience === v ? "var(--or)" : "var(--dv)"}`,background:audience === v ? "var(--or-bg)" : "#fff",color:audience === v ? "var(--or)" : "var(--mu)",fontWeight:800,fontSize:14.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+        ))}
+      </div>
+
+      {loadErr && (
+        <div style={{background:"#fff",borderRadius:"var(--r)",padding:"18px",textAlign:"center",border:"1px solid var(--dv)"}}>
+          <p style={{color:"#c0392b",fontSize:13.5,marginBottom:10}}>{th ? "โหลดราคาไม่สำเร็จ" : "Couldn't load prices"}</p>
+          <button onClick={loadCatalog} style={{padding:"9px 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{th ? "ลองใหม่" : "Retry"}</button>
+        </div>
+      )}
+      {!items && !loadErr && <p style={{textAlign:"center",color:"var(--mu)",fontSize:13}}>{th ? "กำลังโหลดราคา..." : "Loading prices..."}</p>}
+
+      {items && TYPES.map(T0 => (
+        <div key={T0.type} className="card" style={{border:`1.5px solid ${T0.accent}55`}}>
+          <div style={{padding:"14px 16px 6px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <span style={{fontSize:26}}>{T0.icon}</span>
+              <div>
+                <p className="bb" style={{fontSize:22,color:"var(--br)",lineHeight:1.1}}>{T0.title}</p>
+                <p style={{fontSize:12,fontWeight:700,color:T0.accent}}>{T0.sub}</p>
+              </div>
+            </div>
+            <p style={{fontSize:12.5,color:"var(--mu)",margin:"8px 0 10px"}}>{T0.tag}</p>
+          </div>
+          <div style={{padding:"0 12px 14px",display:"flex",flexDirection:"column",gap:8}}>
+            {[1, 5, 10].map(s => {
+              const it = pick(T0.type, s); if (!it) return null;
+              const on = sel && sel.type === T0.type && sel.sessions === s;
+              return (
+                <button key={s} onClick={() => choose(T0.type, s)} style={{textAlign:"left",padding:"11px 13px",borderRadius:12,border:`2px solid ${on ? T0.accent : "var(--dv)"}`,background:on ? `${T0.accent}14` : "#fff",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+                  <span>
+                    <span style={{display:"block",fontWeight:800,fontSize:14.5,color:"var(--br)"}}>{on ? "✓ " : ""}{rowLabel(s)}</span>
+                    <span style={{display:"block",fontSize:11.5,color:"var(--mu)",marginTop:2}}>
+                      {s === 1 ? `${baht(it.perPerson)}${it.people > 1 ? (th ? "/คน/ชม." : "/person/hr") : (th ? "/ชม." : "/hr")}` : `${baht(it.perPerson)}${it.people > 1 ? (th ? "/คน" : "/person") : ""} = ${baht(it.perSessionPerPerson)}${it.people > 1 ? (th ? "/คน/ชม." : "/person/hr") : (th ? "/ชม." : "/hr")}`}
+                    </span>
+                  </span>
+                  <span style={{textAlign:"right",flexShrink:0}}>
+                    <span style={{display:"block",fontWeight:900,fontSize:19,color:T0.accent}}>{baht(it.total)}</span>
+                    {it.people > 1 && <span style={{display:"block",fontSize:10.5,color:"var(--mu)"}}>{th ? `รวม ${it.people} คน` : `total, ${it.people} people`}</span>}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+
+      {items && (
+        <div style={{display:"flex",justifyContent:"space-around",gap:6,background:"#fff",border:"1px solid var(--dv)",borderRadius:12,padding:"10px 6px"}}>
+          {(th ? [["🎾", "ไม้ให้ยืม"], ["🟢", "ลูกคุณภาพ"], ["🏟", "สนามในร่ม"], ["🎒", "มาตัวเปล่า"]] : [["🎾", "Racket provided"], ["🟢", "Quality balls"], ["🏟", "Indoor"], ["🎒", "Just bring yourself"]]).map(([ic, tx]) => (
+            <div key={tx} style={{textAlign:"center",flex:1}}><div style={{fontSize:20}}>{ic}</div><div style={{fontSize:10.5,color:"var(--mu)",fontWeight:600,lineHeight:1.3}}>{tx}</div></div>
+          ))}
+        </div>
+      )}
+
+      {selected && (
+        <section ref={formRef} style={{background:"#fff",border:"1.5px solid var(--or)",borderRadius:"var(--r)",padding:"16px",boxShadow:"var(--sh)"}}>
+          <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:2}}>{th ? "สรุปคำสั่งซื้อ" : "Order summary"}</p>
+          <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.6}}>{coachLabel({ ...selected }, lang)}</p>
+          <p style={{fontWeight:900,fontSize:28,color:"var(--or)",margin:"6px 0 2px"}}>{baht(selected.total)}</p>
+          {selected.people > 1 && <p style={{fontSize:11.5,color:"var(--mu)",marginBottom:6}}>{th ? `(${baht(selected.perPerson)} × ${selected.people} คน)` : `(${baht(selected.perPerson)} × ${selected.people} people)`}</p>}
+
+          <div style={{display:"flex",flexDirection:"column",gap:12,marginTop:10}}>
+            <div>
+              <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>{th ? "ชื่อผู้เรียน / อายุเด็ก (ไม่บังคับ)" : "Learner name / child's age (optional)"}</label>
+              <input value={note} onChange={e => setNote(e.target.value.slice(0, 120))} placeholder={selected.people > 1 ? (th ? "เช่น น้องมะลิ และน้องกล้า (8 ขวบ)" : "e.g. Mali and Klar (8 yrs)") : (th ? "เช่น น้องกล้า (8 ขวบ)" : "e.g. Klar (8 yrs)")}
+                style={{width:"100%",padding:"12px 14px",borderRadius:10,fontSize:14.5,border:"1.5px solid var(--dv)",outline:"none",background:"#fff"}} />
+            </div>
+            <div>
+              <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>{th ? "ชื่อ (จาก LINE)" : "Name (from LINE)"}</label>
+              <input value={lineName} readOnly style={{width:"100%",padding:"12px 14px",borderRadius:10,fontSize:14.5,border:"1.5px solid var(--dv)",outline:"none",background:"var(--cr2)",color:"var(--mu)"}} />
+            </div>
+            <div>
+              <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>{T[lang].phone}</label>
+              <input value={phone} readOnly={phoneLocked} onChange={e => { if (!phoneLocked) setPhone(e.target.value.replace(/\D/g, "").slice(0, 10)); }} placeholder="0812345678" inputMode="numeric"
+                style={{width:"100%",padding:"12px 14px",borderRadius:10,fontSize:14.5,border:`1.5px solid ${phone && !phoneOk ? "#c0392b" : "var(--dv)"}`,outline:"none",background:phoneLocked ? "var(--cr2)" : "#fff",color:phoneLocked ? "var(--mu)" : "var(--tx)"}} />
+              <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>
+                {phoneLocked ? (th ? `🔒 เบอร์ที่ผูกกับบัญชี LINE ของคุณ — เปลี่ยนเองไม่ได้ ต้องการเปลี่ยนติดต่อแอดมิน ${ADMIN_CONTACT_PHONE}` : `🔒 Linked to your LINE account — contact admin to change: ${ADMIN_CONTACT_PHONE}`)
+                  : (th ? "กรอกครั้งแรกครั้งเดียว — เบอร์นี้จะถูกล็อกกับบัญชี LINE ของคุณ กรุณากรอกให้ถูกต้อง" : "Enter once — this number will be locked to your LINE account. Please double-check it.")}
+              </p>
+            </div>
+          </div>
+          {err && <p style={{fontSize:12.5,color:"#c0392b",marginTop:10,lineHeight:1.6}}>{err}</p>}
+          <button className="btn-primary" onClick={go} disabled={!phoneOk || creating} style={{marginTop:14,opacity:(!phoneOk || creating) ? 0.6 : 1,cursor:(!phoneOk || creating) ? "not-allowed" : "pointer"}}>
+            {creating ? (th ? "กำลังสร้างคำสั่งซื้อ..." : "Creating order...") : (th ? "ไปชำระเงิน →" : "Continue to payment →")}
+          </button>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function CoachPaymentView({ order, linePushed, lang="th", onDone }) {
+  const th = lang === "th";
   const t = T[lang];
+  const [slip, setSlip] = useState(null);
+  const [slipPreview, setSlipPreview] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploaded, setUploaded] = useState(false);
+  const [chatTapped, setChatTapped] = useState(false); // ลูกค้ากดปุ่มทักไลน์ OA แล้วหรือยัง (ใช้เตือนถ้ายังไม่ได้ทัก)
+  const fileRef = useRef();
+
+  const handleSlipChange = (e) => { const file = e.target.files[0]; if (!file) return; setSlip(file); setSlipPreview(URL.createObjectURL(file)); };
+  const handleUpload = async () => {
+    if (!slip || uploading) return;
+    setUploading(true);
+    const up = await db.uploadSlip(slip, `coach_${order.id}`);
+    const url = typeof up === "string" ? up : null;
+    if (!url) { alert(uploadFailMsg(up, lang)); setUploading(false); return; }
+    const updated = await db.updateCoachSlip(order.id, url);
+    if (!updated) {
+      setUploading(false);
+      alert(th ? "ส่งสลิปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง หรือติดต่อร้านโดยตรง" : "Failed to submit slip. Please try again or contact us directly.");
+      return;
+    }
+    setUploaded(true); setUploading(false);
+    trackFb("Purchase", { value: order.price, currency: "THB", content_name: "coach" });
+    // การแจ้งเตือน Telegram ถึงแอดมินทำที่เซิร์ฟเวอร์ตอนบันทึกสลิปสำเร็จ (api/booking-actions.js)
+  };
+  const cancelOrder = async () => {
+    if (!window.confirm(th ? "ยกเลิกคำสั่งซื้อนี้ใช่หรือไม่?" : "Cancel this order?")) return;
+    await db.cancelCoachOrder(order.id).catch(() => {});
+    onDone();
+  };
+
+  return (
+    <div style={{padding:"20px 16px 90px"}} className="fu">
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:14}}>{t.payment}</h2>
+
+      {linePushed ? (
+        <div style={{background:"rgba(6,199,85,.1)",border:"1px solid rgba(6,199,85,.35)",borderRadius:12,padding:"12px 14px",marginBottom:14}}>
+          <p style={{fontSize:13,fontWeight:800,color:"#047a38",marginBottom:2}}>💬 {th ? "ส่งสรุปรายการเข้า LINE OA ของคุณแล้ว" : "We've sent your order summary on LINE"}</p>
+          <p style={{fontSize:12,color:"var(--tx)",lineHeight:1.6}}>{th ? "ตรวจดูได้ในแชท LINE OA ของ NOVA Tennis — หลังชำระเงิน แอดมินจะนัดวัน-เวลาเรียนกับคุณในแชทนั้น" : "Check the NOVA Tennis LINE OA chat — after payment our admin will schedule your lesson there."}</p>
+        </div>
+      ) : (
+        <div style={{background:"rgba(6,199,85,.08)",border:`1.5px solid ${chatTapped ? "rgba(6,199,85,.35)" : "#06C755"}`,borderRadius:12,padding:"14px 14px",marginBottom:14}}>
+          <p style={{fontSize:13.5,fontWeight:800,color:"#047a38",marginBottom:4}}>{chatTapped ? "✅" : "👉"} {th ? "ทักไลน์ OA เพื่อนัดวัน-เวลาเรียน" : "Message our LINE OA to schedule your lesson"}</p>
+          <p style={{fontSize:12,color:"var(--tx)",lineHeight:1.65,marginBottom:10}}>{th ? "กดปุ่มด้านล่าง LINE จะเปิดแชทพร้อมข้อความที่เตรียมไว้ให้ (รหัส C-" + order.id + " คอร์ส ชื่อ เบอร์) แค่กดส่ง — ควรทักเลย แม้ยังไม่ได้ชำระเงิน เพื่อให้แอดมินรู้ว่าเป็นคุณและนัดเวลาได้" : "Tap the button — LINE opens with your message prefilled (order C-" + order.id + ", course, name, phone). Just press send. Do it now, even before paying, so our admin knows it's you."}</p>
+          <a href={oaChatUrl(coachChatText(order, lang))} onClick={() => setChatTapped(true)} target="_blank" rel="noopener noreferrer" style={{display:"block",textAlign:"center",padding:"12px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:14.5,textDecoration:"none"}}>💬 {th ? "ทักไลน์ OA เพื่อนัดวัน-เวลา" : "Message LINE OA"}</a>
+        </div>
+      )}
+
+      <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",boxShadow:"0 4px 24px rgba(102,57,36,.12)",marginBottom:16,border:"1px solid var(--dv)"}}>
+        <p style={{fontSize:13,color:"var(--mu)",marginBottom:12}}>{t.scanQR}</p>
+        <img src={COACH_QR} alt="Payment QR" style={{width:200,height:200,objectFit:"contain",borderRadius:10,border:"1px solid var(--dv)",background:"#fff"}} />
+        <div style={{marginTop:14,display:"inline-flex",alignItems:"center",gap:8,background:"var(--or-bg)",borderRadius:20,padding:"8px 18px"}}>
+          <span style={{fontSize:24,fontWeight:800,color:"var(--or)"}}>฿{order.price.toLocaleString()}</span>
+        </div>
+        <div style={{marginTop:12,padding:"10px 14px",background:"var(--cr)",borderRadius:10}}>
+          <p style={{fontSize:11,color:"var(--mu)"}}>{t.accountName}</p>
+          <p style={{fontSize:14,fontWeight:700,color:"var(--br)"}}>{PAYMENT_ACCOUNT_NAME}</p>
+          <p style={{fontSize:11,color:"var(--mu)",marginTop:2}}>{th ? "รับโอนได้จากทุกธนาคาร" : "Accepts all banks"}</p>
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div className="card-header"><p>{th ? "รายละเอียดคำสั่งซื้อ" : "Order details"}</p></div>
+        <div className="card-body">
+          <Row label="🎓" val={coachLabel(order, lang)} />
+          {order.people > 1 && <Row label="💰" val={`฿${(order.price / order.people).toLocaleString()} × ${order.people} ${th ? "คน" : "people"}`} />}
+          {order.learner_note && <Row label="📝" val={order.learner_note} />}
+          <Row label="👤" val={order.customer_name} />
+          <Row label="📞" val={order.customer_id} />
+          <Row label="#" val={`C-${order.id}`} />
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:20}}>
+        <div className="card-header"><p>{t.uploadSlip}</p></div>
+        <div className="card-body">
+          {uploaded ? (
+            <div style={{textAlign:"center",padding:"10px 0"}}>
+              <p style={{color:"#2d7a4f",fontWeight:700,fontSize:15}}>{t.slipSent}</p>
+              <p style={{color:"var(--mu)",fontSize:13,marginTop:4,lineHeight:1.6}}>{th ? "ทีมงานจะตรวจสอบสลิป แล้วนัดวัน-เวลาเรียนกับคุณทาง LINE OA" : "Our team will verify your slip and schedule your lesson with you on LINE OA."}</p>
+              {!linePushed && !chatTapped && (
+                <div style={{marginTop:14,background:"rgba(255,213,74,.28)",border:"1px solid rgba(232,162,0,.45)",borderRadius:12,padding:"12px 14px",textAlign:"left"}}>
+                  <p style={{fontSize:12.5,fontWeight:700,color:"#8a5a00",lineHeight:1.6,marginBottom:8}}>⚠️ {th ? "ขั้นตอนสุดท้าย: ยังไม่ได้ทักไลน์ OA — ถ้าไม่ทักมา แอดมินจะไม่ทราบว่าเป็นคุณและนัดวัน-เวลาให้ไม่ได้" : "Last step: you haven't messaged our LINE OA yet — without it we can't tell who you are or schedule your lesson."}</p>
+                  <a href={oaChatUrl(coachChatText(order, lang))} onClick={() => setChatTapped(true)} target="_blank" rel="noopener noreferrer" style={{display:"block",textAlign:"center",padding:"11px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:14,textDecoration:"none"}}>💬 {th ? "ทักไลน์ OA เลย" : "Message LINE OA now"}</a>
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              {slipPreview && <img src={slipPreview} alt="slip" style={{width:"100%",borderRadius:10,marginBottom:12,maxHeight:200,objectFit:"cover"}} />}
+              <input ref={fileRef} type="file" accept="image/*" onChange={handleSlipChange} style={{display:"none"}} />
+              <button onClick={() => fileRef.current.click()} style={{width:"100%",padding:"12px",borderRadius:10,border:"1.5px dashed var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:600,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {slip ? t.changeSlip : t.selectSlip}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {uploaded ? (
+        <button className="btn-primary" onClick={onDone}>{th ? "เสร็จสิ้น" : "Done"}</button>
+      ) : (
+        <>
+          <button className="btn-primary" disabled={!slip || uploading} onClick={handleUpload} style={{opacity:(!slip || uploading) ? 0.6 : 1,cursor:(!slip || uploading) ? "not-allowed" : "pointer"}}>
+            {uploading ? t.sending : t.sendSlip}
+          </button>
+          {order.status === "pending" && (
+            <button onClick={cancelOrder} style={{display:"block",margin:"14px auto 0",background:"none",border:"none",color:"#c0392b",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+              {th ? "ยกเลิกคำสั่งซื้อนี้" : "Cancel this order"}
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+
+// ─── Cancel / Check Booking Page ─────────────────────────────────────────────
+function CancelPage({ lang="th", initialPhone="", lockedPhone="", onResumeCoach }) {
+  const t = T[lang];
+  const [coachOrders, setCoachOrders] = useState([]);
+  useEffect(() => { if (lockedPhone) db.myCoachOrders().then(setCoachOrders).catch(() => {}); }, [lockedPhone]);
   const [phone, setPhone] = useState(lockedPhone || initialPhone);
   useEffect(() => { if (lockedPhone) setPhone(lockedPhone); }, [lockedPhone]); // ผูก LINE แล้ว → ดูได้เฉพาะการจองของเบอร์ตัวเอง
   const [bookings, setBookings] = useState([]);
@@ -2008,6 +2350,35 @@ function CancelPage({ lang="th", initialPhone="", lockedPhone="" }) {
         })}
       </div>
 
+      {coachOrders.length > 0 && (
+        <div style={{marginTop:20}}>
+          <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:10}}>🎓 {lang==="th" ? "คอร์สเรียนกับโค้ชของฉัน" : "My coaching courses"}</p>
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {coachOrders.map(o => {
+              const st = coachStatusInfo(o.status, lang);
+              return (
+                <div key={o.id} className="card">
+                  <div style={{padding:"14px 16px"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:10}}>
+                      <span style={{fontWeight:700,color:"var(--br)",fontSize:13.5,lineHeight:1.4}}>{coachLabel(o, lang)}</span>
+                      <span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 10px",borderRadius:20,whiteSpace:"nowrap"}}>{st.text}</span>
+                    </div>
+                    <Row label={t.rowPrice} val={`฿${o.price?.toLocaleString()}`} />
+                    {o.status === "confirmed" && Number(o.sessions) > 1 && <Row label={lang==="th" ? "เรียนแล้ว" : "Used"} val={`${o.sessions_used} / ${o.sessions} ${lang==="th" ? "ครั้ง" : "sessions"}`} />}
+                    {o.status === "pending" && onResumeCoach && (
+                      <button onClick={() => onResumeCoach(o)} style={{width:"100%",marginTop:4,padding:"11px",borderRadius:10,border:"none",background:"linear-gradient(90deg,var(--or),var(--or2))",color:"#fff",fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{lang==="th" ? "ไปชำระเงิน →" : "Go to payment →"}</button>
+                    )}
+                    {o.status === "reviewing" && <p style={{fontSize:12,color:"var(--mu)",lineHeight:1.6}}>{lang==="th" ? "ทางร้านกำลังตรวจสอบสลิป แล้วจะนัดวัน-เวลาเรียนทาง LINE OA" : "We're verifying your slip, then will schedule your lesson on LINE OA."}</p>}
+                    {o.status === "confirmed" && <p style={{fontSize:12,color:"var(--mu)",lineHeight:1.6}}>{lang==="th" ? "แอดมินจะนัดวัน-เวลาเรียนกับคุณทาง LINE OA (หรือส่งวัน-เวลาที่สะดวกมาในแชทได้เลย)" : "Our admin will schedule your lessons on LINE OA (or message us your preferred times)."}</p>}
+                    <a href={oaChatUrl(coachChatText(o, lang))} target="_blank" rel="noopener noreferrer" style={{display:"block",textAlign:"center",marginTop:10,padding:"10px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>💬 {lang==="th" ? "ทักไลน์ OA เพื่อนัดวัน-เวลา" : "Message LINE OA"}</a>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       <div style={{marginTop:18,background:"#fff",border:"1px solid var(--dv)",borderRadius:"var(--r)",padding:"16px 18px",boxShadow:"var(--sh)"}}>
         <p style={{fontWeight:800,color:"var(--br)",fontSize:14.5,marginBottom:6}}>{lang==="th" ? "ต้องการยกเลิกหรือสอบถามเรื่องการจอง?" : "Need to cancel or ask about a booking?"}</p>
         <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7,marginBottom:12}}>
@@ -2069,7 +2440,7 @@ export default function AppV2() {
 
   const goTab = (id) => {
     // ตัดสินใจตอน "กด" (ไม่ใช่ตอนแสดงผล) — กด Back จากหน้า LINE แล้วกลับมาหน้าแรกได้ปกติ ไม่วนลูปเด้งไปล็อกอินซ้ำ
-    if (LINE_SKIP_INTRO && LINE_GATE_MODE === "booking" && (id === "book" || id === "package") && !lineSession) {
+    if (LINE_SKIP_INTRO && LINE_GATE_MODE === "booking" && (id === "book" || id === "package" || id === "coach") && !lineSession) {
       startLineLogin(id, null); // กลับมาแล้วจะเข้าหน้าที่กดไว้
       return;
     }
@@ -2127,7 +2498,7 @@ export default function AppV2() {
     if (!isAdminPath) initMetaPixel();
   }, []);
   useEffect(() => {
-    if (tab === "book" || tab === "package") trackFb("ViewContent", { content_name: tab === "book" ? "booking" : "packages" });
+    if (tab === "book" || tab === "package" || tab === "coach") trackFb("ViewContent", { content_name: tab === "book" ? "booking" : tab === "coach" ? "coach" : "packages" });
   }, [tab]);
   useEffect(() => {
     if (tab === "book" && page === "checkout" && booking) trackFb("InitiateCheckout", { value: booking.slot?.price || 0, currency: "THB" });
@@ -2172,7 +2543,7 @@ export default function AppV2() {
       } catch { /* no-op */ }
       if (!restored) {
         setPage("booking");
-        setTab(["home", "book", "package", "cancel"].includes(returnTarget) ? returnTarget : "home");
+        setTab(["home", "book", "package", "coach", "cancel"].includes(returnTarget) ? returnTarget : "home");
       }
       setLineCbStatus(null);
     }).catch(() => setLineCbStatus("error"));
@@ -2228,6 +2599,7 @@ export default function AppV2() {
 
   // จองด้วยสิทธิ์แพ็คเกจ — จ่ายไว้ล่วงหน้าแล้ว ยืนยันทันทีไม่ต้องผ่านหน้า QR/แนบสลิปอีก
   const [pkgBookingBusy, setPkgBookingBusy] = useState(false);
+  const [coachResume, setCoachResume] = useState(null); // เปิดหน้าชำระเงินคอร์สโค้ชที่ค้างอยู่ (มาจากหน้า "การจองของฉัน")
   // จองด้วยโค้ดส่วนลดที่ครอบคลุมทั้งยอด (฿0): สร้างการจองเป็น "รอแอดมินยืนยัน" ทันที ไม่ผ่านหน้า QR
   const handleConfirmFree = async ({ name, phone, discount }) => {
     if (!booking || pkgBookingBusy) return;
@@ -2403,7 +2775,7 @@ export default function AppV2() {
     </>
   );
   // โหมด booking: กั้นเฉพาะหน้าจองสนาม/แพ็คเกจ (หน้าแรก ราคา แบนเนอร์ ดูได้อิสระ)
-  const blockedByLine = LINE_GATE_MODE === "booking" && (needLogin || needFriend) && (tab === "book" || tab === "package");
+  const blockedByLine = LINE_GATE_MODE === "booking" && (needLogin || needFriend) && (tab === "book" || tab === "package" || tab === "coach");
 
   return (
     <>
@@ -2435,7 +2807,7 @@ export default function AppV2() {
           {blockedByLine && (needLogin
             ? <LineLoginGate lang={lang} compact onLogin={() => handleLineLogin(null)} />
             : <LineFriendGate lang={lang} compact name={toFormName(lineSession?.displayName)} onRecheck={recheckFriend} />)}
-          {tab==="home" && <HomePage goBook={() => goTab("book")} goPackage={() => goTab("package")} lang={lang} />}
+          {tab==="home" && <HomePage goBook={() => goTab("book")} goPackage={() => goTab("package")} goCoach={() => goTab("coach")} lang={lang} />}
           {!blockedByLine && tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} lang={lang} />}
           {!blockedByLine && tab==="book" && page==="checkout" && booking && (
             <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} onConfirmWithPackage={handleConfirmWithPackage} onConfirmFree={handleConfirmFree} lineSession={lineSession} onLineLogin={handleLineLogin} onLinkPhone={handleLinkPhone} lang={lang} />
@@ -2444,7 +2816,8 @@ export default function AppV2() {
             <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} resumeBooking={resumeBooking} onCreated={(id, createdAt) => setResumeBooking({ id, createdAt })} onStartOver={resetBookingFlow} />
           )}
           {!blockedByLine && tab==="package" && <PackagePage lang={lang} lineSession={lineSession} onLineLogin={handleLineLogin} onLinkPhone={handleLinkPhone} />}
-          {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone || lineSession?.phone || ""} lockedPhone={lineSession?.phone || ""} />}
+          {!blockedByLine && tab==="coach" && <CoachPage lang={lang} lineSession={lineSession} onLinkPhone={handleLinkPhone} resume={coachResume} onResumeUsed={() => setCoachResume(null)} />}
+          {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone || lineSession?.phone || ""} lockedPhone={lineSession?.phone || ""} onResumeCoach={(o) => { setCoachResume({ order: o }); goTab("coach"); }} />}
         </main>
         <TabBar tab={tab} setTab={goTab} lang={lang} />
       </div>
@@ -2636,6 +3009,36 @@ function AdminDashboard({ token, onLogout }) {
     if (!window.confirm(`ปลดล็อกเบอร์ ${phone} จากบัญชี LINE?\n\nลูกค้าจะผูกเบอร์ใหม่ (หรือเบอร์เดิม) ได้อีกครั้งตอนจองครั้งถัดไป ประวัติการจองเดิมยังอยู่กับเบอร์เดิม`)) return;
     const r = await callAdminAction("unlinkLinePhone", token, { phone });
     if (r?.ok) loadCustomers();
+  };
+
+  // ── คอร์สเรียนกับโค้ช (สนาม+โค้ช): ลูกค้าจ่ายเงินแล้วแอดมินนัดวัน-เวลาทาง LINE OA ──
+  const [coachList, setCoachList] = useState(null);
+  const [coachFilter, setCoachFilter] = useState("open"); // open = รอชำระ/รอตรวจสอบ, confirmed, all
+  const [coachBusy, setCoachBusy] = useState(null);
+  const [coachPushEnabled, setCoachPushEnabled] = useState(false); // เซิร์ฟเวอร์เปิดส่งข้อความ LINE อัตโนมัติอยู่หรือไม่ (COACH_LINE_PUSH)
+  const loadCoach = async () => { const r = await callAdminAction("coachOrders", token, {}); setCoachList(Array.isArray(r?.orders) ? r.orders : []); setCoachPushEnabled(!!r?.pushEnabled); };
+  useEffect(() => { if (tab === "coach") loadCoach(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [tab]);
+  const confirmCoach = async (o) => {
+    if (!window.confirm(`ยืนยันว่าได้รับเงินแล้ว ฿${o.price.toLocaleString()} จาก ${o.customer_name}?${coachPushEnabled ? "\n\nระบบจะส่งข้อความแจ้งลูกค้าใน LINE OA ให้ด้วย" : "\n\nจากนั้นนัดวัน-เวลากับลูกค้าในแชท LINE OA (ลูกค้าทักมาพร้อมรหัส C-" + o.id + ")"}`)) return;
+    setCoachBusy(o.id);
+    const r = await callAdminAction("confirmCoachOrder", token, { id: o.id });
+    setCoachBusy(null);
+    if (!r?.ok) alert("ยืนยันไม่สำเร็จ (อาจถูกยืนยัน/ยกเลิกไปแล้ว)");
+    else if (r.pushEnabled && !r.pushed) alert("ยืนยันแล้ว แต่ส่งข้อความเข้า LINE OA ของลูกค้าไม่สำเร็จ (ลูกค้าอาจบล็อก OA หรือโควตาข้อความหมด) กรุณาทักลูกค้าเอง");
+    loadCoach();
+  };
+  const cancelCoach = async (o) => {
+    if (!window.confirm(`ยกเลิกคำสั่งซื้อ C-${o.id} ของ ${o.customer_name}?`)) return;
+    setCoachBusy(o.id);
+    await callAdminAction("cancelCoachOrder", token, { id: o.id });
+    setCoachBusy(null); loadCoach();
+  };
+  const adjustCoach = async (o, delta) => {
+    setCoachBusy(o.id);
+    const r = await callAdminAction("adjustCoachSessions", token, { id: o.id, delta });
+    setCoachBusy(null);
+    if (r?.ok) setCoachList(list => list.map(x => (x.id === o.id ? { ...x, sessions_used: r.sessions_used } : x)));
+    else loadCoach();
   };
 
   const [pkgQueue, setPkgQueue] = useState([]);
@@ -2893,7 +3296,7 @@ function AdminDashboard({ token, onLogout }) {
         </header>
 
         <div style={{background:"#fff",borderBottom:"1px solid var(--dv)",display:"flex",padding:"0 20px",overflowX:"auto"}}>
-          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["newbooking","➕ จองแทน"],["packages","🎟 แพ็คเกจ"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
+          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["newbooking","➕ จองแทน"],["packages","🎟 แพ็คเกจ"],["coach","🎓 โค้ช"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
             <button key={id} onClick={() => setTab(id)} style={{padding:"13px 16px",background:"none",border:"none",borderBottom:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",fontWeight:tab===id?700:400,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
               {label}
             </button>
@@ -3201,6 +3604,65 @@ function AdminDashboard({ token, onLogout }) {
               </div>
             </div>
           )}
+
+          {tab==="coach" && (() => {
+            const all = coachList || [];
+            const openN = all.filter(o => o.status === "pending" || o.status === "reviewing").length;
+            const shown = all.filter(o => coachFilter === "all" ? true : coachFilter === "confirmed" ? o.status === "confirmed" : (o.status === "pending" || o.status === "reviewing"));
+            const stBadge = (s) => ({ confirmed: ["ยืนยันแล้ว", "#2d7a4f"], reviewing: ["รอตรวจสอบสลิป", "#e67e22"], pending: ["รอชำระเงิน", "#8a7060"], cancelled: ["ยกเลิกแล้ว", "#c0392b"] }[s] || [s, "#8a7060"]);
+            const when = (t) => { try { return parseUtc(t).toLocaleString("th-TH", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }); } catch { return ""; } };
+            return (
+              <div>
+                <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:4}}>🎓 คอร์สเรียนกับโค้ช</p>
+                <p style={{fontSize:12,color:"var(--mu)",marginBottom:12,lineHeight:1.6}}>ลูกค้าเลือกคอร์สและโอนเงินในเว็บ {coachPushEnabled ? "ระบบส่งข้อความเข้า LINE OA ของลูกค้าให้แล้ว" : "แล้วกดปุ่มทักไลน์ OA มาเอง (ข้อความมีรหัส C-xx / ชื่อ / เบอร์)"} — ตรวจสลิปแล้วกด ✅ แล้วนัดวัน-เวลากับลูกค้าในแชท LINE OA</p>
+                <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+                  {[["open", `รอดำเนินการ (${openN})`], ["confirmed", "ยืนยันแล้ว"], ["all", "ทั้งหมด"]].map(([v, label]) => (
+                    <button key={v} onClick={() => setCoachFilter(v)} style={{padding:"8px 14px",borderRadius:20,border:`1.5px solid ${coachFilter === v ? "var(--or)" : "var(--dv)"}`,background:coachFilter === v ? "var(--or-bg)" : "#fff",color:coachFilter === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+                  ))}
+                  <button onClick={loadCoach} style={{padding:"8px 14px",borderRadius:20,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--br)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>🔄 รีเฟรช</button>
+                </div>
+                {coachList === null && <p style={{color:"var(--mu)",fontSize:13}}>กำลังโหลด...</p>}
+                {coachList !== null && shown.length === 0 && <div style={{background:"#fff",borderRadius:12,padding:24,textAlign:"center",border:"1px solid var(--dv)",color:"var(--mu)"}}>ไม่มีรายการ</div>}
+                <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                  {shown.map(o => {
+                    const [stTxt, stCol] = stBadge(o.status);
+                    const busy = coachBusy === o.id;
+                    return (
+                      <div key={o.id} style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",boxShadow:"var(--sh)",padding:"14px 16px"}}>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:8}}>
+                          <div>
+                            <p style={{fontWeight:800,color:"var(--br)",fontSize:14.5}}>C-{o.id} • {o.customer_name}</p>
+                            <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>📞 <a href={`tel:${o.customer_id}`} style={{color:"var(--br)"}}>{o.customer_id}</a> • {when(o.created_time)} {o.line_pushed ? " • 💬 ส่งข้อความ LINE แล้ว" : coachPushEnabled ? <span> • 💬 <span style={{color:"#c0392b",fontWeight:700}}>ส่ง LINE ไม่สำเร็จ — ทักลูกค้าเอง</span></span> : null}</p>
+                          </div>
+                          <span style={{fontSize:11.5,fontWeight:700,color:stCol,background:`${stCol}18`,padding:"3px 10px",borderRadius:20,whiteSpace:"nowrap"}}>{stTxt}</span>
+                        </div>
+                        <p style={{fontSize:13.5,color:"var(--tx)",lineHeight:1.6}}>{coachLabel(o, "th")}</p>
+                        <p style={{fontSize:15,fontWeight:800,color:"var(--or)",margin:"2px 0 4px"}}>฿{o.price.toLocaleString()}{o.people > 1 ? <span style={{fontSize:11.5,fontWeight:500,color:"var(--mu)"}}> ({(o.price / o.people).toLocaleString()} × {o.people} คน)</span> : null}</p>
+                        {o.learner_note && <p style={{fontSize:12.5,color:"var(--mu)"}}>📝 ผู้เรียน: {o.learner_note}</p>}
+                        {o.slip_url && <a href={o.slip_url} target="_blank" rel="noopener noreferrer" style={{display:"inline-block",marginTop:6,fontSize:12.5,fontWeight:700,color:"var(--br)"}}>🧾 ดูสลิป</a>}
+                        <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap",alignItems:"center"}}>
+                          {(o.status === "pending" || o.status === "reviewing") && (
+                            <>
+                              <button disabled={busy} onClick={() => confirmCoach(o)} style={{padding:"9px 16px",borderRadius:10,border:"none",background:"#2d7a4f",color:"#fff",fontWeight:800,fontSize:13,cursor:"pointer",opacity:busy ? .6 : 1}}>✅ ยืนยันรับเงิน</button>
+                              <button disabled={busy} onClick={() => cancelCoach(o)} style={{padding:"9px 16px",borderRadius:10,border:"1.5px solid #c0392b",background:"#fff",color:"#c0392b",fontWeight:700,fontSize:13,cursor:"pointer",opacity:busy ? .6 : 1}}>❌ ยกเลิก</button>
+                            </>
+                          )}
+                          {o.status === "confirmed" && (
+                            <>
+                              <span style={{fontSize:13,fontWeight:700,color:"var(--br)"}}>เรียนแล้ว {o.sessions_used || 0} / {o.sessions} ครั้ง</span>
+                              <button disabled={busy || (o.sessions_used || 0) <= 0} onClick={() => adjustCoach(o, -1)} style={{width:34,height:34,borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",fontWeight:800,fontSize:16,cursor:"pointer"}}>−</button>
+                              <button disabled={busy || (o.sessions_used || 0) >= o.sessions} onClick={() => adjustCoach(o, 1)} style={{width:34,height:34,borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:800,fontSize:16,cursor:"pointer"}}>+</button>
+                              <button disabled={busy} onClick={() => cancelCoach(o)} style={{marginLeft:"auto",padding:"7px 12px",borderRadius:8,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:12,cursor:"pointer"}}>ยกเลิกคำสั่งซื้อ</button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
 
           {tab==="packages" && (
             <div>
