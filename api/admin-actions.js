@@ -102,7 +102,7 @@ async function insertBookingsAtomic(rows) {
   if (msg.includes("slot_taken")) return { error: "slot_taken", court: Number(msg.split(":")[1]) || null };
   if (r.body?.code !== "PGRST202") console.error("create_bookings_if_free failed — fallback to plain insert:", r.body);
   const ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(rows) });
-  if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== rows.length) return { error: "insert_failed" };
+  if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== rows.length) return { error: "insert_failed", detail: ins.body };
   return { rows: ins.body };
 }
 
@@ -200,6 +200,8 @@ export default async function handler(req, res) {
         // อ่านสถานะ "ก่อนหน้า" ก่อนแก้ไข เพื่อตัดสินใจเรื่องสิทธิ์แพ็คเกจให้ถูกต้องตามการเปลี่ยนสถานะจริง
         const { body: beforeRows } = await sb(`bookings?id=eq.${id}&select=*`);
         const before = (beforeRows || [])[0];
+        // การจองที่นัดเรียนกับโค้ชถูกสร้างเป็น "ยืนยันแล้ว" และตัดสิทธิ์ไปแล้ว → เปลี่ยนได้เฉพาะ "ยกเลิก" (กันตัด/คืนสิทธิ์ผิดพลาดจากการสลับสถานะไปมา)
+        if (before?.coach_order_id && status !== "cancelled") { res.status(400).json({ error: "coach_booking_locked" }); return; }
 
         // การจองคู่ (2 สนามโอนทีเดียว) — เปลี่ยนสถานะทั้งกลุ่มพร้อมกัน กันแอดมินยืนยันไปแค่สนามเดียว
         if (before?.group_id) {
@@ -210,6 +212,12 @@ export default async function handler(req, res) {
 
         if (status === "cancelled" && before?.discount_code && before.status !== "confirmed") {
           await releaseDiscountByCode(before.discount_code); // รายการที่ยังไม่เคยยืนยัน = ยังไม่ได้ใช้ส่วนลดจริง → คืนสิทธิ์ (ถ้ายืนยันไปแล้วไม่คืนอัตโนมัติ ใช้ปุ่ม "รีเซ็ต" ที่หน้า ส่วนลด)
+        }
+        // ยกเลิกการนัดเรียนกับโค้ชที่ยืนยันแล้ว + แอดมินเลือกคืนสิทธิ์ → ลดจำนวนครั้งที่ใช้ไปลง 1 (ไม่ต่ำกว่า 0 และไม่คืนซ้ำถ้ายกเลิกไปแล้ว)
+        if (before?.coach_order_id && status === "cancelled" && before.status === "confirmed" && refundCredit) {
+          const { body: cur } = await sb(`coach_orders?id=eq.${before.coach_order_id}&select=sessions_used`);
+          const c = Array.isArray(cur) ? cur[0] : null;
+          if (c && (c.sessions_used || 0) > 0) await sb(`coach_orders?id=eq.${before.coach_order_id}&sessions_used=eq.${c.sessions_used}`, { method: "PATCH", body: JSON.stringify({ sessions_used: c.sessions_used - 1 }) });
         }
         if (before?.package_id) {
           const wasConfirmed = before.status === "confirmed";
@@ -292,6 +300,20 @@ export default async function handler(req, res) {
           console.error("lookupCustomer packages error:", e);
           packagesError = true;
         }
+        // คอร์สเรียนกับโค้ชของเบอร์นี้: ที่ยืนยันรับเงินแล้วและยังเหลือสิทธิ์ → coachOrders (ใช้ตัดสิทธิ์ได้) / ที่ใช้ไม่ได้ → coachIssues พร้อมเหตุผล
+        const coachOrders = [];
+        const coachIssues = [];
+        try {
+          const cq = await sb(`coach_orders?customer_id=eq.${phone}&status=neq.cancelled&select=id,audience,type,sessions,people,sessions_used,status&order=created_time.asc`);
+          if (Array.isArray(cq.body)) {
+            for (const o of cq.body) {
+              const used = o.sessions_used || 0;
+              if (o.status !== "confirmed") coachIssues.push({ id: o.id, label: `C-${o.id} ${coachLabel(o)}`, issue: 'ยังไม่ได้ยืนยันการชำระเงิน — ไปที่แท็บ "👤 โค้ช" แล้วกด ✅ ก่อน' });
+              else if (used >= o.sessions) coachIssues.push({ id: o.id, label: `C-${o.id} ${coachLabel(o)}`, issue: `ใช้สิทธิ์ครบแล้ว (${used}/${o.sessions} ครั้ง)` });
+              else coachOrders.push({ id: o.id, audience: o.audience, type: o.type, sessions: o.sessions, people: o.people, sessions_used: used, remaining: o.sessions - used });
+            }
+          }
+        } catch (e) { console.error("lookupCustomer coach orders error:", e); }
         res.status(200).json({
           name: Array.isArray(cust) ? (cust[0]?.customer_name || null) : null,
           linked: Array.isArray(line) && line.length > 0,
@@ -300,6 +322,8 @@ export default async function handler(req, res) {
           packages,
           packageIssues,
           packagesError,
+          coachOrders,
+          coachIssues,
         });
         return;
       }
@@ -330,7 +354,7 @@ export default async function handler(req, res) {
       case "createAdminBooking": {
         // แอดมินจองแทนลูกค้า (โทรมาจอง/ไม่มี LINE) — ไม่ต้องล็อกอิน LINE, ไม่มีโปรอัตโนมัติ, แอดมินกำหนดราคาต่อสนามเอง
         // ถ้าภายหลังลูกค้าล็อกอิน LINE แล้วผูกเบอร์นี้ ชื่อ LINE จะแทนชื่อที่แอดมินใส่ในข้อมูลลูกค้า (ดู lineLinkPhone)
-        const { customerId, customerName, courtIds, bookingDate, hour, startMinute, durationMinutes, packageId } = p;
+        const { customerId, customerName, courtIds, bookingDate, hour, startMinute, durationMinutes, packageId, coachOrderId } = p;
         let { price, status } = p;
         if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid phone" }); return; }
         const name = String(customerName || "").trim();
@@ -340,6 +364,8 @@ export default async function handler(req, res) {
         if (!/^\d{4}-\d{2}-\d{2}$/.test(bookingDate || "")) { res.status(400).json({ error: "invalid date" }); return; }
         if (!Number.isInteger(hour) || hour < 0 || hour > 23 || ![0, 30].includes(startMinute || 0)) { res.status(400).json({ error: "invalid time" }); return; }
         if (![30, 60, 90, 120].includes(durationMinutes)) { res.status(400).json({ error: "invalid duration" }); return; }
+
+        if (coachOrderId && packageId) { res.status(400).json({ error: "coach_with_package" }); return; } // เลือกได้อย่างเดียว: สิทธิ์แพ็คเกจสนาม หรือ สิทธิ์คอร์สโค้ช
 
         // ── ตัดสิทธิ์แพ็คเกจ (ถ้าเลือก): ราคา 0 / ยืนยันทันที / หักสิทธิ์ทันที (แอดมินเป็นคนยืนยันเอง) ──
         let pkg = null, units = 0;
@@ -361,6 +387,19 @@ export default async function handler(req, res) {
           if (!covered) { res.status(400).json({ error: "package_wrong_tier" }); return; }
           price = 0; status = "confirmed";
         }
+        // ── นัดเรียนกับโค้ช: ตัดสิทธิ์ครั้งเรียนของคอร์ส 1 ครั้ง (60 นาที) / 1 สนาม / ราคา 0 (จ่ายค่าคอร์สไปแล้ว) / ยืนยันทันที / ลงชื่อโค้ช ──
+        let coachOrder = null, coachNameClean = "";
+        if (coachOrderId) {
+          if (ids.length !== 1) { res.status(400).json({ error: "coach_one_court" }); return; }
+          if (durationMinutes !== 60) { res.status(400).json({ error: "coach_duration" }); return; }
+          coachNameClean = String(p.coachName || "").normalize("NFC").replace(/\s+/g, " ").trim();
+          if (!coachNameClean || nameLen(coachNameClean) > 30) { res.status(400).json({ error: "coach_name_required" }); return; }
+          const { body: coRows } = await sb(`coach_orders?id=eq.${encodeURIComponent(coachOrderId)}&customer_id=eq.${customerId}&select=*`);
+          coachOrder = Array.isArray(coRows) ? coRows[0] : null;
+          if (!coachOrder || coachOrder.status !== "confirmed") { res.status(400).json({ error: "coach_order_not_active" }); return; }
+          if ((coachOrder.sessions_used || 0) >= coachOrder.sessions) { res.status(400).json({ error: "coach_no_sessions" }); return; }
+          price = 0; status = "confirmed";
+        }
         const unit = Number(price);
         if (!Number.isFinite(unit) || unit < 0 || unit > 20000) { res.status(400).json({ error: "invalid price" }); return; }
         if (!["confirmed", "reviewing"].includes(status)) { res.status(400).json({ error: "invalid status" }); return; }
@@ -371,6 +410,39 @@ export default async function handler(req, res) {
           const taken = await getActiveIntervals(bookingDate, cid);
           if (taken.some(([s, e]) => startMin < e && endMin > s)) { res.status(409).json({ error: "slot_taken", court: cid }); return; }
         }
+
+        // โค้ชคนเดียวกันห้ามถูกนัดซ้อนเวลา (ทุกสนาม) — เทียบชื่อโดยไม่สนตัวพิมพ์เล็ก/ใหญ่และช่องว่างทั้งหมด ("โค้ชเอ" = "โค้ช เอ") กันโค้ชถูกนัดซ้อนเพราะพิมพ์ชื่อไม่เหมือนกัน
+        const normCoach = (s) => String(s || "").normalize("NFC").replace(/\s+/g, "").toLowerCase();
+        if (coachOrder) {
+          const { body: dayRows } = await sb(`bookings?booking_date=eq.${bookingDate}&status=neq.cancelled&coach_name=not.is.null&select=coach_name,hour,start_minute,duration_minutes,court_id`);
+          if (!Array.isArray(dayRows)) { res.status(500).json({ error: "coach_columns_missing" }); return; } // ยังไม่ได้รัน add-coach-booking-columns.sql
+          const clash = dayRows.find((b) => normCoach(b.coach_name) === normCoach(coachNameClean) && (() => { const s = (b.hour || 0) * 60 + (b.start_minute || 0); return startMin < s + (b.duration_minutes || 60) && endMin > s; })());
+          if (clash) {
+            const s = (clash.hour || 0) * 60 + (clash.start_minute || 0);
+            res.status(409).json({ error: "coach_busy", coach: coachNameClean, from: minutesToLabel(s), to: minutesToLabel(s + (clash.duration_minutes || 60)), court: clash.court_id });
+            return;
+          }
+        }
+        let coachUsedAfter = null;
+        if (coachOrder) {
+          let claimed = false;
+          for (let attempt = 0; attempt < 3 && !claimed; attempt++) {
+            const { body: cur } = await sb(`coach_orders?id=eq.${coachOrder.id}&select=sessions,sessions_used,status`);
+            const c0 = Array.isArray(cur) ? cur[0] : null;
+            if (!c0 || c0.status !== "confirmed") { res.status(400).json({ error: "coach_order_not_active" }); return; }
+            const used = c0.sessions_used || 0;
+            if (used >= c0.sessions) { res.status(400).json({ error: "coach_no_sessions" }); return; }
+            const upd = await sb(`coach_orders?id=eq.${coachOrder.id}&status=eq.confirmed&sessions_used=eq.${used}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ sessions_used: used + 1 }) }); // เงื่อนไข sessions_used กันตัดซ้อนพร้อมกันจนเกินสิทธิ์
+            if (upd.ok && Array.isArray(upd.body) && upd.body.length > 0) { claimed = true; coachUsedAfter = used + 1; }
+          }
+          if (!claimed) { res.status(409).json({ error: "coach_order_busy" }); return; }
+        }
+        const restoreCoach = async () => {
+          if (!coachOrder) return;
+          const { body: cur } = await sb(`coach_orders?id=eq.${coachOrder.id}&select=sessions_used`);
+          const c = Array.isArray(cur) ? cur[0] : null;
+          if (c) await sb(`coach_orders?id=eq.${coachOrder.id}`, { method: "PATCH", body: JSON.stringify({ sessions_used: Math.max(0, (c.sessions_used || 0) - 1) }) });
+        };
 
         let remainingAfter = null;
         if (pkg) {
@@ -400,15 +472,19 @@ export default async function handler(req, res) {
           court_id: cid, customer_id: customerId, customer_name: name,
           booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
           price: Math.round(unit), discount_amount: 0, status, ...(groupId ? { group_id: groupId } : {}), ...(pkg ? { package_id: pkg.id } : {}),
+          ...(coachOrder ? { coach_name: coachNameClean, coach_order_id: coachOrder.id } : {}),
         });
         let ins = await insertBookingsAtomic(ids.map(c => ({ ...baseRow(c), booked_by: "admin" })));
+        if (coachOrder && ins.error === "insert_failed" && /coach_(name|order_id)/.test(JSON.stringify(ins.detail || ""))) {
+          await restoreCoach(); res.status(500).json({ error: "coach_columns_missing" }); return; // ยังไม่ได้รัน add-coach-booking-columns.sql — คืนสิทธิ์ที่ตัดไปแล้ว
+        }
         if (ins.error && ins.error !== "slot_taken") {
           // คอลัมน์ booked_by ยังไม่ถูกสร้าง (ยังไม่ได้รัน SQL) — บันทึกการจองให้ก่อน ไม่ให้งานหลักพัง
           console.error("createAdminBooking: insert with booked_by failed — run add-booked-by-column.sql");
           ins = await insertBookingsAtomic(ids.map(baseRow));
         }
-        if (ins.error === "slot_taken") { await restoreCredits(); res.status(409).json({ error: "slot_taken", court: ins.court || ids[0] }); return; } // มีคนจองตัดหน้าพอดี
-        if (!ins.rows) { await restoreCredits(); res.status(500).json({ error: "insert_failed" }); return; }
+        if (ins.error === "slot_taken") { await restoreCredits(); await restoreCoach(); res.status(409).json({ error: "slot_taken", court: ins.court || ids[0] }); return; } // มีคนจองตัดหน้าพอดี
+        if (!ins.rows) { await restoreCredits(); await restoreCoach(); res.status(500).json({ error: "insert_failed" }); return; }
         ins = { ok: true, body: ins.rows };
 
         await notifyTelegram(
@@ -416,11 +492,13 @@ export default async function handler(req, res) {
           `👤 ${esc(name)}\n📞 ${customerId}\n` +
           `🎾 ${ids.map(c => `Court ${c}`).join(" + ")}\n📅 ${bookingDate}\n` +
           `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n` +
-          (pkg
-            ? `🎟 ตัดสิทธิ์แพ็คเกจ ${units} ครั้ง (เหลือ ${remainingAfter} / ${pkg.total_credits} ครั้ง) — ยืนยันแล้ว`
-            : `💰 ฿${(Math.round(unit) * ids.length).toLocaleString()} (${status === "confirmed" ? "ชำระแล้ว" : "รอชำระ"})`)
+          (coachOrder
+            ? `👤 นัดเรียนกับโค้ช: <b>${esc(coachNameClean)}</b>\n📋 ตัดสิทธิ์คอร์ส C-${coachOrder.id} ครั้งที่ ${coachUsedAfter}/${coachOrder.sessions} (เหลือ ${coachOrder.sessions - coachUsedAfter} ครั้ง) — ยืนยันแล้ว`
+            : pkg
+              ? `🎟 ตัดสิทธิ์แพ็คเกจ ${units} ครั้ง (เหลือ ${remainingAfter} / ${pkg.total_credits} ครั้ง) — ยืนยันแล้ว`
+              : `💰 ฿${(Math.round(unit) * ids.length).toLocaleString()} (${status === "confirmed" ? "ชำระแล้ว" : "รอชำระ"})`)
         );
-        res.status(200).json({ ok: true, bookings: ins.body, ...(pkg ? { creditsUsed: units, remaining: remainingAfter } : {}) });
+        res.status(200).json({ ok: true, bookings: ins.body, ...(pkg ? { creditsUsed: units, remaining: remainingAfter } : {}), ...(coachOrder ? { coach: { orderId: coachOrder.id, coachName: coachNameClean, sessions: coachOrder.sessions, sessions_used: coachUsedAfter, remaining: coachOrder.sessions - coachUsedAfter } } : {}) });
         return;
       }
       case "updateCustomerName": {
