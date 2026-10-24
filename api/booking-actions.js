@@ -152,6 +152,76 @@ async function getReservedCredits(packageId) {
   return (Array.isArray(body) ? body : []).reduce((s, b) => s + Math.max(1, Math.round((b.duration_minutes || 60) / 60)), 0);
 }
 
+// ล็อกอิน LINE อยู่หรือไม่ (ผูกเบอร์แล้วหรือยังก็ได้) — ใช้กับคำสั่งที่ต้องรู้ว่า "เป็นลูกค้าที่ล็อกอิน" แต่ยังไม่ต้องเป็นเจ้าของรายการ
+async function getSessionUser(sessionToken) {
+  const userId = verifyLineSession(sessionToken);
+  if (!userId) return { error: "line_required" };
+  const { body } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}&select=phone`);
+  const row = Array.isArray(body) ? body[0] : null;
+  if (!row) return { error: "line_required" };
+  return { userId, phone: row.phone || null };
+}
+
+// ลิงก์สลิปต้องเป็นไฟล์ที่อัปโหลดเข้า bucket ของเราเองและตั้งชื่อตามรายการนี้เท่านั้น (กันแนบลิงก์ภายนอก/ใช้สลิปของรายการอื่น)
+// รูปแบบที่หน้าเว็บสร้าง: <SUPABASE_URL>/storage/v1/object/public/slips/slips/<key>_<timestamp>.<นามสกุลรูปภาพ>
+function isOwnSlipUrl(url, key) {
+  const prefix = `${SUPABASE_URL}/storage/v1/object/public/slips/slips/${key}_`;
+  const u = String(url || "");
+  return u.startsWith(prefix) && /^\d{10,16}\.(jpe?g|png|webp|heic|heif|gif)$/i.test(u.slice(prefix.length));
+}
+
+// แจ้งเตือน Telegram จากเซิร์ฟเวอร์เอง โดยดึงข้อมูลจากฐานข้อมูล (เดิมหน้าเว็บเป็นคนส่งข้อมูลมาให้ ซึ่งใครก็ยิงข้อความปลอมเข้า Telegram แอดมินได้)
+async function notifySlipBooking(row) {
+  try {
+    let all = [row];
+    if (row.group_id) {
+      const { body } = await sb(`bookings?group_id=eq.${encodeURIComponent(row.group_id)}&select=*&order=court_id.asc`);
+      if (Array.isArray(body) && body.length) all = body;
+    }
+    const startMin = (row.hour || 0) * 60 + (row.start_minute || 0);
+    const dur = row.duration_minutes || 60;
+    const sentAt = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().substr(11, 5);
+    await notifyTelegram(
+      `🔔 <b>มีลูกค้าส่งสลิปใหม่</b>\n\n` +
+      `🎾 สนาม: ${all.map((r) => `Court ${r.court_id}`).join(" + ")}\n` +
+      `📅 วันที่: ${row.booking_date}\n` +
+      `🕐 เวลา: ${minutesToLabel(startMin)}–${minutesToLabel(startMin + dur)}\n` +
+      `💰 ยอด: ฿${all.reduce((s, r) => s + (r.price || 0), 0).toLocaleString()}\n` +
+      `👤 ชื่อ: ${esc(row.customer_name || "-")}\n` +
+      `📞 เบอร์: ${row.customer_id}\n` +
+      `🕓 ส่งสลิปเมื่อเวลา: ${sentAt} น. (ไทย)\n\n` +
+      `สถานะ: รอการตรวจสอบ\nกรุณาเข้าไปตรวจสอบและยืนยันที่หน้า Admin Dashboard`
+    );
+  } catch (e) { console.error("notifySlipBooking failed:", e); }
+}
+async function notifySlipPackage(row) {
+  try {
+    const sentAt = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().substr(11, 5);
+    await notifyTelegram(
+      `🔔 <b>มีลูกค้าส่งสลิปซื้อแพ็คเกจ</b>\n\n` +
+      `🎟 แพ็คเกจ ${row.tier === "peak" ? "Peak" : "Off Peak"} × ${row.total_credits} ครั้ง\n` +
+      `💰 ยอด: ฿${(row.price || 0).toLocaleString()}\n` +
+      `👤 ชื่อ: ${esc(row.customer_name || "-")}\n` +
+      `📞 เบอร์: ${row.customer_id}\n` +
+      `🕓 ส่งสลิปเมื่อเวลา: ${sentAt} น. (ไทย)\n\n` +
+      `สถานะ: รอการตรวจสอบ\nกรุณาเข้าไปตรวจสอบและยืนยันที่แท็บ "🎟 แพ็คเกจ" ใน Admin Dashboard`
+    );
+  } catch (e) { console.error("notifySlipPackage failed:", e); }
+}
+
+// บันทึกการจองผ่านฟังก์ชัน SQL ที่ "ล็อกต่อสนาม/วัน → เช็คว่าง → บันทึก" ในธุรกรรมเดียว กัน 2 คนกดจองช่วงเดียวกันพร้อมกันแล้วผ่านทั้งคู่
+// ถ้ายังไม่ได้รัน SQL (ไม่มีฟังก์ชัน) หรือฟังก์ชันผิดพลาดแบบอื่น → ถอยกลับไปใช้วิธีเดิม (เช็คไว้แล้วก่อนหน้า แล้วบันทึกตรงๆ) การจองจึงไม่หยุดทำงาน
+async function insertBookingsAtomic(rows) {
+  const r = await sb(`rpc/create_bookings_if_free`, { method: "POST", body: JSON.stringify({ rows }) });
+  if (r.ok && Array.isArray(r.body) && r.body.length === rows.length) return { rows: r.body };
+  const msg = String(r.body?.message || "");
+  if (msg.includes("slot_taken")) return { error: "slot_taken", court: Number(msg.split(":")[1]) || null };
+  if (r.body?.code !== "PGRST202") console.error("create_bookings_if_free failed — fallback to plain insert:", r.body);
+  const ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(rows) });
+  if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== rows.length) return { error: "insert_failed" };
+  return { rows: ins.body };
+}
+
 async function getLinkedCustomer(sessionToken) {
   const userId = verifyLineSession(sessionToken);
   if (!userId) return { error: "line_required" };
@@ -229,8 +299,10 @@ export default async function handler(req, res) {
       case "getBooking": {
         const { id } = p;
         if (!id) { res.status(400).json({ error: "missing id" }); return; }
-        const { body } = await sb(`bookings?id=eq.${id}&select=*`);
-        const booking = (body || [])[0] || null;
+        const who = await getLinkedCustomer(p.session); // ดูได้เฉพาะการจองของตัวเอง (บัญชี LINE ที่ผูกเบอร์นั้น)
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        const { body } = await sb(`bookings?id=eq.${encodeURIComponent(id)}&customer_id=eq.${who.phone}&select=*`);
+        const booking = (Array.isArray(body) ? body[0] : null) || null;
         let group = null;
         if (booking?.group_id) {
           const { body: gRows } = await sb(`bookings?group_id=eq.${encodeURIComponent(booking.group_id)}&select=*&order=court_id.asc`);
@@ -243,12 +315,18 @@ export default async function handler(req, res) {
       case "myBookings": {
         const { phone } = p;
         if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
+        const me = await getSessionUser(p.session);
+        if (me.error) { res.status(403).json({ error: me.error }); return; }
+        if (!me.phone) { res.status(200).json({ bookings: [] }); return; } // ยังไม่ผูกเบอร์ = ยังไม่มีการจองของตัวเอง
+        if (me.phone !== phone) { res.status(403).json({ error: "not_owner" }); return; } // ดูได้เฉพาะเบอร์ที่ผูกกับบัญชี LINE ของตัวเอง
         const { body } = await sb(`bookings?customer_id=eq.${phone}&select=*&order=booking_date.desc`);
         res.status(200).json({ bookings: body || [] });
         return;
       }
 
       case "checkDiscount": {
+        const me = await getSessionUser(p.session);
+        if (me.error) { res.status(403).json({ error: me.error }); return; }
         const { code } = p;
         if (!code) { res.status(200).json({ valid: false }); return; }
         const { body } = await sb(`discount_codes?code=eq.${encodeURIComponent(String(code).trim().toUpperCase())}&select=*`);
@@ -316,16 +394,13 @@ export default async function handler(req, res) {
             body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
           });
 
-          const { body: created } = await sb(`bookings`, {
-            method: "POST",
-            headers: { Prefer: "return=representation" },
-            body: JSON.stringify({
-              court_id: courtId, customer_id: customerId, customer_name: customerName,
-              booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
-              price: 0, package_id: packageId, status: "reviewing", // รอแอดมินกดยืนยันก่อนถึงจะหักสิทธิ์จริง
-            }),
-          });
-          const bookingRow = (created || [])[0];
+          const pins = await insertBookingsAtomic([{
+            court_id: courtId, customer_id: customerId, customer_name: customerName,
+            booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
+            price: 0, package_id: packageId, status: "reviewing", // รอแอดมินกดยืนยันก่อนถึงจะหักสิทธิ์จริง
+          }]);
+          if (pins.error === "slot_taken") { res.status(409).json({ error: "slot_taken" }); return; }
+          const bookingRow = (pins.rows || [])[0];
           if (!bookingRow) { res.status(500).json({ error: "insert_failed" }); return; }
 
           const nowBangkok = new Date(Date.now() + 7 * 60 * 60 * 1000);
@@ -376,19 +451,16 @@ export default async function handler(req, res) {
           body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
         });
 
-        const { body: created } = await sb(`bookings`, {
-          method: "POST",
-          headers: { Prefer: "return=representation" },
-          body: JSON.stringify({
-            court_id: courtId, customer_id: customerId, customer_name: customerName,
-            booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
-            price: finalPrice, discount_code: discountRow?.code || null, discount_amount: discountAmount,
-            status: isFree ? "reviewing" : "pending",
-          }),
-        });
-        const bookingRow = (created || [])[0];
+        const cins = await insertBookingsAtomic([{
+          court_id: courtId, customer_id: customerId, customer_name: customerName,
+          booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
+          price: finalPrice, discount_code: discountRow?.code || null, discount_amount: discountAmount,
+          status: isFree ? "reviewing" : "pending",
+        }]);
+        const bookingRow = (cins.rows || [])[0];
         if (!bookingRow) {
-          if (discountRow) await releaseDiscountById(discountRow.id); // สร้างการจองไม่สำเร็จ → คืนสิทธิ์โค้ด
+          if (discountRow) await releaseDiscountById(discountRow.id); // สร้างการจองไม่สำเร็จ (หรือมีคนจองตัดหน้าพอดี) → คืนสิทธิ์โค้ด
+          if (cins.error === "slot_taken") { res.status(409).json({ error: "slot_taken" }); return; }
           res.status(500).json({ error: "insert_failed" }); return;
         }
 
@@ -442,25 +514,61 @@ export default async function handler(req, res) {
           booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
           price: unitPrice, discount_amount: 0, status: "pending", group_id: groupId,
         }));
-        const { ok, body: created } = await sb(`bookings`, {
-          method: "POST",
-          headers: { Prefer: "return=representation" },
-          body: JSON.stringify(rowsToInsert),
-        });
-        if (!ok || !Array.isArray(created) || created.length !== 2) {
-          console.error("createBookingMulti insert failed:", created);
-          res.status(500).json({ error: "insert_failed" }); return;
-        }
-        res.status(200).json({ bookings: created, groupId });
+        const mins = await insertBookingsAtomic(rowsToInsert);
+        if (mins.error === "slot_taken") { res.status(409).json({ error: "slot_taken" }); return; }
+        if (!mins.rows) { console.error("createBookingMulti insert failed"); res.status(500).json({ error: "insert_failed" }); return; }
+        res.status(200).json({ bookings: mins.rows, groupId });
         return;
       }
 
       case "updateSlip": {
         const { bookingId, slipUrl } = p;
         if (!bookingId || !slipUrl) { res.status(400).json({ error: "missing params" }); return; }
-        // เงื่อนไข status=in.(pending,reviewing) กันไว้อีกชั้น: แก้ได้เฉพาะรายการที่ยังไม่ถูกยืนยัน/ยกเลิกเท่านั้น
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        if (!isOwnSlipUrl(slipUrl, bookingId)) { res.status(400).json({ error: "invalid_slip_url" }); return; }
+
+        // สลิปที่ส่ง "ช้า": รายการรอชำระที่หมดเวลา 5 นาทีไปแล้ว ช่วงเวลานั้นถูกปล่อยให้คนอื่นจองได้ จึงอาจมีคนจองต่อไปแล้ว
+        // → รับสลิปได้ก็ต่อเมื่อช่วงเวลายังว่างอยู่จริง ถ้าไม่ว่าง: ไม่รับเป็นการจอง (กันจองซ้อน) แต่ลูกค้าอาจโอนเงินไปแล้ว
+        //   จึงเก็บสลิปไว้ที่รายการ + แจ้ง Telegram แอดมินพร้อมลิงก์สลิป ให้ติดต่อคืนเงินหรือจัดเวลาใหม่ (ไม่ปล่อยให้เงียบ)
+        const { body: curRows } = await sb(`bookings?id=eq.${encodeURIComponent(bookingId)}&customer_id=eq.${who.phone}&select=*`);
+        const cur = Array.isArray(curRows) ? curRows[0] : null;
+        if (cur && cur.status === "pending" && Date.now() - new Date(cur.created_time).getTime() >= 5 * 60 * 1000) {
+          let mineRows = [cur];
+          if (cur.group_id) {
+            const { body: g } = await sb(`bookings?group_id=eq.${encodeURIComponent(cur.group_id)}&select=*&order=court_id.asc`);
+            if (Array.isArray(g) && g.length) mineRows = g;
+          }
+          let clash = false;
+          for (const r of mineRows) {
+            const s0 = (r.hour || 0) * 60 + (r.start_minute || 0);
+            const e0 = s0 + (r.duration_minutes || 60);
+            const taken = await getActiveIntervals(r.booking_date, r.court_id); // รายการของเราเองหมดเวลาแล้วจึงไม่ถูกนับรวม
+            if (taken.some(([a, b]) => s0 < b && e0 > a)) { clash = true; break; }
+          }
+          if (clash) {
+            await sb(cur.group_id ? `bookings?group_id=eq.${encodeURIComponent(cur.group_id)}&status=eq.pending` : `bookings?id=eq.${encodeURIComponent(bookingId)}&status=eq.pending`, {
+              method: "PATCH", body: JSON.stringify({ status: "cancelled", slip_url: slipUrl }),
+            });
+            if (cur.discount_code) await releaseDiscountByCode(cur.discount_code);
+            const s1 = (cur.hour || 0) * 60 + (cur.start_minute || 0);
+            await notifyTelegram(
+              `⚠️ <b>ลูกค้าส่งสลิปช้า แต่ช่วงเวลานี้ถูกจองไปแล้ว</b>\n` +
+              `ไม่ได้รับเป็นการจอง (ยกเลิกรายการแล้ว) — ลูกค้าอาจโอนเงินมาแล้ว กรุณาติดต่อเพื่อคืนเงินหรือจัดเวลาใหม่\n\n` +
+              `👤 ${esc(cur.customer_name || "-")}\n📞 ${cur.customer_id}\n` +
+              `🎾 ${mineRows.map((r) => `Court ${r.court_id}`).join(" + ")}\n📅 ${cur.booking_date}\n` +
+              `🕐 ${minutesToLabel(s1)}–${minutesToLabel(s1 + (cur.duration_minutes || 60))}\n` +
+              `💰 ฿${mineRows.reduce((t, r) => t + (r.price || 0), 0).toLocaleString()}\n` +
+              `🧾 สลิป: ${esc(slipUrl)}`
+            );
+            res.status(409).json({ error: "slot_taken_late" });
+            return;
+          }
+        }
+
+        // เงื่อนไข: ต้องเป็นการจองของเบอร์ที่ผูกกับบัญชีนี้ + status=in.(pending,reviewing) (แก้ได้เฉพาะรายการที่ยังไม่ถูกยืนยัน/ยกเลิก)
         // (เผื่อกรณีลูกค้ากดส่งสลิปซ้ำ หรือกลับมาแนบสลิปใหม่หลัง resume session — ไม่ให้ค้างเหมือนก่อนหน้านี้)
-        const { ok, body } = await sb(`bookings?id=eq.${bookingId}&status=in.(pending,reviewing)`, {
+        const { ok, body } = await sb(`bookings?id=eq.${encodeURIComponent(bookingId)}&customer_id=eq.${who.phone}&status=in.(pending,reviewing)`, {
           method: "PATCH",
           headers: { Prefer: "return=representation" },
           body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
@@ -478,6 +586,7 @@ export default async function handler(req, res) {
             body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
           });
         }
+        await notifySlipBooking(row);
         res.status(200).json({ booking: row });
         return;
       }
@@ -486,7 +595,10 @@ export default async function handler(req, res) {
         // ลูกค้ากดยกเลิกเองจากหน้าชำระเงิน (เช่นกดหมดเวลาแล้วไม่รอ) — ปล่อยช่วงเวลาคืนทันที + แจ้งเตือนแอดมิน
         const { bookingId } = p;
         if (!bookingId) { res.status(400).json({ error: "missing bookingId" }); return; }
-        const { ok, body } = await sb(`bookings?id=eq.${bookingId}&status=in.(pending,reviewing)`, {
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        // ยกเลิกได้เฉพาะการจองของตัวเอง (เงื่อนไข customer_id) — ของคนอื่นจะไม่ตรงเงื่อนไข ไม่เกิดอะไรขึ้น
+        const { ok, body } = await sb(`bookings?id=eq.${encodeURIComponent(bookingId)}&customer_id=eq.${who.phone}&status=in.(pending,reviewing)`, {
           method: "PATCH",
           headers: { Prefer: "return=representation" },
           body: JSON.stringify({ status: "cancelled" }),
@@ -561,13 +673,17 @@ export default async function handler(req, res) {
       case "updatePackageSlip": {
         const { packageId, slipUrl } = p;
         if (!packageId || !slipUrl) { res.status(400).json({ error: "missing params" }); return; }
-        const { ok, body } = await sb(`packages?id=eq.${packageId}&status=in.(pending,reviewing)`, {
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        if (!isOwnSlipUrl(slipUrl, `pkg_${packageId}`)) { res.status(400).json({ error: "invalid_slip_url" }); return; }
+        const { ok, body } = await sb(`packages?id=eq.${encodeURIComponent(packageId)}&customer_id=eq.${who.phone}&status=in.(pending,reviewing)`, {
           method: "PATCH",
           headers: { Prefer: "return=representation" },
           body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
         });
         const row = (body || [])[0] || null;
         if (!ok || !row) { res.status(409).json({ error: "update_failed", detail: body }); return; }
+        await notifySlipPackage(row);
         res.status(200).json({ package: row });
         return;
       }
@@ -575,7 +691,9 @@ export default async function handler(req, res) {
       case "cancelPendingPackage": {
         const { packageId } = p;
         if (!packageId) { res.status(400).json({ error: "missing packageId" }); return; }
-        const { ok, body } = await sb(`packages?id=eq.${packageId}&status=in.(pending,reviewing)`, {
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        const { ok, body } = await sb(`packages?id=eq.${encodeURIComponent(packageId)}&customer_id=eq.${who.phone}&status=in.(pending,reviewing)`, {
           method: "PATCH",
           headers: { Prefer: "return=representation" },
           body: JSON.stringify({ status: "cancelled" }),
@@ -597,8 +715,13 @@ export default async function handler(req, res) {
       case "myPackages": {
         const { phone } = p;
         if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
+        const me = await getSessionUser(p.session);
+        if (me.error) { res.status(403).json({ error: me.error }); return; }
+        if (me.phone && me.phone !== phone) { res.status(403).json({ error: "not_owner" }); return; }
         const { body } = await sb(`packages?customer_id=eq.${phone}&select=*&order=created_time.desc`);
-        const pkgs = await Promise.all((body || []).map(async (pk) => (pk.status === "active" ? { ...pk, reserved_credits: await getReservedCredits(pk.id) } : pk)));
+        let pkgs = await Promise.all((Array.isArray(body) ? body : []).map(async (pk) => (pk.status === "active" ? { ...pk, reserved_credits: await getReservedCredits(pk.id) } : pk)));
+        // ยังไม่ผูกเบอร์ (กำลังกรอกเบอร์เป็นครั้งแรกเพื่อให้ระบบหาสิทธิ์แพ็คเกจให้) → ส่งเฉพาะข้อมูลสิทธิ์ที่จำเป็น ไม่ส่งชื่อ/ราคา/สลิป
+        if (!me.phone) pkgs = pkgs.map(({ id, tier, status, total_credits, remaining_credits, expiry_date, reserved_credits }) => ({ id, tier, status, total_credits, remaining_credits, expiry_date, reserved_credits }));
         res.status(200).json({ packages: pkgs });
         return;
       }
@@ -747,6 +870,8 @@ export default async function handler(req, res) {
       case "recordSource": {
         // บันทึกแหล่งที่มา (UTM จากโฆษณา) ติดกับการจอง/แพ็คเกจ — ทำแยกหลังสร้างรายการเสร็จ ถ้าล้มเหลว (เช่นยังไม่ได้รัน SQL) การจองหลักไม่กระทบ
         const { kind, id } = p;
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(200).json({ ok: false }); return; }
         const ALLOWED = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"];
         const utm = {};
         if (p.utm && typeof p.utm === "object") {
@@ -755,7 +880,7 @@ export default async function handler(req, res) {
         if (!id || !["booking", "package"].includes(kind) || Object.keys(utm).length === 0) { res.status(200).json({ ok: false }); return; }
         const table = kind === "package" ? "packages" : "bookings";
         // เขียนได้ครั้งเดียว (utm ต้องยังว่าง) — กันถูกเขียนทับภายหลัง
-        const { ok, body } = await sb(`${table}?id=eq.${encodeURIComponent(id)}&utm=is.null`, {
+        const { ok, body } = await sb(`${table}?id=eq.${encodeURIComponent(id)}&customer_id=eq.${who.phone}&utm=is.null`, {
           method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ utm }),
         });
         if (ok && kind === "booking" && body?.[0]?.group_id) {
@@ -766,6 +891,7 @@ export default async function handler(req, res) {
       }
 
       case "checkFirstTime": {
+        { const me = await getSessionUser(p.session); if (me.error) { res.status(403).json({ error: me.error }); return; } }
         const { phone, bookingDate } = p;
         if (!/^[0-9]{10}$/.test(phone || "")) { res.status(200).json({ eligible: false }); return; }
         const promoPrice = getFirstTimePrice(bookingDate); // null = วันที่เล่นนี้อยู่นอกช่วงโปรโมชั่น
