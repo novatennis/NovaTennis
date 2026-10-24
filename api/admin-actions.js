@@ -98,6 +98,8 @@ async function insertBookingsAtomic(rows) {
   return { rows: ins.body };
 }
 
+// สวิตช์ส่งข้อความอัตโนมัติจาก OA ไปหาลูกค้า (ตั้ง COACH_LINE_PUSH=on ที่ Vercel เพื่อเปิด — ปิดไว้เป็นค่าตั้งต้น ใช้แบบให้ลูกค้ากดทักไลน์ OA เอง)
+const coachPushOn = () => process.env.COACH_LINE_PUSH === "on";
 // ส่งข้อความจาก LINE OA ไปหาลูกค้า (ต้องเป็นเพื่อน OA และไม่ได้บล็อก; นับโควตาข้อความของแผน OA) — ล้มเหลวแล้วคืน false ไม่ทำให้งานหลักพัง
 async function pushLine(to, text) {
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
@@ -449,7 +451,7 @@ export default async function handler(req, res) {
       case "coachOrders": {
         // คำสั่งซื้อคอร์สเรียนกับโค้ชทั้งหมด (ล่าสุดก่อน) — ไม่ส่ง line_user_id ออกไปหน้าเว็บ
         const { body } = await sb(`coach_orders?select=*&order=created_time.desc&limit=300`);
-        res.status(200).json({ orders: (Array.isArray(body) ? body : []).map(({ line_user_id, ...r }) => r) });
+        res.status(200).json({ orders: (Array.isArray(body) ? body : []).map(({ line_user_id, ...r }) => r), pushEnabled: coachPushOn() });
         return;
       }
       case "confirmCoachOrder": {
@@ -461,10 +463,10 @@ export default async function handler(req, res) {
         });
         const row = Array.isArray(body) ? body[0] : null;
         if (!ok || !row) { res.status(409).json({ error: "update_failed" }); return; }
-        const pushed = await pushLine(row.line_user_id,
+        const pushed = !coachPushOn() ? false : await pushLine(row.line_user_id,
           `✅ ได้รับชำระเงินแล้วค่ะ — ${coachLabel(row)} (C-${row.id})\n\n` +
           `แอดมินจะติดต่อนัดวัน-เวลาเรียนกับโค้ชในแชทนี้ค่ะ ส่งวัน-เวลาที่สะดวกมาได้เลย 🎾`);
-        res.status(200).json({ ok: true, pushed });
+        res.status(200).json({ ok: true, pushed, pushEnabled: coachPushOn() });
         return;
       }
       case "cancelCoachOrder": {
