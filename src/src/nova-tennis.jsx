@@ -42,10 +42,10 @@ const db = {
     return { booking: bookings[0], bookings }; // booking = แถวแรก (ใช้ id นี้ส่งสลิป เซิร์ฟเวอร์จะครอบคลุมทั้งกลุ่มให้เอง)
   },
   async createBookingWithPackage({ courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, packageId }) {
-    const { booking, error, available, needed } = await callBookingAction("createBooking", {
+    const { booking, error, available, needed, expiry_date } = await callBookingAction("createBooking", {
       courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, packageId,
     });
-    if (error) return { error, available, needed };
+    if (error) return { error, available, needed, expiry_date };
     return { booking };
   },
   async createPackage({ tier, credits, customerId, customerName }) {
@@ -578,7 +578,7 @@ function TabBar({ tab, setTab, lang="th" }) {
   const t = T[lang];
   return (
     <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:200,backgroundColor:"#fff",borderTop:"1px solid var(--dv)",display:"flex",boxShadow:"0 -3px 16px rgba(102,57,36,0.07)"}}>
-      {[["home","🏠",t.home],["book","📅",t.book],["package","🎟",lang==="th"?"แพ็คเกจ":"Packages"],["coach","🎓",lang==="th"?"เรียนโค้ช":"Coaching"],["cancel","🔍",t.myBookings]].map(([id,icon,label]) => (
+      {[["home","🏠",t.home],["book","📅",t.book],["package","🎟",lang==="th"?"แพ็คเกจ":"Packages"],["coach","👤",lang==="th"?"เรียนโค้ช":"Coaching"],["cancel","🔍",t.myBookings]].map(([id,icon,label]) => (
         <button key={id} onClick={() => setTab(id)} style={{flex:1,padding:"11px 0 8px",background:"none",border:"none",borderTop:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
           <span style={{fontSize:19}}>{icon}</span>
           <span style={{fontSize:10,fontWeight:tab===id?700:400}}>{label}</span>
@@ -770,7 +770,7 @@ function HomePage({ goBook, goPackage, goCoach, lang="th" }) {
       {goCoach && (
         <div style={{padding:"10px 16px 0"}}>
           <button onClick={goCoach} style={{width:"100%",display:"flex",alignItems:"center",gap:12,textAlign:"left",padding:"13px 16px",borderRadius:"var(--r)",border:"none",cursor:"pointer",color:"#fff",background:"linear-gradient(100deg,#663924 0%,#8a5433 100%)",boxShadow:"0 4px 16px rgba(102,57,36,.3)",fontFamily:"'Noto Sans Thai',sans-serif"}}>
-            <span style={{fontSize:30}}>🎓</span>
+            <span style={{fontSize:30}}>👤</span>
             <span style={{flex:1}}>
               <span style={{display:"block",fontWeight:800,fontSize:15}}>{lang==="th" ? "เรียนกับโค้ช — สนาม + โค้ช + อุปกรณ์" : "Train with a coach — court + coach + equipment"}</span>
               <span style={{display:"block",fontSize:11.5,opacity:.9,marginTop:2}}>{lang==="th" ? "ผู้ใหญ่ & เด็ก • Private / Duo • แพ็ค 5–10 ครั้งคุ้มกว่า" : "Adults & kids • Private / Duo • 5–10 session packages save more"}</span>
@@ -1121,6 +1121,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
   const [useCredit, setUseCredit] = useState(false);
   const [checkingPkg, setCheckingPkg] = useState(false);
   const pkgUnits = slot.durationMinutes === 120 ? 2 : slot.durationMinutes === 60 ? 1 : 0;
+  const playIso = toIso(date);
   useEffect(() => {
     setMatchedPkg(null); setPkgNote(""); setUseCredit(false);
     if (!phoneOk || isGroup) return;
@@ -1129,8 +1130,16 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
     db.myPackages(phone).then(rows => {
       if (cancelled) return;
       const today = toIso(new Date());
-      const live = (rows || []).filter(p => p.status === "active" && (!p.expiry_date || p.expiry_date >= today) && p.remaining_credits - (p.reserved_credits || 0) > 0);
-      if (live.length === 0) { setCheckingPkg(false); return; }
+      const liveAll = (rows || []).filter(p => p.status === "active" && (!p.expiry_date || String(p.expiry_date).slice(0, 10) >= today) && p.remaining_credits - (p.reserved_credits || 0) > 0);
+      if (liveAll.length === 0) { setCheckingPkg(false); return; }
+      // "วันที่เล่น" ต้องอยู่ภายในอายุแพ็คเกจ (วันสุดท้ายยังเล่นได้) — ไม่ใช่แค่ตอนนี้แพ็คเกจยังไม่หมดอายุ
+      const live = liveAll.filter(p => !p.expiry_date || String(p.expiry_date).slice(0, 10) >= playIso);
+      if (live.length === 0) {
+        const lastDay = liveAll.map(p => String(p.expiry_date).slice(0, 10)).sort().pop();
+        const nice = new Date(lastDay + "T00:00:00").toLocaleDateString(lang==="th" ? "th-TH" : "en-GB", { day: "numeric", month: "short", year: "numeric" });
+        setPkgNote(lang==="th" ? `แพ็คเกจของคุณใช้เล่นได้ถึง ${nice} แต่วันที่เล่นที่เลือกเลยจากนั้น — เลือกวันเล่นให้อยู่ภายในอายุแพ็คเกจ` : `Your package is playable until ${nice}, but the date you chose is later. Pick a play date within the package validity.`);
+        setCheckingPkg(false); return;
+      }
       if (pkgUnits === 0) { setPkgNote(lang==="th" ? "แพ็คเกจใช้จองได้เฉพาะ 60 หรือ 120 นาที (ตอนนี้เลือกอยู่ " + slot.durationMinutes + " นาที)" : "Packages can only book 60 or 120 minutes."); setCheckingPkg(false); return; }
       const wkend = date.getDay() === 0 || date.getDay() === 6;
       const hourPeak = (i) => wkend || (slot.hour + i) >= 16;
@@ -1146,7 +1155,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
     }).catch(() => { if (!cancelled) setCheckingPkg(false); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phone, phoneOk, slot.durationMinutes, slot.peak, slot.hour, isGroup]);
+  }, [phone, phoneOk, slot.durationMinutes, slot.peak, slot.hour, isGroup, playIso]);
 
   // โปรโมชั่นจองครั้งแรก — เฉพาะ 60 นาที และยังไม่เคยจองที่ไม่ถูกยกเลิกมาก่อนเลย (เซิร์ฟเวอร์เป็นคนชี้ขาดตอนยืนยันจริงอีกชั้น)
   const [firstTimePrice, setFirstTimePrice] = useState(null);
@@ -1687,7 +1696,7 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
     <div style={{padding:"20px 16px 100px",display:"flex",flexDirection:"column",gap:22}} className="fu">
       <section>
         <h2 className="bb" style={{fontSize:26,color:"var(--br)",marginBottom:4}}>{lang==="th"?"แพ็คเกจสมาชิก":"Membership Packages"}</h2>
-        <p style={{fontSize:12.5,color:"var(--mu)"}}>{lang==="th"?"ซื้อจำนวนครั้งล่วงหน้า ถูกกว่าจ่ายเดี่ยว ใช้จองได้ภายในระยะเวลาที่กำหนด (จอง 60 นาที ตัด 1 ครั้ง หรือ 120 นาที ตัด 2 ครั้ง)":"Buy sessions in advance, cheaper than paying per visit. Book 60 minutes (uses 1 credit) or 120 minutes (uses 2 credits)."}</p>
+        <p style={{fontSize:12.5,color:"var(--mu)"}}>{lang==="th"?"ซื้อจำนวนครั้งล่วงหน้า ถูกกว่าจ่ายเดี่ยว ใช้จองได้ภายในระยะเวลาที่กำหนด โดย \"วันที่เล่น\" ต้องอยู่ภายในอายุแพ็คเกจ (จอง 60 นาที ตัด 1 ครั้ง หรือ 120 นาที ตัด 2 ครั้ง)":"Buy sessions in advance, cheaper than paying per visit. The play date must fall within the package validity. Book 60 minutes (uses 1 credit) or 120 minutes (uses 2 credits)."}</p>
       </section>
 
       <section>
@@ -1696,13 +1705,13 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
           <div style={{display:"flex",flexDirection:"column",gap:6}}>
             {(lang==="th" ? [
               "เลือกและซื้อแพ็คเกจด้านล่าง แล้วโอนเงิน + แนบสลิป",
-              "รอแอดมินตรวจสอบและกดยืนยัน (แพ็คเกจจะเริ่มนับอายุการใช้งานตั้งแต่ตอนนั้น)",
+              "รอแอดมินตรวจสอบและกดยืนยัน (แพ็คเกจจะเริ่มนับอายุการใช้งานตั้งแต่ตอนนั้น โดยวันที่ยืนยันนับเป็นวันที่ 1 เช่น แพ็ค 7 วัน ยืนยัน 25 ต.ค. ใช้เล่นได้ 25–31 ต.ค.)",
               "ไปที่แท็บ \"จองสนาม\" ตามปกติ — แพ็ค Peak จองได้ทุกช่วงเวลา (ทั้ง Peak และ Off Peak) ส่วนแพ็ค Off Peak จองได้เฉพาะช่วง Off Peak",
-              "ตอนกรอกชื่อ-เบอร์โทร ถ้ามีสิทธิ์คงเหลือ ระบบจะโชว์ตัวเลือก \"ใช้สิทธิ์จากแพ็คเกจ\" ให้กดเลือกแทนการโอนเงิน",
+              "ตอนกรอกชื่อ-เบอร์โทร ถ้ามีสิทธิ์คงเหลือ และ \"วันที่เล่น\" อยู่ภายในอายุแพ็คเกจ ระบบจะโชว์ตัวเลือก \"ใช้สิทธิ์จากแพ็คเกจ\" ให้กดเลือกแทนการโอนเงิน",
               "แอดมินจะกดยืนยันการจองนี้อีกครั้ง (เหมือนการจองปกติ) ถึงจะหักสิทธิ์จริง",
             ] : [
               "Choose and buy a package below, then transfer and upload your payment slip",
-              "Wait for admin to verify and confirm (the package's validity period starts from then)",
+              "Wait for admin to verify and confirm (the validity period starts from then; the confirmation day counts as day 1 — e.g. a 7-day package confirmed on Oct 25 is playable Oct 25–31)",
               "Go to the \"Book\" tab as usual — a Peak package works for any time (Peak and Off Peak); an Off Peak package works for Off Peak times only",
               "When entering your name/phone, if you have credits left, you'll see an option to \"Use package credit\" instead of paying",
               "Admin will confirm this booking (same as a normal booking) — only then is a credit actually deducted",
@@ -1749,11 +1758,11 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
                     {p.status==="active" && !expired && (
                       <>
                         <Row label={lang==="th"?"เหลือ":"Remaining"} val={`${p.remaining_credits} / ${p.total_credits} ${lang==="th"?"ครั้ง":"sessions"}${p.reserved_credits > 0 ? (lang==="th" ? ` (จองรอยืนยัน ${p.reserved_credits})` : ` (${p.reserved_credits} pending)`) : ""}`} />
-                        <Row label={lang==="th"?"หมดอายุ":"Expires"} val={new Date(p.expiry_date).toLocaleDateString(lang==="th"?"th-TH":"en-GB",{year:"numeric",month:"short",day:"numeric"})} />
+                        <Row label={lang==="th"?"ใช้เล่นได้ถึง":"Play until"} val={new Date(p.expiry_date).toLocaleDateString(lang==="th"?"th-TH":"en-GB",{year:"numeric",month:"short",day:"numeric"})} />
                       </>
                     )}
                     {(p.status==="pending" || p.status==="reviewing") && (
-                      <Row label={lang==="th"?"อายุการใช้งาน":"Valid for"} val={lang==="th"?`${p.expiry_days} วัน นับจากวันที่ยืนยัน`:`${p.expiry_days} days from confirmation`} />
+                      <Row label={lang==="th"?"อายุการใช้งาน":"Valid for"} val={lang==="th"?`${p.expiry_days} วัน (นับวันที่ยืนยันเป็นวันที่ 1)`:`${p.expiry_days} days (confirmation day counts as day 1)`} />
                     )}
                     <Row label={t.rowPrice} val={`฿${p.price?.toLocaleString()}`} />
                   </div>
@@ -2223,7 +2232,7 @@ function CoachPaymentView({ order, linePushed, lang="th", onDone }) {
       <div className="card" style={{marginBottom:16}}>
         <div className="card-header"><p>{th ? "รายละเอียดคำสั่งซื้อ" : "Order details"}</p></div>
         <div className="card-body">
-          <Row label="🎓" val={coachLabel(order, lang)} />
+          <Row label="👤" val={coachLabel(order, lang)} />
           {order.people > 1 && <Row label="💰" val={`฿${(order.price / order.people).toLocaleString()} × ${order.people} ${th ? "คน" : "people"}`} />}
           {order.learner_note && <Row label="📝" val={order.learner_note} />}
           <Row label="👤" val={order.customer_name} />
@@ -2352,7 +2361,7 @@ function CancelPage({ lang="th", initialPhone="", lockedPhone="", onResumeCoach 
 
       {coachOrders.length > 0 && (
         <div style={{marginTop:20}}>
-          <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:10}}>🎓 {lang==="th" ? "คอร์สเรียนกับโค้ชของฉัน" : "My coaching courses"}</p>
+          <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:10}}>👤 {lang==="th" ? "คอร์สเรียนกับโค้ชของฉัน" : "My coaching courses"}</p>
           <div style={{display:"flex",flexDirection:"column",gap:12}}>
             {coachOrders.map(o => {
               const st = coachStatusInfo(o.status, lang);
@@ -2631,7 +2640,7 @@ export default function AppV2() {
     if (!booking || pkgBookingBusy) return;
     setPkgBookingBusy(true);
     const { slot, court, date } = booking;
-    const { error, available, needed } = await db.createBookingWithPackage({
+    const { error, available, needed, expiry_date } = await db.createBookingWithPackage({
       courtId: court.courtId, customerId: phone, customerName: name,
       bookingDate: toIso(date), hour: slot.hour, startMinute: slot.startMinute, durationMinutes: slot.durationMinutes, packageId,
     });
@@ -2642,6 +2651,7 @@ export default function AppV2() {
         package_no_credits: lang==="th" ? `สิทธิ์ในแพ็คเกจไม่พอ (ต้องใช้ ${needed ?? "?"} ครั้ง ใช้ได้ ${available ?? 0} ครั้ง — ไม่นับสิทธิ์ที่จองไว้รอแอดมินยืนยัน)` : `Not enough credits (need ${needed ?? "?"}, ${available ?? 0} available — credits waiting for admin confirmation are reserved)`,
         package_duration: lang==="th" ? "แพ็คเกจใช้จองได้เฉพาะ 60 หรือ 120 นาที" : "Packages can only book 60 or 120 minutes",
         package_expired: lang==="th" ? "แพ็คเกจหมดอายุแล้ว" : "This package has expired",
+        package_date_out_of_range: lang==="th" ? `แพ็คเกจนี้ใช้เล่นได้ถึง ${expiry_date ?? "-"} แต่วันที่เล่นที่เลือกเลยจากนั้น กรุณาเลือกวันเล่นให้อยู่ภายในอายุแพ็คเกจ` : `This package is playable until ${expiry_date ?? "-"}, but your chosen date is later. Please pick a date within the validity.`,
         package_wrong_tier: lang==="th" ? "แพ็คเกจนี้ใช้กับช่วงเวลานี้ไม่ได้" : "This package cannot be used for this time slot",
       }[error] || accountErrMsg(error, lang) || (lang==="th" ? "จองไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Booking failed, please try again");
       alert(msg);
@@ -2911,15 +2921,17 @@ function AdminDashboard({ token, onLogout }) {
   const nbUnits = nb.duration === 120 ? 2 : 1;
   const nbPkg = nbPkgs.find(p => String(p.id) === String(nb.packageId)) || null;
   const nbWeekend = nb.date ? [0, 6].includes(new Date(nb.date + "T00:00:00").getDay()) : false;
+  const inRangeNb = (p) => !p.expiry_date || nb.date <= String(p.expiry_date).slice(0, 10); // วันเล่นอยู่ภายในอายุแพ็คเกจ
   const pkgCoversNb = (p) => Array.from({ length: nbUnits }, (_, i) => Math.floor(nb.startMin / 60) + i).every(h => p.tier === "peak" || !(nbWeekend || h >= 16));
   const pkgProblem = !nbUsePkg ? "" : !nbPkg ? "กรุณาเลือกแพ็คเกจ"
     : ![60, 120].includes(nb.duration) ? "แพ็คเกจจองได้เฉพาะ 60 หรือ 120 นาที"
     : nb.courts.length !== 1 ? "แพ็คเกจใช้กับ 1 สนามต่อครั้ง"
+    : !inRangeNb(nbPkg) ? `แพ็คเกจนี้ใช้เล่นได้ถึง ${String(nbPkg.expiry_date).slice(0, 10)} แต่วันที่เล่นที่เลือกเลยจากนั้น`
     : !pkgCoversNb(nbPkg) ? "แพ็คเกจนี้ใช้กับช่วงเวลานี้ไม่ได้ (แพ็ค Off Peak: จ.–ศ. ก่อน 16:00 ทุกชั่วโมงที่จอง)"
     : nbPkg.available < nbUnits ? `สิทธิ์ไม่พอ (ต้องใช้ ${nbUnits} ครั้ง ใช้ได้ ${nbPkg.available} ครั้ง)` : "";
   const nbCanSubmit = nbPhoneOk && nbNameOk && nb.courts.length > 0 && nb.date && Number.isFinite(nbUnit) && nbUnit >= 0 && !nbBusy && !pkgProblem;
-  const pickBestPkg = () => (nbPkgs.find(p => pkgCoversNb(p) && p.available >= nbUnits && p.tier === (nbWeekend || Math.floor(nb.startMin / 60) >= 16 ? "peak" : "offpeak"))
-    || nbPkgs.find(p => pkgCoversNb(p) && p.available >= nbUnits) || nbPkgs[0]);
+  const pickBestPkg = () => (nbPkgs.find(p => pkgCoversNb(p) && inRangeNb(p) && p.available >= nbUnits && p.tier === (nbWeekend || Math.floor(nb.startMin / 60) >= 16 ? "peak" : "offpeak"))
+    || nbPkgs.find(p => pkgCoversNb(p) && inRangeNb(p) && p.available >= nbUnits) || nbPkgs[0]);
   const togglePkg = (on) => setNb(prev => {
     if (!on) return { ...prev, packageId: "" };
     const best = pickBestPkg();
@@ -2973,6 +2985,7 @@ function AdminDashboard({ token, onLogout }) {
         : r?.error === "package_duration" ? "❌ แพ็คเกจจองได้เฉพาะ 60 หรือ 120 นาที"
         : r?.error === "package_one_court" ? "❌ แพ็คเกจใช้กับ 1 สนามต่อครั้ง"
         : r?.error === "package_expired" ? "❌ แพ็คเกจหมดอายุแล้ว"
+        : r?.error === "package_date_out_of_range" ? `❌ แพ็คเกจนี้ใช้เล่นได้ถึง ${r.expiry_date} แต่วันที่เล่นที่เลือกเลยจากนั้น`
         : r?.error === "package_busy" ? "❌ มีการตัดสิทธิ์แพ็คเกจนี้พร้อมกัน กรุณาลองใหม่อีกครั้ง"
         : r?.error === "package_not_active" ? "❌ แพ็คเกจนี้ใช้ไม่ได้ (ไม่ใช่ของเบอร์นี้ หรือยังไม่เปิดใช้งาน)"
         : r?.error === "network_or_server" ? "❌ เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว และดู Vercel → Logs"
@@ -3296,7 +3309,7 @@ function AdminDashboard({ token, onLogout }) {
         </header>
 
         <div style={{background:"#fff",borderBottom:"1px solid var(--dv)",display:"flex",padding:"0 20px",overflowX:"auto"}}>
-          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["newbooking","➕ จองแทน"],["packages","🎟 แพ็คเกจ"],["coach","🎓 โค้ช"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
+          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["newbooking","➕ จองแทน"],["packages","🎟 แพ็คเกจ"],["coach","👤 โค้ช"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
             <button key={id} onClick={() => setTab(id)} style={{padding:"13px 16px",background:"none",border:"none",borderBottom:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",fontWeight:tab===id?700:400,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
               {label}
             </button>
@@ -3613,7 +3626,7 @@ function AdminDashboard({ token, onLogout }) {
             const when = (t) => { try { return parseUtc(t).toLocaleString("th-TH", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }); } catch { return ""; } };
             return (
               <div>
-                <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:4}}>🎓 คอร์สเรียนกับโค้ช</p>
+                <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:4}}>👤 คอร์สเรียนกับโค้ช</p>
                 <p style={{fontSize:12,color:"var(--mu)",marginBottom:12,lineHeight:1.6}}>ลูกค้าเลือกคอร์สและโอนเงินในเว็บ {coachPushEnabled ? "ระบบส่งข้อความเข้า LINE OA ของลูกค้าให้แล้ว" : "แล้วกดปุ่มทักไลน์ OA มาเอง (ข้อความมีรหัส C-xx / ชื่อ / เบอร์)"} — ตรวจสลิปแล้วกด ✅ แล้วนัดวัน-เวลากับลูกค้าในแชท LINE OA</p>
                 <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
                   {[["open", `รอดำเนินการ (${openN})`], ["confirmed", "ยืนยันแล้ว"], ["all", "ทั้งหมด"]].map(([v, label]) => (
