@@ -85,6 +85,19 @@ async function releaseDiscountByCode(code) {
   if (d && d.used_count > 0) await sb(`discount_codes?id=eq.${d.id}`, { method: "PATCH", body: JSON.stringify({ used_count: d.used_count - 1 }) });
 }
 
+// บันทึกการจองผ่านฟังก์ชัน SQL ที่ล็อกต่อสนาม/วัน → เช็คว่าง → บันทึกในธุรกรรมเดียว (กันจองซ้อนเมื่อกดพร้อมกัน)
+// ถ้ายังไม่ได้รัน SQL หรือฟังก์ชันผิดพลาดแบบอื่น → ถอยกลับไปใช้วิธีเดิม (บันทึกตรงๆ หลังเช็คว่างไว้แล้ว)
+async function insertBookingsAtomic(rows) {
+  const r = await sb(`rpc/create_bookings_if_free`, { method: "POST", body: JSON.stringify({ rows }) });
+  if (r.ok && Array.isArray(r.body) && r.body.length === rows.length) return { rows: r.body };
+  const msg = String(r.body?.message || "");
+  if (msg.includes("slot_taken")) return { error: "slot_taken", court: Number(msg.split(":")[1]) || null };
+  if (r.body?.code !== "PGRST202") console.error("create_bookings_if_free failed — fallback to plain insert:", r.body);
+  const ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(rows) });
+  if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== rows.length) return { error: "insert_failed" };
+  return { rows: ins.body };
+}
+
 async function getActiveIntervals(bookingDate, courtId) {
   const { body } = await sb(
     `bookings?booking_date=eq.${bookingDate}&court_id=eq.${courtId}&status=neq.cancelled&select=hour,start_minute,duration_minutes,status,created_time`
@@ -362,13 +375,15 @@ export default async function handler(req, res) {
           booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
           price: Math.round(unit), discount_amount: 0, status, ...(groupId ? { group_id: groupId } : {}), ...(pkg ? { package_id: pkg.id } : {}),
         });
-        let ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(ids.map(c => ({ ...baseRow(c), booked_by: "admin" }))) });
-        if (!ins.ok) {
+        let ins = await insertBookingsAtomic(ids.map(c => ({ ...baseRow(c), booked_by: "admin" })));
+        if (ins.error && ins.error !== "slot_taken") {
           // คอลัมน์ booked_by ยังไม่ถูกสร้าง (ยังไม่ได้รัน SQL) — บันทึกการจองให้ก่อน ไม่ให้งานหลักพัง
           console.error("createAdminBooking: insert with booked_by failed — run add-booked-by-column.sql");
-          ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(ids.map(baseRow)) });
+          ins = await insertBookingsAtomic(ids.map(baseRow));
         }
-        if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== ids.length) { await restoreCredits(); res.status(500).json({ error: "insert_failed" }); return; }
+        if (ins.error === "slot_taken") { await restoreCredits(); res.status(409).json({ error: "slot_taken", court: ins.court || ids[0] }); return; } // มีคนจองตัดหน้าพอดี
+        if (!ins.rows) { await restoreCredits(); res.status(500).json({ error: "insert_failed" }); return; }
+        ins = { ok: true, body: ins.rows };
 
         await notifyTelegram(
           `📞 <b>แอดมินจองให้ลูกค้า</b>\n\n` +
