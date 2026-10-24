@@ -222,6 +222,45 @@ async function insertBookingsAtomic(rows) {
   return { rows: ins.body };
 }
 
+// ─── เรียนกับโค้ช (สนาม+โค้ช) ─────────────────────────────────────────────────────────
+// ซื้อคอร์สแล้วแอดมินนัดวัน-เวลากับลูกค้าทาง LINE OA เอง ไม่มีการเลือกวัน/เวลา/โค้ชในระบบ — ราคาที่นี่เป็นตัวตัดสินเสมอ หน้าเว็บดึงไปแสดง
+// ราคาตามป้ายของร้านเป็น "ต่อคน" (Duo = 2 คน : 1 โค้ช) ระบบคิดยอดรวมเป็น ต่อคน × จำนวนคน — ถ้าร้านต้องการขาย Duo ต่อคน ให้เปลี่ยน people ของ duo เป็น 1
+const COACH_PRICES = {
+  adult: { private: { people: 1, 1: 1190, 5: 5750, 10: 11000 }, duo: { people: 2, 1: 750, 5: 3500, 10: 6500 } },
+  kid:   { private: { people: 1, 1: 1190, 5: 5750, 10: 11000 }, duo: { people: 2, 1: 699, 5: 3295, 10: 6290 } },
+};
+const COACH_SESSIONS = [1, 5, 10];
+function coachQuote(audience, type, sessions) {
+  const row = COACH_PRICES[audience]?.[type];
+  const n = Number(sessions);
+  if (!row || !COACH_SESSIONS.includes(n)) return null;
+  const perPerson = row[n];
+  return { audience, type, sessions: n, people: row.people, perPerson, perSessionPerPerson: Math.round(perPerson / n), total: perPerson * row.people };
+}
+const coachLabel = (o) => `${o.type === "duo" ? "Private Duo (2 คน : 1 โค้ช)" : "Private (1 คน : 1 โค้ช)"} • ${o.audience === "kid" ? "เด็ก" : "ผู้ใหญ่"} • ${Number(o.sessions) === 1 ? "ครั้งเดียว" : `แพ็ค ${o.sessions} ครั้ง`}`;
+const publicCoachOrder = (r) => ({ id: r.id, customer_name: r.customer_name, customer_id: r.customer_id, audience: r.audience, type: r.type, sessions: r.sessions, people: r.people, price: r.price, learner_note: r.learner_note, status: r.status, sessions_used: r.sessions_used || 0, line_pushed: !!r.line_pushed, created_time: r.created_time });
+
+// ส่งข้อความจาก LINE OA ไปหาลูกค้า (ต้องเป็นเพื่อน OA และยังไม่ได้บล็อก; นับโควตาข้อความของแผน OA) — ล้มเหลวแล้วไม่ทำให้การสั่งซื้อพัง คืน false ให้หน้าเว็บโชว์ปุ่มสำรอง
+async function pushLine(to, text) {
+  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  if (!token || !to) return false;
+  try {
+    const r = await fetch("https://api.line.me/v2/bot/message/push", {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ to, messages: [{ type: "text", text }] }),
+    });
+    if (!r.ok) { console.error("LINE push failed:", r.status, await r.text().catch(() => "")); return false; }
+    return true;
+  } catch (e) { console.error("LINE push error:", e?.message); return false; }
+}
+const coachCreatedText = (o) =>
+  `🎓 NOVA Tennis — รับคำขอเรียนกับโค้ชแล้วค่ะ\n\n` +
+  `คอร์ส: ${coachLabel(o)}\n` +
+  `ยอดชำระ: ฿${Number(o.price).toLocaleString()}${o.people > 1 ? ` (฿${(o.price / o.people).toLocaleString()} × ${o.people} คน)` : ""}\n` +
+  `รหัสคำสั่งซื้อ: C-${o.id}\n\n` +
+  `👉 ชำระเงินและส่งสลิปในหน้าเว็บให้เรียบร้อย แล้วแอดมินจะนัดวัน-เวลาเรียนกับโค้ชในแชทนี้ค่ะ\n` +
+  `ตอบกลับแชทนี้ได้เลย เช่น วัน-เวลาที่สะดวกเรียนค่ะ 🙏`;
+
 async function getLinkedCustomer(sessionToken) {
   const userId = verifyLineSession(sessionToken);
   if (!userId) return { error: "line_required" };
@@ -286,6 +325,101 @@ export default async function handler(req, res) {
 
   try {
     switch (action) {
+      case "coachCatalog": {
+        // ราคาคอร์สเรียนกับโค้ชทั้งหมด (ข้อมูลสาธารณะ ไม่มีข้อมูลลูกค้า) — หน้าเว็บดึงจากที่นี่ จึงแก้ราคาที่เดียว
+        const items = [];
+        for (const audience of ["adult", "kid"]) for (const type of ["duo", "private"]) for (const s of COACH_SESSIONS) items.push(coachQuote(audience, type, s));
+        res.status(200).json({ items });
+        return;
+      }
+
+      case "createCoachOrder": {
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        const q = coachQuote(p.audience, p.type, p.sessions);
+        if (!q) { res.status(400).json({ error: "invalid_product" }); return; }
+        const note = Array.from(String(p.learnerNote || "").trim()).slice(0, 120).join("");
+
+        // กันซ้ำ/กันยิงรัว: คำสั่งซื้อเดิมที่ยังรอชำระของคอร์สเดียวกัน (ภายใน 1 ชม.) ใช้ใบเดิมต่อ ไม่สร้างใหม่/ไม่ส่งข้อความซ้ำ — และไม่เกิน 6 ใบต่อชั่วโมง
+        const since = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+        const { body: recent } = await sb(`coach_orders?customer_id=eq.${who.phone}&created_time=gte.${since}&select=*`);
+        const recentRows = Array.isArray(recent) ? recent : [];
+        const same = recentRows.find((r) => r.status === "pending" && r.audience === q.audience && r.type === q.type && Number(r.sessions) === q.sessions);
+        if (same) { res.status(200).json({ order: publicCoachOrder(same), linePushed: !!same.line_pushed, reused: true }); return; }
+        if (recentRows.length >= 6) { res.status(429).json({ error: "too_many_orders" }); return; }
+
+        const ins = await sb(`coach_orders`, {
+          method: "POST", headers: { Prefer: "return=representation" },
+          body: JSON.stringify({
+            customer_id: who.phone, customer_name: who.name, line_user_id: who.userId,
+            audience: q.audience, type: q.type, sessions: q.sessions, people: q.people, price: q.total,
+            learner_note: note || null, status: "pending",
+          }),
+        });
+        const order = Array.isArray(ins.body) ? ins.body[0] : null;
+        if (!ins.ok || !order) { console.error("createCoachOrder insert failed:", ins.body); res.status(500).json({ error: "insert_failed" }); return; }
+
+        // ส่งข้อความเข้า LINE OA ของลูกค้าทันที (ให้เกิดห้องแชทใน OA และแอดมินรู้ว่าลูกค้าคือใคร ทักกลับได้ แม้ลูกค้ายังไม่จ่ายเงิน)
+        const pushed = await pushLine(who.userId, coachCreatedText(order));
+        if (pushed) await sb(`coach_orders?id=eq.${order.id}`, { method: "PATCH", body: JSON.stringify({ line_pushed: true }) });
+        await notifyTelegram(
+          `🎓 <b>มีคำขอเรียนกับโค้ชใหม่ (ยังไม่ชำระ)</b>\n\n` +
+          `👤 ${esc(who.name)} (LINE)\n📞 ${who.phone}\n` +
+          `📚 ${esc(coachLabel(order))}\n💰 ฿${Number(order.price).toLocaleString()}\n` +
+          (note ? `📝 ผู้เรียน: ${esc(note)}\n` : "") +
+          `💬 ส่งข้อความเข้า LINE OA ของลูกค้า: ${pushed ? "สำเร็จ ✅" : "ไม่สำเร็จ ❌ (ลูกค้าอาจบล็อก OA / โควตาหมด / ยังไม่ได้ตั้งค่า token) — กรุณาติดต่อลูกค้าเอง"}`
+        );
+        res.status(200).json({ order: publicCoachOrder({ ...order, line_pushed: pushed }), linePushed: pushed });
+        return;
+      }
+
+      case "updateCoachSlip": {
+        const { orderId, slipUrl } = p;
+        if (!orderId || !slipUrl) { res.status(400).json({ error: "missing params" }); return; }
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        if (!isOwnSlipUrl(slipUrl, `coach_${orderId}`)) { res.status(400).json({ error: "invalid_slip_url" }); return; }
+        const { ok, body } = await sb(`coach_orders?id=eq.${encodeURIComponent(orderId)}&customer_id=eq.${who.phone}&status=in.(pending,reviewing)`, {
+          method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
+        });
+        const row = Array.isArray(body) ? body[0] : null;
+        if (!ok || !row) { res.status(409).json({ error: "update_failed" }); return; }
+        const sentAt = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().substr(11, 5);
+        await notifyTelegram(
+          `🔔 <b>มีลูกค้าส่งสลิปคอร์สเรียนกับโค้ช</b>\n\n` +
+          `📚 ${esc(coachLabel(row))}\n💰 ฿${Number(row.price).toLocaleString()}\n` +
+          `👤 ${esc(row.customer_name || "-")}\n📞 ${row.customer_id}\n` +
+          (row.learner_note ? `📝 ผู้เรียน: ${esc(row.learner_note)}\n` : "") +
+          `🕓 ส่งสลิปเมื่อเวลา: ${sentAt} น. (ไทย)\n\nกรุณาตรวจสอบและกดยืนยันที่แท็บ "🎓 โค้ช" ใน Admin Dashboard แล้วนัดวัน-เวลากับลูกค้าทาง LINE OA`
+        );
+        res.status(200).json({ order: publicCoachOrder(row) });
+        return;
+      }
+
+      case "cancelCoachOrder": {
+        // ลูกค้ายกเลิกได้เฉพาะคำสั่งซื้อที่ "ยังไม่ชำระ" ของตัวเอง
+        const { orderId } = p;
+        if (!orderId) { res.status(400).json({ error: "missing orderId" }); return; }
+        const who = await getLinkedCustomer(p.session);
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        const { ok, body } = await sb(`coach_orders?id=eq.${encodeURIComponent(orderId)}&customer_id=eq.${who.phone}&status=eq.pending`, {
+          method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "cancelled" }),
+        });
+        const row = Array.isArray(body) ? body[0] : null;
+        if (ok && row) await notifyTelegram(`❌ <b>ลูกค้ายกเลิกคำสั่งซื้อคอร์สโค้ช (ยังไม่ชำระ)</b>\n\n📚 ${esc(coachLabel(row))}\n👤 ${esc(row.customer_name || "-")}\n📞 ${row.customer_id}`);
+        res.status(200).json({ ok: !!(ok && row) });
+        return;
+      }
+
+      case "myCoachOrders": {
+        const who = await getLinkedCustomer(p.session);
+        if (who.error === "phone_not_linked") { res.status(200).json({ orders: [] }); return; }
+        if (who.error) { res.status(403).json({ error: who.error }); return; }
+        const { body } = await sb(`coach_orders?customer_id=eq.${who.phone}&status=neq.cancelled&select=*&order=created_time.desc&limit=30`);
+        res.status(200).json({ orders: (Array.isArray(body) ? body : []).map(publicCoachOrder) });
+        return;
+      }
+
       case "checkAvailability": {
         const { date, courtId } = p;
         if (!date || !courtId) { res.status(400).json({ error: "missing params" }); return; }
