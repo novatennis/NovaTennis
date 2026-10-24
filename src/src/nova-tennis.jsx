@@ -74,6 +74,7 @@ const db = {
   },
   async updateSlip(id, slipUrl) {
     const result = await callBookingAction("updateSlip", { bookingId: id, slipUrl });
+    if (result?.error === "slot_taken_late") return { _error: "slot_taken_late" }; // หมดเวลาชำระ และช่วงเวลานี้ถูกคนอื่นจองไปแล้ว
     return result?.booking || null; // null = อัปเดตไม่สำเร็จ (ไม่เจอแถวที่ตรงเงื่อนไข)
   },
   async cancelPending(id) {
@@ -89,18 +90,32 @@ const db = {
     return bookings || [];
   },
   // อัปโหลดไฟล์สลิปขึ้น Supabase Storage โดยตรง (คนละระบบสิทธิ์กับตารางข้อมูล ไม่กระทบความปลอดภัยของข้อมูลลูกค้า)
+  // คืนค่า: ลิงก์ (สำเร็จ) / { error: "bad_type" | "too_big" } (ไฟล์ไม่ผ่านเงื่อนไข) / null (อัปโหลดไม่สำเร็จ)
   async uploadSlip(file, bookingId) {
-    const ext = file.name.split(".").pop();
+    const EXT_BY_TYPE = { "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/webp": "webp", "image/heic": "heic", "image/heif": "heif", "image/gif": "gif" };
+    const mime = String(file?.type || "").toLowerCase();
+    // เครื่องบางรุ่นไม่ส่งชนิดไฟล์มา (ค่าว่าง) → ดูนามสกุลชื่อไฟล์แทน แต่ยอมรับเฉพาะนามสกุลรูปภาพ
+    const nameExt = String(file?.name || "").split(".").pop().toLowerCase().replace("jpeg", "jpg");
+    const ext = EXT_BY_TYPE[mime] || (mime === "" && ["jpg", "png", "webp", "heic", "heif", "gif"].includes(nameExt) ? nameExt : undefined);
+    if (!ext) return { error: "bad_type" };
+    const contentType = mime || `image/${ext === "jpg" ? "jpeg" : ext}`;
+    if (file.size > 8 * 1024 * 1024) return { error: "too_big" };
     const path = `slips/${bookingId}_${Date.now()}.${ext}`;
-    const res = await fetch(`${SUPABASE_URL}/storage/v1/object/slips/${path}`, {
-      method: "POST",
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": file.type },
-      body: file,
-    });
-    if (!res.ok) return null;
+    try {
+      const res = await fetch(`${SUPABASE_URL}/storage/v1/object/slips/${path}`, {
+        method: "POST",
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": contentType },
+        body: file,
+      });
+      if (!res.ok) return null;
+    } catch { return null; }
     return `${SUPABASE_URL}/storage/v1/object/public/slips/${path}`;
   },
 };
+
+const uploadFailMsg = (up, lang) => (up?.error === "bad_type" ? (lang==="th" ? "กรุณาแนบรูปภาพสลิป (JPG, PNG, WEBP, HEIC)" : "Please attach an image of your slip (JPG, PNG, WEBP, HEIC).")
+  : up?.error === "too_big" ? (lang==="th" ? "ไฟล์ใหญ่เกิน 8 MB กรุณาเลือกรูปที่เล็กกว่านี้" : "The file is larger than 8 MB. Please choose a smaller image.")
+  : (lang==="th" ? "อัปโหลดสลิปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Slip upload failed. Please try again."));
 
 // ─── Admin API helper ───────────────────────────────────────────────────────────
 async function callAdminAction(action, token, payload) {
@@ -1395,9 +1410,20 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
   const handleUpload = async () => {
     if (!slip || !bookingId) return;
     setUploading(true);
-    const url = await db.uploadSlip(slip, bookingId);
+    const up = await db.uploadSlip(slip, bookingId);
+    const url = typeof up === "string" ? up : null;
+    if (!url) { alert(uploadFailMsg(up, lang)); setUploading(false); return; }
     if (url) {
       const updated = await db.updateSlip(bookingId, url);
+      if (updated?._error === "slot_taken_late") {
+        // เซิร์ฟเวอร์ยกเลิกรายการนี้แล้ว เก็บสลิปไว้ให้แอดมิน และแจ้ง Telegram แอดมินให้ติดต่อลูกค้า (ลูกค้าอาจโอนเงินมาแล้ว)
+        setUploading(false);
+        alert(lang==="th"
+          ? `หมดเวลาชำระเงินแล้ว และช่วงเวลานี้ถูกลูกค้าท่านอื่นจองไปแล้ว\n\nหากท่านโอนเงินไปแล้ว ทางร้านได้รับแจ้งพร้อมสลิปของท่านแล้ว และจะติดต่อกลับเพื่อคืนเงินหรือจัดเวลาใหม่ให้\nหรือติดต่อร้านโดยตรงได้ที่ ${ADMIN_CONTACT_PHONE}`
+          : `The payment time has expired and this time slot has been booked by someone else.\n\nIf you have already transferred the money, the studio has been notified with your slip and will contact you to refund or reschedule.\nYou can also call us directly: ${ADMIN_CONTACT_PHONE}`);
+        onStartOver?.();
+        return;
+      }
       if (!updated) {
         // อัปเดตสถานะไม่สำเร็จจริง — ไม่ถือว่าส่งสลิปสำเร็จ ไม่แจ้งเตือนแอดมิน ให้ลูกค้าลองใหม่
         setUploading(false);
@@ -1406,18 +1432,7 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
       }
       setUploaded(true);
       trackFb("Purchase", { value: serverPrice ?? clientPrice, currency: "THB", content_name: isGroup ? "court_booking_2courts" : "court_booking" });
-      fetch("/api/notify-admin-telegram", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          courtName: courtLabel,
-          date: fmtDate(date, lang),
-          time: slot.label,
-          price: serverPrice ?? clientPrice,
-          name: customer.name,
-          phone: customer.phone,
-        }),
-      }).catch(() => {});
+      // การแจ้งเตือน Telegram ถึงแอดมินทำที่เซิร์ฟเวอร์ตอนบันทึกสลิปสำเร็จ (api/booking-actions.js) ไม่ได้ให้หน้าเว็บส่งข้อมูลเอง
     }
     setUploading(false);
   };
@@ -1649,7 +1664,7 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
     <div style={{padding:"20px 16px 100px",display:"flex",flexDirection:"column",gap:22}} className="fu">
       <section>
         <h2 className="bb" style={{fontSize:26,color:"var(--br)",marginBottom:4}}>{lang==="th"?"แพ็คเกจสมาชิก":"Membership Packages"}</h2>
-        <p style={{fontSize:12.5,color:"var(--mu)"}}>{lang==="th"?"ซื้อจำนวนครั้งล่วงหน้า ถูกกว่าจ่ายเดี่ยว ใช้จองได้ภายในระยะเวลาที่กำหนด (จองได้ครั้งละ 60 นาทีเท่านั้น)":"Buy sessions in advance, cheaper than paying per visit. Each credit books a 60-minute session."}</p>
+        <p style={{fontSize:12.5,color:"var(--mu)"}}>{lang==="th"?"ซื้อจำนวนครั้งล่วงหน้า ถูกกว่าจ่ายเดี่ยว ใช้จองได้ภายในระยะเวลาที่กำหนด (จอง 60 นาที ตัด 1 ครั้ง หรือ 120 นาที ตัด 2 ครั้ง)":"Buy sessions in advance, cheaper than paying per visit. Book 60 minutes (uses 1 credit) or 120 minutes (uses 2 credits)."}</p>
       </section>
 
       <section>
@@ -1831,7 +1846,9 @@ function PackagePaymentView({ pkg, lang="th", onDone }) {
   const handleUpload = async () => {
     if (!slip) return;
     setUploading(true);
-    const url = await db.uploadSlip(slip, `pkg_${pkg.id}`);
+    const up = await db.uploadSlip(slip, `pkg_${pkg.id}`);
+    const url = typeof up === "string" ? up : null;
+    if (!url) { alert(uploadFailMsg(up, lang)); setUploading(false); return; }
     if (url) {
       const updated = await db.updatePackageSlip(pkg.id, url);
       if (!updated) {
@@ -1841,14 +1858,7 @@ function PackagePaymentView({ pkg, lang="th", onDone }) {
       }
       setUploaded(true);
       trackFb("Purchase", { value: pkg.price, currency: "THB", content_name: "package" });
-      fetch("/api/notify-admin-telegram", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          courtName: `🎟 แพ็คเกจ ${pkg.tier==="peak"?"Peak":"Off Peak"} × ${pkg.total_credits} ครั้ง`,
-          date: "-", time: "-", price: pkg.price, name: pkg.customer_name, phone: pkg.customer_id,
-        }),
-      }).catch(() => {});
+      // การแจ้งเตือน Telegram ถึงแอดมินทำที่เซิร์ฟเวอร์ตอนบันทึกสลิปสำเร็จ (api/booking-actions.js)
     }
     setUploading(false);
   };
@@ -1996,6 +2006,19 @@ function CancelPage({ lang="th", initialPhone="", lockedPhone="" }) {
             </div>
           );
         })}
+      </div>
+
+      <div style={{marginTop:18,background:"#fff",border:"1px solid var(--dv)",borderRadius:"var(--r)",padding:"16px 18px",boxShadow:"var(--sh)"}}>
+        <p style={{fontWeight:800,color:"var(--br)",fontSize:14.5,marginBottom:6}}>{lang==="th" ? "ต้องการยกเลิกหรือสอบถามเรื่องการจอง?" : "Need to cancel or ask about a booking?"}</p>
+        <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7,marginBottom:12}}>
+          {lang==="th" ? "หลังส่งสลิปหรือยืนยันการจองแล้ว ยกเลิกเองในระบบไม่ได้ กรุณาติดต่อร้านทาง LINE หรือโทรศัพท์" : "Once a slip is submitted or a booking is confirmed, it can't be cancelled online. Please contact us via LINE or phone."}
+          <br />
+          {lang==="th" ? "ตามเงื่อนไขของร้าน: สงวนสิทธิ์การเลื่อนจอง และไม่คืนค่าบริการทุกกรณี" : "Per our conditions: no rescheduling and no refunds under any circumstances."}
+        </p>
+        <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+          <a href={LINE_OA_URL} target="_blank" rel="noopener noreferrer" style={{flex:1,minWidth:140,textAlign:"center",padding:"11px 12px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>💬 LINE @347mlhra</a>
+          <a href={adminTel()} style={{flex:1,minWidth:140,textAlign:"center",padding:"11px 12px",borderRadius:10,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--br)",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>📞 {ADMIN_CONTACT_PHONE}</a>
+        </div>
       </div>
     </div>
   );
