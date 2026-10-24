@@ -98,6 +98,21 @@ async function insertBookingsAtomic(rows) {
   return { rows: ins.body };
 }
 
+// ส่งข้อความจาก LINE OA ไปหาลูกค้า (ต้องเป็นเพื่อน OA และไม่ได้บล็อก; นับโควตาข้อความของแผน OA) — ล้มเหลวแล้วคืน false ไม่ทำให้งานหลักพัง
+async function pushLine(to, text) {
+  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  if (!token || !to) return false;
+  try {
+    const r = await fetch("https://api.line.me/v2/bot/message/push", {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ to, messages: [{ type: "text", text }] }),
+    });
+    if (!r.ok) { console.error("LINE push failed:", r.status, await r.text().catch(() => "")); return false; }
+    return true;
+  } catch (e) { console.error("LINE push error:", e?.message); return false; }
+}
+const coachLabel = (o) => `${o.type === "duo" ? "Private Duo (2 คน : 1 โค้ช)" : "Private (1 คน : 1 โค้ช)"} • ${o.audience === "kid" ? "เด็ก" : "ผู้ใหญ่"} • ${Number(o.sessions) === 1 ? "ครั้งเดียว" : `แพ็ค ${o.sessions} ครั้ง`}`;
+
 async function getActiveIntervals(bookingDate, courtId) {
   const { body } = await sb(
     `bookings?booking_date=eq.${bookingDate}&court_id=eq.${courtId}&status=neq.cancelled&select=hour,start_minute,duration_minutes,status,created_time`
@@ -429,6 +444,46 @@ export default async function handler(req, res) {
         }
         await notifyTelegram(`🔧 <b>แอดมินเปลี่ยนเบอร์ลูกค้า</b>\n\n📞 ${oldPhone} → ${newPhone}\n(ย้ายข้อมูลลูกค้า การจอง แพ็คเกจ และการผูก LINE ไปเบอร์ใหม่แล้ว)`);
         res.status(200).json({ ok: true });
+        return;
+      }
+      case "coachOrders": {
+        // คำสั่งซื้อคอร์สเรียนกับโค้ชทั้งหมด (ล่าสุดก่อน) — ไม่ส่ง line_user_id ออกไปหน้าเว็บ
+        const { body } = await sb(`coach_orders?select=*&order=created_time.desc&limit=300`);
+        res.status(200).json({ orders: (Array.isArray(body) ? body : []).map(({ line_user_id, ...r }) => r) });
+        return;
+      }
+      case "confirmCoachOrder": {
+        // แอดมินยืนยันว่าได้รับเงินแล้ว → ส่งข้อความเข้า LINE OA ของลูกค้าให้ด้วย (แอดมินนัดวัน-เวลาต่อในแชท)
+        const { id } = p;
+        if (!id) { res.status(400).json({ error: "missing id" }); return; }
+        const { ok, body } = await sb(`coach_orders?id=eq.${encodeURIComponent(id)}&status=in.(pending,reviewing)`, {
+          method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "confirmed", confirmed_time: new Date().toISOString() }),
+        });
+        const row = Array.isArray(body) ? body[0] : null;
+        if (!ok || !row) { res.status(409).json({ error: "update_failed" }); return; }
+        const pushed = await pushLine(row.line_user_id,
+          `✅ ได้รับชำระเงินแล้วค่ะ — ${coachLabel(row)} (C-${row.id})\n\n` +
+          `แอดมินจะติดต่อนัดวัน-เวลาเรียนกับโค้ชในแชทนี้ค่ะ ส่งวัน-เวลาที่สะดวกมาได้เลย 🎾`);
+        res.status(200).json({ ok: true, pushed });
+        return;
+      }
+      case "cancelCoachOrder": {
+        const { id } = p;
+        if (!id) { res.status(400).json({ error: "missing id" }); return; }
+        await sb(`coach_orders?id=eq.${encodeURIComponent(id)}&status=in.(pending,reviewing,confirmed)`, { method: "PATCH", body: JSON.stringify({ status: "cancelled" }) });
+        res.status(200).json({ ok: true });
+        return;
+      }
+      case "adjustCoachSessions": {
+        // ตัด/คืนจำนวนครั้งที่เรียนไปแล้ว (+1 / −1) ใช้กับคำสั่งซื้อที่ยืนยันแล้วเท่านั้น และไม่เกินจำนวนครั้งในแพ็ค
+        const { id, delta } = p;
+        if (!id || ![1, -1].includes(delta)) { res.status(400).json({ error: "invalid" }); return; }
+        const { body } = await sb(`coach_orders?id=eq.${encodeURIComponent(id)}&status=eq.confirmed&select=id,sessions,sessions_used`);
+        const row = Array.isArray(body) ? body[0] : null;
+        if (!row) { res.status(409).json({ error: "not_confirmed" }); return; }
+        const next = Math.min(row.sessions, Math.max(0, (row.sessions_used || 0) + delta));
+        await sb(`coach_orders?id=eq.${row.id}&sessions_used=eq.${row.sessions_used || 0}`, { method: "PATCH", body: JSON.stringify({ sessions_used: next }) }); // เงื่อนไขกันกดซ้อนกัน
+        res.status(200).json({ ok: true, sessions_used: next });
         return;
       }
       case "unlinkLinePhone": {
