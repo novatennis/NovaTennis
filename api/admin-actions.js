@@ -76,6 +76,14 @@ async function getReservedCredits(packageId) {
   return (Array.isArray(body) ? body : []).reduce((s, b) => s + Math.max(1, Math.round((b.duration_minutes || 60) / 60)), 0);
 }
 const todayBangkok = () => new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
+// วันสุดท้ายที่แพ็คเกจใช้เล่นได้ = วันที่ยืนยัน (เวลาไทย) นับเป็นวันที่ 1 → ครบ N วันปฏิทินพอดี (ใช้ได้ถึงสิ้นวันนั้น) เช่นยืนยัน 25 ต.ค. แพ็ค 7 วัน = เล่นได้ 25–31 ต.ค.
+// ถ้าร้านอยากนับ "7 วันนับจากวันถัดไป" (รวมเป็น 8 วันปฏิทิน) ให้เปลี่ยน COUNT_ACTIVATION_DAY เป็น false
+const COUNT_ACTIVATION_DAY = true;
+function packageExpiryDate(activatedMs, days) {
+  const bkk = new Date(activatedMs + 7 * 60 * 60 * 1000); // เลื่อนเป็นเวลาไทย แล้วอ่านวันที่แบบ UTC
+  const base = Date.UTC(bkk.getUTCFullYear(), bkk.getUTCMonth(), bkk.getUTCDate());
+  return new Date(base + (Number(days) - (COUNT_ACTIVATION_DAY ? 1 : 0)) * 86400000).toISOString().slice(0, 10);
+}
 
 // คืนสิทธิ์ใช้โค้ด 1 ครั้ง (ยกเลิกรายการที่ยังไม่ได้ยืนยัน = ยังไม่เคยได้ใช้ส่วนลดจริง)
 async function releaseDiscountByCode(code) {
@@ -343,6 +351,7 @@ export default async function handler(req, res) {
           pkg = (pkgRows || [])[0];
           if (!pkg || pkg.status !== "active") { res.status(400).json({ error: "package_not_active" }); return; }
           if (pkg.expiry_date && String(pkg.expiry_date).slice(0, 10) < todayBangkok()) { res.status(400).json({ error: "package_expired" }); return; }
+          if (pkg.expiry_date && bookingDate > String(pkg.expiry_date).slice(0, 10)) { res.status(400).json({ error: "package_date_out_of_range", expiry_date: String(pkg.expiry_date).slice(0, 10) }); return; } // วันเล่นต้องอยู่ภายในอายุแพ็คเกจ
           const reserved = await getReservedCredits(pkg.id);
           if (pkg.remaining_credits - reserved < units) { res.status(400).json({ error: "package_no_credits", available: Math.max(0, pkg.remaining_credits - reserved), needed: units }); return; }
           // ทุกชั่วโมงที่จองต้องอยู่ในช่วงที่แพ็คครอบคลุม: แพ็ค Peak ได้ทุกชั่วโมง / แพ็ค Off Peak เฉพาะ จ.–ศ. ก่อน 16:00
@@ -509,12 +518,12 @@ export default async function handler(req, res) {
       case "confirmPackage": {
         const { id } = p;
         if (!id) { res.status(400).json({ error: "missing id" }); return; }
-        const now = new Date();
+        const nowMs = Date.now();
+        const now = new Date(nowMs);
         const { body: pkgRows } = await sb(`packages?id=eq.${id}&select=*`);
         const pkg = (pkgRows || [])[0];
         if (!pkg) { res.status(404).json({ error: "not_found" }); return; }
-        const expiry = new Date(now.getTime() + pkg.expiry_days * 24 * 60 * 60 * 1000);
-        const expiryDateStr = expiry.toISOString().split("T")[0];
+        const expiryDateStr = packageExpiryDate(nowMs, pkg.expiry_days);
         await sb(`packages?id=eq.${id}`, {
           method: "PATCH",
           body: JSON.stringify({ status: "active", activated_at: now.toISOString(), expiry_date: expiryDateStr }),
