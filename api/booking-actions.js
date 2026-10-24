@@ -258,7 +258,7 @@ async function pushLine(to, text) {
   } catch (e) { console.error("LINE push error:", e?.message); return false; }
 }
 const coachCreatedText = (o) =>
-  `🎓 NOVA Tennis — รับคำขอเรียนกับโค้ชแล้วค่ะ\n\n` +
+  `👤 NOVA Tennis — รับคำขอเรียนกับโค้ชแล้วค่ะ\n\n` +
   `คอร์ส: ${coachLabel(o)}\n` +
   `ยอดชำระ: ฿${Number(o.price).toLocaleString()}${o.people > 1 ? ` (฿${(o.price / o.people).toLocaleString()} × ${o.people} คน)` : ""}\n` +
   `รหัสคำสั่งซื้อ: C-${o.id}\n\n` +
@@ -367,7 +367,7 @@ export default async function handler(req, res) {
         const pushed = coachPushOn() ? await pushLine(who.userId, coachCreatedText(order)) : false;
         if (pushed) await sb(`coach_orders?id=eq.${order.id}`, { method: "PATCH", body: JSON.stringify({ line_pushed: true }) });
         await notifyTelegram(
-          `🎓 <b>มีคำขอเรียนกับโค้ชใหม่ (ยังไม่ชำระ)</b>\n\n` +
+          `👤 <b>มีคำขอเรียนกับโค้ชใหม่ (ยังไม่ชำระ)</b>\n\n` +
           `👤 ${esc(who.name)} (LINE)\n📞 ${who.phone}\n` +
           `📚 ${esc(coachLabel(order))}\n💰 ฿${Number(order.price).toLocaleString()}\n` +
           (note ? `📝 ผู้เรียน: ${esc(note)}\n` : "") +
@@ -396,7 +396,7 @@ export default async function handler(req, res) {
           `📚 ${esc(coachLabel(row))}\n💰 ฿${Number(row.price).toLocaleString()}\n` +
           `👤 ${esc(row.customer_name || "-")}\n📞 ${row.customer_id}\n` +
           (row.learner_note ? `📝 ผู้เรียน: ${esc(row.learner_note)}\n` : "") +
-          `🕓 ส่งสลิปเมื่อเวลา: ${sentAt} น. (ไทย)\n\nกรุณาตรวจสอบและกดยืนยันที่แท็บ "🎓 โค้ช" ใน Admin Dashboard แล้วนัดวัน-เวลากับลูกค้าทาง LINE OA`
+          `🕓 ส่งสลิปเมื่อเวลา: ${sentAt} น. (ไทย)\n\nกรุณาตรวจสอบและกดยืนยันที่แท็บ "👤 โค้ช" ใน Admin Dashboard แล้วนัดวัน-เวลากับลูกค้าทาง LINE OA`
         );
         res.status(200).json({ order: publicCoachOrder(row) });
         return;
@@ -518,7 +518,9 @@ export default async function handler(req, res) {
           const { body: pkgRows } = await sb(`packages?id=eq.${packageId}&customer_id=eq.${customerId}&select=*`);
           const pkg = (pkgRows || [])[0];
           if (!pkg || pkg.status !== "active") { res.status(400).json({ error: "package_not_active" }); return; }
-          if (pkg.expiry_date && new Date(pkg.expiry_date + "T23:59:59") < new Date()) { res.status(400).json({ error: "package_expired" }); return; }
+          if (pkg.expiry_date && String(pkg.expiry_date).slice(0, 10) < todayBangkok()) { res.status(400).json({ error: "package_expired" }); return; }
+          // "วันที่เล่น" ต้องอยู่ภายในอายุแพ็คเกจด้วย (ไม่ใช่แค่ตอนกดจองแพ็คเกจยังไม่หมดอายุ) — เช่นแพ็ค 7 วัน จองวันเล่นเลยวันสุดท้ายไม่ได้ (วันสุดท้ายเล่นได้ถึงสิ้นวัน)
+          if (pkg.expiry_date && bookingDate > String(pkg.expiry_date).slice(0, 10)) { res.status(400).json({ error: "package_date_out_of_range", expiry_date: String(pkg.expiry_date).slice(0, 10) }); return; }
           // สิทธิ์ที่ใช้ได้จริง = คงเหลือ − สิทธิ์ที่จองค้างรอแอดมินยืนยันอยู่ (ยังไม่ถูกหัก) กันส่งหลายออเดอร์ซ้อนจนเล่นเกินสิทธิ์
           const reserved = await getReservedCredits(packageId);
           if (pkg.remaining_credits - reserved < units) { res.status(400).json({ error: "package_no_credits", available: Math.max(0, pkg.remaining_credits - reserved), needed: units }); return; }
