@@ -2352,7 +2352,8 @@ function CancelPage({ lang="th", initialPhone="", lockedPhone="", onResumeCoach 
                 </div>
                 <Row label={`📅 ${t.date}`} val={new Date(b.booking_date).toLocaleDateString(lang==="th"?"th-TH":"en-GB",{year:"numeric",month:"long",day:"numeric"})} />
                 <Row label={`🕐 ${t.time}`} val={`${minutesToLabel(startMin)} – ${minutesToLabel(startMin+dur)}`} />
-                <Row label={t.rowPrice} val={`฿${b.price?.toLocaleString()}`} />
+                {b.coach_name && <Row label={lang==="th" ? "👤 โค้ช" : "👤 Coach"} val={b.coach_name} />}
+                <Row label={t.rowPrice} val={b.coach_order_id ? (lang==="th" ? `ชำระแล้ว (ใช้สิทธิ์คอร์ส C-${b.coach_order_id})` : `Paid (course C-${b.coach_order_id})`) : `฿${b.price?.toLocaleString()}`} />
               </div>
             </div>
           );
@@ -2373,7 +2374,20 @@ function CancelPage({ lang="th", initialPhone="", lockedPhone="", onResumeCoach 
                       <span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 10px",borderRadius:20,whiteSpace:"nowrap"}}>{st.text}</span>
                     </div>
                     <Row label={t.rowPrice} val={`฿${o.price?.toLocaleString()}`} />
-                    {o.status === "confirmed" && Number(o.sessions) > 1 && <Row label={lang==="th" ? "เรียนแล้ว" : "Used"} val={`${o.sessions_used} / ${o.sessions} ${lang==="th" ? "ครั้ง" : "sessions"}`} />}
+                    {o.status === "confirmed" && <Row label={lang==="th" ? "ใช้สิทธิ์แล้ว" : "Used"} val={`${o.sessions_used} / ${o.sessions} ${lang==="th" ? "ครั้ง" : "sessions"} (${lang==="th" ? "เหลือ" : "left"} ${o.sessions - o.sessions_used})`} />}
+                    {o.status === "confirmed" && (() => {
+                      const mine = bookings.filter(b => b.coach_order_id === o.id && b.status !== "cancelled").sort((x, y) => String(x.booking_date).localeCompare(String(y.booking_date)) || ((x.hour||0)*60 + (x.start_minute||0)) - ((y.hour||0)*60 + (y.start_minute||0)));
+                      if (mine.length === 0) return null;
+                      return (
+                        <div style={{margin:"6px 0 10px",padding:"10px 12px",background:"var(--cr)",borderRadius:10}}>
+                          <p style={{fontSize:12,fontWeight:700,color:"var(--br)",marginBottom:6}}>📅 {lang==="th" ? "นัดหมายที่แอดมินลงให้แล้ว" : "Scheduled lessons"}</p>
+                          {mine.map((b, i) => {
+                            const s = (b.hour||0)*60 + (b.start_minute||0);
+                            return <p key={b.id} style={{fontSize:12.5,color:"var(--tx)",lineHeight:1.7}}>{i + 1}. {new Date(b.booking_date + "T00:00:00").toLocaleDateString(lang==="th" ? "th-TH" : "en-GB", { weekday: "short", day: "numeric", month: "short" })} • {minutesToLabel(s)}–{minutesToLabel(s + (b.duration_minutes||60))} • Court {b.court_id}{b.coach_name ? ` • 👤 ${b.coach_name}` : ""}</p>;
+                          })}
+                        </div>
+                      );
+                    })()}
                     {o.status === "pending" && onResumeCoach && (
                       <button onClick={() => onResumeCoach(o)} style={{width:"100%",marginTop:4,padding:"11px",borderRadius:10,border:"none",background:"linear-gradient(90deg,var(--or),var(--or2))",color:"#fff",fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{lang==="th" ? "ไปชำระเงิน →" : "Go to payment →"}</button>
                     )}
@@ -2905,12 +2919,15 @@ function AdminDashboard({ token, onLogout }) {
 
   // ── จองแทนลูกค้า (ลูกค้าโทรมาจอง / ไม่มี LINE) ──
   const START_OPTS = (() => { const o = []; for (let m = DAY_START_MIN; m < DAY_END_MIN; m += 30) o.push(m); return o; })();
-  const [nb, setNb] = useState({ phone: "", name: "", date: toIso(new Date()), courts: [1], startMin: 10 * 60, duration: 60, price: "", status: "reviewing", packageId: "" });
+  const [nb, setNb] = useState({ phone: "", name: "", date: toIso(new Date()), courts: [1], startMin: 10 * 60, duration: 60, price: "", status: "reviewing", packageId: "", coachOrderId: "", coachName: "" });
   const [nbInfo, setNbInfo] = useState(null);
   const nbAutoName = useRef(""); // ชื่อที่ระบบเติมให้อัตโนมัติจากเบอร์ (ใช้แยกจากชื่อที่แอดมินพิมพ์เอง)
   const [nbInfoErr, setNbInfoErr] = useState(null); // ค้นหาข้อมูลลูกค้าไม่สำเร็จ (บอกสาเหตุ ไม่ปล่อยให้หน้าเงียบ)
   const [nbBusy, setNbBusy] = useState(false);
   const [nbMsg, setNbMsg] = useState(null);
+  const [nbConfirmText, setNbConfirmText] = useState(null); // ข้อความยืนยันนัดเรียนกับโค้ช ให้แอดมินคัดลอกไปส่งในแชท LINE OA
+  const [nbCopied, setNbCopied] = useState(false);
+  const [coachNames, setCoachNames] = useState(() => { try { return JSON.parse(localStorage.getItem("nova_coach_names") || "[]"); } catch { return []; } }); // ชื่อโค้ชที่เคยใช้ (ไว้เลือกเร็ว)
   const nbAutoUnit = nb.date ? getDurationPrice(Math.floor(nb.startMin / 60), new Date(nb.date + "T00:00:00"), nb.duration).price : 0;
   const nbUnit = nb.price !== "" ? Number(nb.price) : nbAutoUnit; // ราคาต่อสนาม (ว่าง = ราคาปกติ)
   const nbNameOk = nb.name.trim().length >= 1 && nb.name.trim().length <= 40;
@@ -2929,20 +2946,38 @@ function AdminDashboard({ token, onLogout }) {
     : !inRangeNb(nbPkg) ? `แพ็คเกจนี้ใช้เล่นได้ถึง ${String(nbPkg.expiry_date).slice(0, 10)} แต่วันที่เล่นที่เลือกเลยจากนั้น`
     : !pkgCoversNb(nbPkg) ? "แพ็คเกจนี้ใช้กับช่วงเวลานี้ไม่ได้ (แพ็ค Off Peak: จ.–ศ. ก่อน 16:00 ทุกชั่วโมงที่จอง)"
     : nbPkg.available < nbUnits ? `สิทธิ์ไม่พอ (ต้องใช้ ${nbUnits} ครั้ง ใช้ได้ ${nbPkg.available} ครั้ง)` : "";
-  const nbCanSubmit = nbPhoneOk && nbNameOk && nb.courts.length > 0 && nb.date && Number.isFinite(nbUnit) && nbUnit >= 0 && !nbBusy && !pkgProblem;
+  // ── ตัดสิทธิ์คอร์สเรียนกับโค้ช: 60 นาที = 1 ครั้ง / 1 สนาม / ต้องลงชื่อโค้ช / ยืนยันทันที ──
+  const nbCoachOrders = nbInfo?.coachOrders || [];
+  const nbCoachIssues = nbInfo?.coachIssues || [];
+  const nbUseCoach = !!nb.coachOrderId;
+  const nbCoach = nbCoachOrders.find(o => String(o.id) === String(nb.coachOrderId)) || null;
+  const nbMode = nbUseCoach ? "coach" : nbUsePkg ? "pkg" : "cash";
+  const coachNameClean = nb.coachName.normalize("NFC").replace(/\s+/g, " ").trim();
+  const coachProblem = !nbUseCoach ? "" : !nbCoach ? "กรุณาเลือกคอร์สโค้ช"
+    : nb.duration !== 60 ? "นัดเรียนกับโค้ชใช้ 60 นาที (1 สิทธิ์ = 1 ชั่วโมง)"
+    : nb.courts.length !== 1 ? "นัดเรียนกับโค้ชใช้ 1 สนาม"
+    : !coachNameClean ? "กรุณาใส่ชื่อโค้ช (ลูกค้าจะเห็นชื่อนี้ในหน้า \"การจองของฉัน\")"
+    : Array.from(coachNameClean).length > 30 ? "ชื่อโค้ชยาวเกิน 30 ตัวอักษร"
+    : nbCoach.remaining < 1 ? "สิทธิ์ครั้งเรียนหมดแล้ว" : "";
+  const nbCanSubmit = nbPhoneOk && nbNameOk && nb.courts.length > 0 && nb.date && Number.isFinite(nbUnit) && nbUnit >= 0 && !nbBusy && !pkgProblem && !coachProblem;
   const pickBestPkg = () => (nbPkgs.find(p => pkgCoversNb(p) && inRangeNb(p) && p.available >= nbUnits && p.tier === (nbWeekend || Math.floor(nb.startMin / 60) >= 16 ? "peak" : "offpeak"))
     || nbPkgs.find(p => pkgCoversNb(p) && inRangeNb(p) && p.available >= nbUnits) || nbPkgs[0]);
+  const setNbMode = (m) => setNb(prev => {
+    if (m === "cash") return { ...prev, packageId: "", coachOrderId: "" };
+    if (m === "coach") { const first = nbCoachOrders[0]; return { ...prev, packageId: "", coachOrderId: first ? String(first.id) : "", duration: 60, courts: prev.courts.slice(0, 1) }; }
+    return prev; // pkg ใช้ togglePkg
+  });
   const togglePkg = (on) => setNb(prev => {
-    if (!on) return { ...prev, packageId: "" };
+    if (!on) return { ...prev, packageId: "", coachOrderId: "" };
     const best = pickBestPkg();
-    return { ...prev, packageId: best ? String(best.id) : "", duration: [60, 120].includes(prev.duration) ? prev.duration : 60, courts: prev.courts.slice(0, 1) };
+    return { ...prev, coachOrderId: "", packageId: best ? String(best.id) : "", duration: [60, 120].includes(prev.duration) ? prev.duration : 60, courts: prev.courts.slice(0, 1) };
   });
   useEffect(() => {
     setNbInfo(null); setNbInfoErr(null);
     setNb(prev => {
       const clearName = !!nbAutoName.current && prev.name === nbAutoName.current; // ชื่อเดิมถูกเติมโดยระบบ ไม่ใช่ที่แอดมินพิมพ์ → ล้าง
       if (clearName) nbAutoName.current = "";
-      return (prev.packageId || clearName) ? { ...prev, packageId: "", ...(clearName ? { name: "" } : {}) } : prev;
+      return (prev.packageId || prev.coachOrderId || clearName) ? { ...prev, packageId: "", coachOrderId: "", ...(clearName ? { name: "" } : {}) } : prev;
     });
     if (!/^[0-9]{10}$/.test(nb.phone)) return;
     let cancelled = false;
@@ -2962,21 +2997,29 @@ function AdminDashboard({ token, onLogout }) {
     const ok = window.confirm(
       `จองให้ ${nb.name.trim()} (${nb.phone})\n` +
       `${nb.courts.map(c => "Court " + c).join(" + ")} • ${nb.date} • ${minutesToLabel(nb.startMin)}–${minutesToLabel(nb.startMin + nb.duration)}\n` +
-      (nbUsePkg
+      (nbUseCoach
+        ? `👤 โค้ช: ${coachNameClean}\nตัดสิทธิ์คอร์ส C-${nbCoach.id} ครั้งที่ ${nbCoach.sessions_used + 1}/${nbCoach.sessions} (เหลือ ${nbCoach.remaining - 1} ครั้งหลังตัด) • ยืนยันทันที\n\nยืนยันการจอง?`
+        : nbUsePkg
         ? `ตัดสิทธิ์แพ็คเกจ ${nbUnits} ครั้ง (${nbPkg.tier === "peak" ? "Peak" : "Off Peak"}) เหลือ ${nbPkg.remaining_credits - nbUnits} ครั้งหลังตัด • ยืนยันทันที\n\nยืนยันการจอง?`
         : `ยอดรวม ฿${total.toLocaleString()} • ${nb.status === "confirmed" ? "ชำระแล้ว (ยืนยันทันที)" : "รอชำระ"}\n\nยืนยันการจอง?`));
     if (!ok) return;
-    setNbBusy(true); setNbMsg(null);
+    setNbBusy(true); setNbMsg(null); setNbConfirmText(null); setNbCopied(false);
     let r = null;
     try { r = await callAdminAction("createAdminBooking", token, {
       customerId: nb.phone, customerName: nb.name.trim(), courtIds: nb.courts, bookingDate: nb.date,
       hour: Math.floor(nb.startMin / 60), startMinute: nb.startMin % 60, durationMinutes: nb.duration, price: Math.round(nbUnit), status: nb.status,
       ...(nbUsePkg ? { packageId: nb.packageId } : {}),
+      ...(nbUseCoach ? { coachOrderId: nb.coachOrderId, coachName: coachNameClean } : {}),
     }); } catch { r = { error: "network_or_server" }; }
     setNbBusy(false);
     if (r?.ok) {
-      setNbMsg({ ok: true, text: `✅ จองให้ ${nb.name.trim()} เรียบร้อย (${nb.courts.map(c => "Court " + c).join(" + ")} ${nb.date} ${minutesToLabel(nb.startMin)})${r.creditsUsed ? ` • ตัดสิทธิ์แพ็คเกจ ${r.creditsUsed} ครั้ง เหลือ ${r.remaining} ครั้ง` : ""}` });
-      setNb(prev => ({ ...prev, phone: "", name: "", price: "", packageId: "" })); setNbInfo(null);
+      setNbMsg({ ok: true, text: `✅ จองให้ ${nb.name.trim()} เรียบร้อย (${nb.courts.map(c => "Court " + c).join(" + ")} ${nb.date} ${minutesToLabel(nb.startMin)})${r.creditsUsed ? ` • ตัดสิทธิ์แพ็คเกจ ${r.creditsUsed} ครั้ง เหลือ ${r.remaining} ครั้ง` : ""}${r.coach ? ` • 👤 โค้ช ${r.coach.coachName} • ตัดสิทธิ์คอร์ส C-${r.coach.orderId} ครั้งที่ ${r.coach.sessions_used}/${r.coach.sessions} (เหลือ ${r.coach.remaining} ครั้ง)` : ""}` });
+      if (r.coach) {
+        const when = new Date(nb.date + "T00:00:00").toLocaleDateString("th-TH", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+        setNbConfirmText(`✅ ยืนยันนัดเรียนกับโค้ช\n👤 โค้ช: ${r.coach.coachName}\n📅 ${when}\n🕐 ${minutesToLabel(nb.startMin)}–${minutesToLabel(nb.startMin + 60)}\n🎾 Court ${nb.courts[0]}\n📋 ใช้สิทธิ์คอร์ส C-${r.coach.orderId} ครั้งที่ ${r.coach.sessions_used}/${r.coach.sessions} (เหลือ ${r.coach.remaining} ครั้ง)\n\nตรวจสอบนัดหมายได้ที่เว็บ NOVA Tennis → เมนู "การจองของฉัน"`);
+        setCoachNames(list => { const next = [r.coach.coachName, ...list.filter(n => n !== r.coach.coachName)].slice(0, 8); try { localStorage.setItem("nova_coach_names", JSON.stringify(next)); } catch { /* no-op */ } return next; });
+      }
+      setNb(prev => ({ ...prev, phone: "", name: "", price: "", packageId: "", coachOrderId: "" })); setNbInfo(null);
       loadBookings(); loadQueue();
     } else {
       setNbMsg({ ok: false, text: r?.error === "slot_taken" ? `❌ ช่วงเวลานี้มีคนจองแล้ว (Court ${r.court}) — ดูที่แท็บตารางว่าง`
@@ -2986,6 +3029,14 @@ function AdminDashboard({ token, onLogout }) {
         : r?.error === "package_one_court" ? "❌ แพ็คเกจใช้กับ 1 สนามต่อครั้ง"
         : r?.error === "package_expired" ? "❌ แพ็คเกจหมดอายุแล้ว"
         : r?.error === "package_date_out_of_range" ? `❌ แพ็คเกจนี้ใช้เล่นได้ถึง ${r.expiry_date} แต่วันที่เล่นที่เลือกเลยจากนั้น`
+        : r?.error === "coach_busy" ? `❌ โค้ช ${r.coach} มีนัดเวลาซ้อนกัน (Court ${r.court} ${r.from}–${r.to}) — เลือกเวลาอื่น หรือตรวจชื่อโค้ช`
+        : r?.error === "coach_no_sessions" ? "❌ คอร์สนี้ใช้สิทธิ์ครั้งเรียนครบแล้ว"
+        : r?.error === "coach_order_not_active" ? "❌ คอร์สนี้ใช้ไม่ได้ (ไม่ใช่ของเบอร์นี้ หรือยังไม่ได้ยืนยันรับเงิน/ถูกยกเลิก)"
+        : r?.error === "coach_order_busy" ? "❌ มีการตัดสิทธิ์คอร์สนี้พร้อมกัน กรุณาลองใหม่อีกครั้ง"
+        : r?.error === "coach_name_required" ? "❌ กรุณาใส่ชื่อโค้ช (ไม่เกิน 30 ตัวอักษร)"
+        : r?.error === "coach_duration" ? "❌ นัดเรียนกับโค้ชใช้ 60 นาที"
+        : r?.error === "coach_one_court" ? "❌ นัดเรียนกับโค้ชใช้ 1 สนาม"
+        : r?.error === "coach_columns_missing" ? "❌ ยังไม่ได้รัน SQL เพิ่มคอลัมน์โค้ช — รันไฟล์ add-coach-booking-columns.sql ที่ Supabase ก่อน (สิทธิ์ที่ตัดไว้ถูกคืนให้แล้ว)"
         : r?.error === "package_busy" ? "❌ มีการตัดสิทธิ์แพ็คเกจนี้พร้อมกัน กรุณาลองใหม่อีกครั้ง"
         : r?.error === "package_not_active" ? "❌ แพ็คเกจนี้ใช้ไม่ได้ (ไม่ใช่ของเบอร์นี้ หรือยังไม่เปิดใช้งาน)"
         : r?.error === "network_or_server" ? "❌ เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว และดู Vercel → Logs"
@@ -3217,7 +3268,7 @@ function AdminDashboard({ token, onLogout }) {
   useEffect(() => { loadBookings(); }, [date]);
   useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); if(tab==="report") loadReport(); if(tab==="closures") loadBlocks(); if(tab==="packages") { loadPkgQueue(); loadAllPkgs(); } }, [tab]);
 
-  const updateStatus = async (id, status, packageId, groupId) => {
+  const updateStatus = async (id, status, packageId, groupId, coachOrderId) => {
     const msg = status === "confirmed"
       ? "ยืนยันการจองนี้ใช่หรือไม่? สถานะจะเปลี่ยนเป็น \"การจองสำเร็จ\""
       : "ยกเลิกการจองนี้ใช่หรือไม่? การกระทำนี้ไม่สามารถย้อนกลับได้ และช่วงเวลานี้จะกลับมาให้ลูกค้าจองได้ใหม่";
@@ -3226,6 +3277,9 @@ function AdminDashboard({ token, onLogout }) {
     let refundCredit = false;
     if (status === "cancelled" && packageId) {
       refundCredit = window.confirm("การจองนี้จ่ายด้วยสิทธิ์แพ็คเกจ\n\nกด OK = คืนสิทธิ์ให้ลูกค้า (ปัญหาจากทางสนาม)\nกด Cancel = ไม่คืนสิทธิ์ (ลูกค้ายกเลิกเอง)");
+    }
+    if (status === "cancelled" && coachOrderId) {
+      refundCredit = window.confirm("การจองนี้ใช้สิทธิ์คอร์สเรียนกับโค้ช\n\nกด OK = คืนสิทธิ์ครั้งเรียนให้ลูกค้า (ปัญหาจากทางสนาม/โค้ช)\nกด Cancel = ไม่คืนสิทธิ์ (ลูกค้ายกเลิกเอง)");
     }
     await callAdminAction("updateStatus", token, { id, status, refundCredit });
     if (groupId) { loadQueue(); loadBookings(); return; } // การจองคู่เปลี่ยนทั้ง 2 แถว — โหลดใหม่ให้ตรงกับเซิร์ฟเวอร์
@@ -3380,6 +3434,7 @@ function AdminDashboard({ token, onLogout }) {
                                           {bk.package_id && <span style={{marginLeft:5,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 5px",borderRadius:8}}>🎟</span>}
                                         </div>
                                         <div style={{fontSize:12.5,fontWeight:600,color:"var(--br)",marginTop:2}}>📞 {bk.customer_id}</div>
+                                        {bk.coach_name && <div style={{fontSize:11.5,fontWeight:700,color:"#2d5f8a",marginTop:2}}>👤 โค้ช {bk.coach_name}</div>}
                                         <div style={{fontSize:10.5,color:"var(--mu)",marginTop:2}}>{stLabel[bk.status] || bk.status} · {minutesToLabel(bs)}–{minutesToLabel(be)}</div>
                                       </td>
                                     );
@@ -3421,7 +3476,7 @@ function AdminDashboard({ token, onLogout }) {
                               <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short"})}</td>
                               <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
                               <td>{fmtTime(b)}</td>
-                              <td style={{fontWeight:600}}>{b.customer_name || "-"}{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}</td>
+                              <td style={{fontWeight:600}}>{b.customer_name || "-"}{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}{b.coach_name && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#2d5f8a",background:"rgba(94,151,174,.22)",padding:"1px 6px",borderRadius:8}}>👤 โค้ช {b.coach_name}</span>}</td>
                               <td>{b.customer_id}</td>
                               <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
                               <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
@@ -3429,7 +3484,7 @@ function AdminDashboard({ token, onLogout }) {
                               <td>
                                 <div style={{display:"flex",gap:6}}>
                                   <button onClick={()=>updateStatus(b.id,"confirmed",null,b.group_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>
-                                  <button onClick={()=>updateStatus(b.id,"cancelled",b.package_id,b.group_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                  <button onClick={()=>updateStatus(b.id,"cancelled",b.package_id,b.group_id,b.coach_order_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
                                 </div>
                               </td>
                             </tr>
@@ -3472,7 +3527,7 @@ function AdminDashboard({ token, onLogout }) {
                           <tr key={b.id} id={`bk-${b.id}`} style={highlightId === b.id ? {background:"rgba(255,213,74,.4)",outline:"2px solid #E8A200"} : undefined}>
                             <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
                             <td>{fmtTime(b)}</td>
-                            <td style={{fontWeight:600}}>{b.customer_name || "-"}{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}</td>
+                            <td style={{fontWeight:600}}>{b.customer_name || "-"}{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}{b.coach_name && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#2d5f8a",background:"rgba(94,151,174,.22)",padding:"1px 6px",borderRadius:8}}>👤 โค้ช {b.coach_name}</span>}</td>
                             <td>{b.customer_id}</td>
                             <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
                             <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
@@ -3481,7 +3536,7 @@ function AdminDashboard({ token, onLogout }) {
                               {b.status!=="cancelled" && b.status!=="blocked" && (
                                 <div style={{display:"flex",gap:6}}>
                                   {b.status!=="confirmed" && <button onClick={()=>updateStatus(b.id,"confirmed",null,b.group_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>}
-                                  <button onClick={()=>updateStatus(b.id,"cancelled",b.package_id,b.group_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                  <button onClick={()=>updateStatus(b.id,"cancelled",b.package_id,b.group_id,b.coach_order_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
                                 </div>
                               )}
                               {b.status==="blocked" && <span style={{fontSize:11,color:"var(--mu)"}}>จัดการที่แท็บ "ปิดสนาม"</span>}
@@ -3562,16 +3617,27 @@ function AdminDashboard({ token, onLogout }) {
                     </div>
                   </div>
                 </div>
-                {nbPkgs.length > 0 && (
+                {(nbPkgs.length > 0 || nbCoachOrders.length > 0 || nbCoachIssues.length > 0) && (
                   <div>
                     <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>วิธีชำระ</label>
-                    <div style={{display:"flex",gap:8}}>
-                      {[[false, "💵 ชำระเงิน"], [true, "🎟 ตัดสิทธิ์แพ็คเกจ"]].map(([v, label]) => (
-                        <button key={String(v)} onClick={() => togglePkg(v)}
-                          style={{flex:1,padding:"10px 6px",borderRadius:8,border:`2px solid ${nbUsePkg === v ? "var(--or)" : "var(--dv)"}`,background:nbUsePkg === v ? "var(--or-bg)" : "#fff",color:nbUsePkg === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
-                      ))}
+                    <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                      {[["cash", "💵 ชำระเงิน", true], ["pkg", "🎟 ตัดสิทธิ์แพ็คเกจสนาม", nbPkgs.length > 0], ["coach", "👤 ตัดสิทธิ์คอร์สโค้ช", nbCoachOrders.length > 0]].filter(x => x[2]).map(([v, label]) => {
+                        const on = nbMode === v;
+                        return (
+                          <button key={v} onClick={() => (v === "pkg" ? togglePkg(true) : setNbMode(v))}
+                            style={{flex:1,minWidth:108,padding:"10px 6px",borderRadius:8,border:`2px solid ${on ? "var(--or)" : "var(--dv)"}`,background:on ? "var(--or-bg)" : "#fff",color:on ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer"}}>{label}</button>
+                        );
+                      })}
                     </div>
-                    <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>ลูกค้ามีแพ็คเกจที่ใช้ได้ {nbPkgs.length} รายการ</p>
+                    <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>
+                      {nbPkgs.length > 0 ? `ลูกค้ามีแพ็คเกจสนามที่ใช้ได้ ${nbPkgs.length} รายการ` : ""}{nbPkgs.length > 0 && nbCoachOrders.length > 0 ? " • " : ""}{nbCoachOrders.length > 0 ? `มีคอร์สโค้ชที่ใช้ได้ ${nbCoachOrders.length} รายการ` : ""}
+                    </p>
+                    {nbCoachIssues.length > 0 && (
+                      <div style={{fontSize:12,marginTop:6,lineHeight:1.7,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:8,padding:"8px 10px"}}>
+                        <b>👤 คอร์สโค้ชที่ยังตัดสิทธิ์ไม่ได้:</b>
+                        {nbCoachIssues.map(i => <div key={i.id}>• {i.label} — {i.issue}</div>)}
+                      </div>
+                    )}
                   </div>
                 )}
                 {nbUsePkg && (
@@ -3590,7 +3656,29 @@ function AdminDashboard({ token, onLogout }) {
                     {pkgProblem && <p style={{fontSize:12.5,color:"#c0392b",fontWeight:600,marginTop:8,lineHeight:1.6}}>⚠️ {pkgProblem}</p>}
                   </div>
                 )}
-                {!nbUsePkg && (
+                {nbUseCoach && (
+                  <div style={{background:"var(--or-bg)",border:"1px solid var(--dv)",borderRadius:10,padding:12,display:"flex",flexDirection:"column",gap:10}}>
+                    {nbCoachOrders.length > 1 && (
+                      <select value={nb.coachOrderId} onChange={e => setNb(p => ({ ...p, coachOrderId: e.target.value }))} style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,background:"#fff"}}>
+                        {nbCoachOrders.map(o => <option key={o.id} value={o.id}>C-{o.id} • {coachLabel(o, "th")} • เหลือ {o.remaining}/{o.sessions} ครั้ง</option>)}
+                      </select>
+                    )}
+                    {nbCoach && (
+                      <p style={{fontSize:13,color:"var(--br)",lineHeight:1.7,margin:0}}>
+                        👤 <b>C-{nbCoach.id}</b> {coachLabel(nbCoach, "th")} • ใช้สิทธิ์แล้ว {nbCoach.sessions_used}/{nbCoach.sessions}<br />
+                        รายการนี้ใช้ <b style={{color:"var(--or)"}}>1 ครั้ง</b> (60 นาที) → เหลือ {Math.max(0, nbCoach.remaining - 1)} ครั้งหลังตัด • ยืนยันทันที ไม่มียอดชำระ
+                      </p>
+                    )}
+                    <div>
+                      <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ชื่อโค้ช (ลูกค้าจะเห็นในหน้า "การจองของฉัน")</label>
+                      <input list="coach-names" value={nb.coachName} maxLength={30} onChange={e => setNb(p => ({ ...p, coachName: e.target.value }))} placeholder="เช่น โค้ชเอ"
+                        style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,outline:"none",background:"#fff"}} />
+                      <datalist id="coach-names">{coachNames.map(n => <option key={n} value={n} />)}</datalist>
+                    </div>
+                    {coachProblem && <p style={{fontSize:12.5,color:"#c0392b",fontWeight:600,margin:0,lineHeight:1.6}}>⚠️ {coachProblem}</p>}
+                  </div>
+                )}
+                {nbMode === "cash" && (
                   <>
                 <div>
                   <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ราคาต่อสนาม (บาท) — เว้นว่าง = ราคาปกติ ฿{nbAutoUnit.toLocaleString()}</label>
@@ -3614,6 +3702,17 @@ function AdminDashboard({ token, onLogout }) {
                   {nbBusy ? "⏳ กำลังบันทึก..." : "บันทึกการจอง"}
                 </button>
                 {nbMsg && <p style={{fontSize:13,fontWeight:600,color:nbMsg.ok ? "#2d7a4f" : "#c0392b",lineHeight:1.6}}>{nbMsg.text}</p>}
+                {nbConfirmText && (
+                  <div style={{background:"#fff",border:"1.5px solid #2d7a4f",borderRadius:10,padding:"12px 14px"}}>
+                    <p style={{fontSize:12,color:"var(--mu)",marginBottom:6}}>ข้อความยืนยันสำหรับส่งให้ลูกค้าในแชท LINE OA:</p>
+                    <pre style={{whiteSpace:"pre-wrap",fontFamily:"'Noto Sans Thai',sans-serif",fontSize:13,color:"var(--tx)",lineHeight:1.7,margin:"0 0 10px"}}>{nbConfirmText}</pre>
+                    <button onClick={async () => {
+                      try { await navigator.clipboard.writeText(nbConfirmText); }
+                      catch { const ta = document.createElement("textarea"); ta.value = nbConfirmText; document.body.appendChild(ta); ta.select(); try { document.execCommand("copy"); } catch { /* no-op */ } document.body.removeChild(ta); }
+                      setNbCopied(true);
+                    }} style={{padding:"9px 16px",borderRadius:8,border:"none",background:"#2d7a4f",color:"#fff",fontWeight:800,fontSize:13,cursor:"pointer"}}>{nbCopied ? "คัดลอกแล้ว ✓" : "📋 คัดลอกข้อความ"}</button>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -3627,7 +3726,7 @@ function AdminDashboard({ token, onLogout }) {
             return (
               <div>
                 <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:4}}>👤 คอร์สเรียนกับโค้ช</p>
-                <p style={{fontSize:12,color:"var(--mu)",marginBottom:12,lineHeight:1.6}}>ลูกค้าเลือกคอร์สและโอนเงินในเว็บ {coachPushEnabled ? "ระบบส่งข้อความเข้า LINE OA ของลูกค้าให้แล้ว" : "แล้วกดปุ่มทักไลน์ OA มาเอง (ข้อความมีรหัส C-xx / ชื่อ / เบอร์)"} — ตรวจสลิปแล้วกด ✅ แล้วนัดวัน-เวลากับลูกค้าในแชท LINE OA</p>
+                <p style={{fontSize:12,color:"var(--mu)",marginBottom:12,lineHeight:1.6}}>ลูกค้าเลือกคอร์สและโอนเงินในเว็บ {coachPushEnabled ? "ระบบส่งข้อความเข้า LINE OA ของลูกค้าให้แล้ว" : "แล้วกดปุ่มทักไลน์ OA มาเอง (ข้อความมีรหัส C-xx / ชื่อ / เบอร์)"} — ตรวจสลิปแล้วกด ✅ → คุยนัดวัน-เวลากับลูกค้าในแชท LINE OA → ไปแท็บ <b>➕ จองแทน</b> ใส่เบอร์ลูกค้า เลือก "👤 ตัดสิทธิ์คอร์สโค้ช" ลงวัน-เวลาและชื่อโค้ช (ระบบตัดสิทธิ์ให้เอง ลูกค้าเห็นนัดใน "การจองของฉัน")</p>
                 <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
                   {[["open", `รอดำเนินการ (${openN})`], ["confirmed", "ยืนยันแล้ว"], ["all", "ทั้งหมด"]].map(([v, label]) => (
                     <button key={v} onClick={() => setCoachFilter(v)} style={{padding:"8px 14px",borderRadius:20,border:`1.5px solid ${coachFilter === v ? "var(--or)" : "var(--dv)"}`,background:coachFilter === v ? "var(--or-bg)" : "#fff",color:coachFilter === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
@@ -3662,7 +3761,7 @@ function AdminDashboard({ token, onLogout }) {
                           )}
                           {o.status === "confirmed" && (
                             <>
-                              <span style={{fontSize:13,fontWeight:700,color:"var(--br)"}}>เรียนแล้ว {o.sessions_used || 0} / {o.sessions} ครั้ง</span>
+                              <span style={{fontSize:13,fontWeight:700,color:"var(--br)"}} title="ระบบตัดให้อัตโนมัติเมื่อนัดผ่านแท็บ จองแทน — ปุ่ม + / − ใช้แก้จำนวนด้วยมือเท่านั้น">ใช้สิทธิ์แล้ว {o.sessions_used || 0} / {o.sessions} ครั้ง</span>
                               <button disabled={busy || (o.sessions_used || 0) <= 0} onClick={() => adjustCoach(o, -1)} style={{width:34,height:34,borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",fontWeight:800,fontSize:16,cursor:"pointer"}}>−</button>
                               <button disabled={busy || (o.sessions_used || 0) >= o.sessions} onClick={() => adjustCoach(o, 1)} style={{width:34,height:34,borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:800,fontSize:16,cursor:"pointer"}}>+</button>
                               <button disabled={busy} onClick={() => cancelCoach(o)} style={{marginLeft:"auto",padding:"7px 12px",borderRadius:8,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:12,cursor:"pointer"}}>ยกเลิกคำสั่งซื้อ</button>
@@ -4143,7 +4242,7 @@ function AdminDashboard({ token, onLogout }) {
                             <div key={b.id} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,padding:"9px 2px",borderBottom:"1px solid var(--dv)"}}>
                               <div style={{minWidth:0}}>
                                 <div style={{fontWeight:700,fontSize:13.5,color:"var(--br)"}}>{fmtDay(b.booking_date)} • {fmtRange(b)}</div>
-                                <div style={{fontSize:11.5,color:"var(--mu)",marginTop:2}}>Court {b.court_id}{b.group_id ? " 🔗 คู่" : ""} • จองเมื่อ {bookedAt(b)}{b.booked_by === "admin" ? " • 📞 แอดมินจอง" : ""}</div>
+                                <div style={{fontSize:11.5,color:"var(--mu)",marginTop:2}}>Court {b.court_id}{b.group_id ? " 🔗 คู่" : ""} • จองเมื่อ {bookedAt(b)}{b.booked_by === "admin" ? " • 📞 แอดมินจอง" : ""}{b.coach_name ? ` • 👤 โค้ช ${b.coach_name}` : ""}</div>
                               </div>
                               <div style={{textAlign:"right",flexShrink:0}}>
                                 <div style={{fontSize:12.5,fontWeight:700,color:c}}>{t}</div>
