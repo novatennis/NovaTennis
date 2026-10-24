@@ -240,7 +240,11 @@ function coachQuote(audience, type, sessions) {
 const coachLabel = (o) => `${o.type === "duo" ? "Private Duo (2 คน : 1 โค้ช)" : "Private (1 คน : 1 โค้ช)"} • ${o.audience === "kid" ? "เด็ก" : "ผู้ใหญ่"} • ${Number(o.sessions) === 1 ? "ครั้งเดียว" : `แพ็ค ${o.sessions} ครั้ง`}`;
 const publicCoachOrder = (r) => ({ id: r.id, customer_name: r.customer_name, customer_id: r.customer_id, audience: r.audience, type: r.type, sessions: r.sessions, people: r.people, price: r.price, learner_note: r.learner_note, status: r.status, sessions_used: r.sessions_used || 0, line_pushed: !!r.line_pushed, created_time: r.created_time });
 
-// ส่งข้อความจาก LINE OA ไปหาลูกค้า (ต้องเป็นเพื่อน OA และยังไม่ได้บล็อก; นับโควตาข้อความของแผน OA) — ล้มเหลวแล้วไม่ทำให้การสั่งซื้อพัง คืน false ให้หน้าเว็บโชว์ปุ่มสำรอง
+// สวิตช์ส่งข้อความอัตโนมัติจาก OA ไปหาลูกค้า — ปิดไว้เป็นค่าตั้งต้น (ตอนนี้ใช้แบบ "ให้ลูกค้ากดปุ่มทักไลน์ OA เอง")
+// เปิดโดยตั้ง Environment Variable  COACH_LINE_PUSH=on  ที่ Vercel (ต้องมี LINE_CHANNEL_ACCESS_TOKEN ด้วย) แล้ว Redeploy — ไม่ต้องแก้โค้ด
+const coachPushOn = () => process.env.COACH_LINE_PUSH === "on";
+
+// ส่งข้อความจาก LINE OA ไปหาลูกค้า (ต้องเป็นเพื่อน OA และยังไม่ได้บล็อก; นับโควตาข้อความของแผน OA) — ล้มเหลวแล้วไม่ทำให้การสั่งซื้อพัง คืน false ให้หน้าเว็บโชว์ปุ่มทักไลน์แทน
 async function pushLine(to, text) {
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
   if (!token || !to) return false;
@@ -360,16 +364,18 @@ export default async function handler(req, res) {
         if (!ins.ok || !order) { console.error("createCoachOrder insert failed:", ins.body); res.status(500).json({ error: "insert_failed" }); return; }
 
         // ส่งข้อความเข้า LINE OA ของลูกค้าทันที (ให้เกิดห้องแชทใน OA และแอดมินรู้ว่าลูกค้าคือใคร ทักกลับได้ แม้ลูกค้ายังไม่จ่ายเงิน)
-        const pushed = await pushLine(who.userId, coachCreatedText(order));
+        const pushed = coachPushOn() ? await pushLine(who.userId, coachCreatedText(order)) : false;
         if (pushed) await sb(`coach_orders?id=eq.${order.id}`, { method: "PATCH", body: JSON.stringify({ line_pushed: true }) });
         await notifyTelegram(
           `🎓 <b>มีคำขอเรียนกับโค้ชใหม่ (ยังไม่ชำระ)</b>\n\n` +
           `👤 ${esc(who.name)} (LINE)\n📞 ${who.phone}\n` +
           `📚 ${esc(coachLabel(order))}\n💰 ฿${Number(order.price).toLocaleString()}\n` +
           (note ? `📝 ผู้เรียน: ${esc(note)}\n` : "") +
-          `💬 ส่งข้อความเข้า LINE OA ของลูกค้า: ${pushed ? "สำเร็จ ✅" : "ไม่สำเร็จ ❌ (ลูกค้าอาจบล็อก OA / โควตาหมด / ยังไม่ได้ตั้งค่า token) — กรุณาติดต่อลูกค้าเอง"}`
+          (coachPushOn()
+            ? `💬 ส่งข้อความเข้า LINE OA ของลูกค้า: ${pushed ? "สำเร็จ ✅" : "ไม่สำเร็จ ❌ (ลูกค้าอาจบล็อก OA / โควตาหมด / ยังไม่ได้ตั้งค่า token) — กรุณาติดต่อลูกค้าเอง"}`
+            : `💬 รอลูกค้ากดปุ่ม "ทักไลน์ OA" เอง — ข้อความจะมีรหัส C-${order.id} (ถ้ายังไม่ทักมา ติดต่อที่เบอร์ ${who.phone})`)
         );
-        res.status(200).json({ order: publicCoachOrder({ ...order, line_pushed: pushed }), linePushed: pushed });
+        res.status(200).json({ order: publicCoachOrder({ ...order, line_pushed: pushed }), linePushed: pushed, pushEnabled: coachPushOn() });
         return;
       }
 
