@@ -2405,12 +2405,12 @@ function CancelPage({ lang="th", initialPhone="", lockedPhone="", onResumeCoach 
       <div style={{marginTop:18,background:"#fff",border:"1px solid var(--dv)",borderRadius:"var(--r)",padding:"16px 18px",boxShadow:"var(--sh)"}}>
         <p style={{fontWeight:800,color:"var(--br)",fontSize:14.5,marginBottom:6}}>{lang==="th" ? "ต้องการยกเลิกหรือสอบถามเรื่องการจอง?" : "Need to cancel or ask about a booking?"}</p>
         <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7,marginBottom:12}}>
-          {lang==="th" ? "หลังส่งสลิปหรือยืนยันการจองแล้ว ยกเลิกเองในระบบไม่ได้ กรุณาติดต่อร้านทาง LINE หรือโทรศัพท์" : "Once a slip is submitted or a booking is confirmed, it can't be cancelled online. Please contact us via LINE or phone."}
+          {lang==="th" ? "หลังส่งสลิปหรือยืนยันการจองแล้ว ยกเลิกเองในระบบไม่ได้ กรุณาติดต่อคอร์ททาง LINE หรือโทรศัพท์" : "Once a slip is submitted or a booking is confirmed, it can't be cancelled online. Please contact us via LINE or phone."}
           <br />
-          {lang==="th" ? "ตามเงื่อนไขของร้าน: สงวนสิทธิ์การเลื่อนจอง และไม่คืนค่าบริการทุกกรณี" : "Per our conditions: no rescheduling and no refunds under any circumstances."}
+          {lang==="th" ? "ตามเงื่อนไขของคอร์ท: สงวนสิทธิ์การเลื่อนจอง และไม่คืนค่าบริการทุกกรณี" : "Per our conditions: no rescheduling and no refunds under any circumstances."}
         </p>
         <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
-          <a href={LINE_OA_URL} target="_blank" rel="noopener noreferrer" style={{flex:1,minWidth:140,textAlign:"center",padding:"11px 12px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>💬 LINE @347mlhra</a>
+          <a href={LINE_OA_URL} target="_blank" rel="noopener noreferrer" style={{flex:1,minWidth:140,textAlign:"center",padding:"11px 12px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>💬 LINE</a>
           <a href={adminTel()} style={{flex:1,minWidth:140,textAlign:"center",padding:"11px 12px",borderRadius:10,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--br)",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>📞 {ADMIN_CONTACT_PHONE}</a>
         </div>
       </div>
