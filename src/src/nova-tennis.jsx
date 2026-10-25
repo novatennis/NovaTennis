@@ -1994,7 +1994,55 @@ const coachStatusInfo = (s, lang = "th") => {
   return { text: th ? "รอชำระเงิน" : "Awaiting payment", color: "var(--mu)" };
 };
 
-function CoachPage({ lang="th", lineSession, onLinkPhone, resume, onResumeUsed }) {
+// กล่อง "คอร์สเรียนกับโค้ชของฉัน": คอร์สที่ซื้อไว้ สถานะ ใช้สิทธิ์แล้ว/เหลือ นัดหมายที่แอดมินลงให้ และปุ่มทักไลน์ OA — แสดงบนสุดของหน้า "เรียนโค้ช" (เฉพาะคนที่เคยซื้อ)
+function MyCoachCourses({ orders, bookings, lang="th", onPay }) {
+  const t = T[lang];
+  if (!orders || orders.length === 0) return null;
+  return (
+          <div style={{marginBottom:8}}>
+            <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:10}}>👤 {lang==="th" ? "คอร์สเรียนกับโค้ชของฉัน" : "My coaching courses"}</p>
+            <div style={{display:"flex",flexDirection:"column",gap:12}}>
+              {orders.map(o => {
+                const st = coachStatusInfo(o.status, lang);
+                return (
+                  <div key={o.id} className="card">
+                    <div style={{padding:"14px 16px"}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:10}}>
+                        <span style={{fontWeight:700,color:"var(--br)",fontSize:13.5,lineHeight:1.4}}>{coachLabel(o, lang)}</span>
+                        <span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 10px",borderRadius:20,whiteSpace:"nowrap"}}>{st.text}</span>
+                      </div>
+                      <Row label={t.rowPrice} val={`฿${o.price?.toLocaleString()}`} />
+                      {o.status === "confirmed" && <Row label={lang==="th" ? "ใช้สิทธิ์แล้ว" : "Used"} val={`${o.sessions_used} / ${o.sessions} ${lang==="th" ? "ครั้ง" : "sessions"} (${lang==="th" ? "เหลือ" : "left"} ${o.sessions - o.sessions_used})`} />}
+                      {o.status === "confirmed" && (() => {
+                        const mine = bookings.filter(b => b.coach_order_id === o.id && b.status !== "cancelled").sort((x, y) => String(x.booking_date).localeCompare(String(y.booking_date)) || ((x.hour||0)*60 + (x.start_minute||0)) - ((y.hour||0)*60 + (y.start_minute||0)));
+                        if (mine.length === 0) return null;
+                        return (
+                          <div style={{margin:"6px 0 10px",padding:"10px 12px",background:"var(--cr)",borderRadius:10}}>
+                            <p style={{fontSize:12,fontWeight:700,color:"var(--br)",marginBottom:6}}>📅 {lang==="th" ? "นัดหมายที่แอดมินลงให้แล้ว" : "Scheduled lessons"}</p>
+                            {mine.map((b, i) => {
+                              const s = (b.hour||0)*60 + (b.start_minute||0);
+                              return <p key={b.id} style={{fontSize:12.5,color:"var(--tx)",lineHeight:1.7}}>{i + 1}. {new Date(b.booking_date + "T00:00:00").toLocaleDateString(lang==="th" ? "th-TH" : "en-GB", { weekday: "short", day: "numeric", month: "short" })} • {minutesToLabel(s)}–{minutesToLabel(s + (b.duration_minutes||60))} • Court {b.court_id}{b.coach_name ? ` • 👤 ${b.coach_name}` : ""}</p>;
+                            })}
+                          </div>
+                        );
+                      })()}
+                      {o.status === "pending" && onPay && (
+                        <button onClick={() => onPay(o)} style={{width:"100%",marginTop:4,padding:"11px",borderRadius:10,border:"none",background:"linear-gradient(90deg,var(--or),var(--or2))",color:"#fff",fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{lang==="th" ? "ไปชำระเงิน →" : "Go to payment →"}</button>
+                      )}
+                      {o.status === "reviewing" && <p style={{fontSize:12,color:"var(--mu)",lineHeight:1.6}}>{lang==="th" ? "ทางร้านกำลังตรวจสอบสลิป แล้วจะนัดวัน-เวลาเรียนทาง LINE OA" : "We're verifying your slip, then will schedule your lesson on LINE OA."}</p>}
+                      {o.status === "confirmed" && <p style={{fontSize:12,color:"var(--mu)",lineHeight:1.6}}>{lang==="th" ? "แอดมินจะนัดวัน-เวลาเรียนกับคุณทาง LINE OA (หรือส่งวัน-เวลาที่สะดวกมาในแชทได้เลย)" : "Our admin will schedule your lessons on LINE OA (or message us your preferred times)."}</p>}
+                      <a href={oaChatUrl(coachChatText(o, lang))} target="_blank" rel="noopener noreferrer" style={{display:"block",textAlign:"center",marginTop:10,padding:"10px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>💬 {lang==="th" ? "ทักไลน์ OA เพื่อนัดวัน-เวลา" : "Message LINE OA"}</a>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+      
+  );
+}
+
+function CoachPage({ lang="th", lineSession, onLinkPhone }) {
   const th = lang === "th";
   const lineName = toFormName(lineSession?.displayName || lineSession?.name) || "ลูกค้า LINE";
   const [items, setItems] = useState(null);
@@ -2012,8 +2060,14 @@ function CoachPage({ lang="th", lineSession, onLinkPhone, resume, onResumeUsed }
   const loadCatalog = () => { setLoadErr(false); db.coachCatalog().then(r => (r ? setItems(r) : setLoadErr(true))).catch(() => setLoadErr(true)); };
   useEffect(() => { loadCatalog(); }, []);
   useEffect(() => { if (lineSession?.phone) setPhone(lineSession.phone); }, [lineSession?.phone]);
-  // เปิดกลับมาจากหน้า "การจองของฉัน" เพื่อชำระเงินคำสั่งซื้อที่ค้างอยู่
-  useEffect(() => { if (resume?.order) { setOrder(resume.order); setLinePushed(!!resume.order.line_pushed); onResumeUsed?.(); } }, [resume]); // eslint-disable-line react-hooks/exhaustive-deps
+  // คอร์สที่ลูกค้าเคยซื้อ + นัดหมายที่แอดมินลงให้ (ไว้แสดงกล่อง "คอร์สเรียนกับโค้ชของฉัน" ด้านบนสุด)
+  const [myOrders, setMyOrders] = useState([]);
+  const [myBookings, setMyBookings] = useState([]);
+  const loadMy = () => {
+    db.myCoachOrders().then(setMyOrders).catch(() => {});
+    if (lineSession?.phone) db.myBookings(lineSession.phone).then(setMyBookings).catch(() => {});
+  };
+  useEffect(() => { loadMy(); }, [lineSession?.phone]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const phoneOk = /^[0-9]{10}$/.test(phone);
   const phoneLocked = !!lineSession?.phone;
@@ -2048,7 +2102,7 @@ function CoachPage({ lang="th", lineSession, onLinkPhone, resume, onResumeUsed }
     setOrder(r.order); setLinePushed(r.linePushed);
   };
 
-  if (order) return <CoachPaymentView order={order} linePushed={linePushed} lang={lang} onDone={() => { setOrder(null); setSel(null); setNote(""); }} />;
+  if (order) return <CoachPaymentView order={order} linePushed={linePushed} lang={lang} onDone={() => { setOrder(null); setSel(null); setNote(""); loadMy(); }} />;
 
   const TYPES = [
     { type: "duo", title: "PRIVATE DUO", sub: th ? "2 คน : 1 โค้ช" : "2 people : 1 coach", tag: th ? "เรียนเป็นคู่ สนุกขึ้น พัฒนาด้วยกัน" : "Learn together, grow together", icon: "👥", accent: "#F47E1F" },
@@ -2060,8 +2114,17 @@ function CoachPage({ lang="th", lineSession, onLinkPhone, resume, onResumeUsed }
     <div style={{padding:"20px 16px 110px",display:"flex",flexDirection:"column",gap:18}} className="fu">
       <section>
         <h2 className="bb" style={{fontSize:26,color:"var(--br)",marginBottom:4}}>{th ? "เรียนกับโค้ช" : "Train with a Coach"}</h2>
-        <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7}}>{th ? "สนาม + โค้ช + อุปกรณ์ รวมในราคา — ไม่ต้องเลือกวัน-เวลาในเว็บ ชำระเงินแล้วแอดมินจะนัดวัน-เวลากับคุณทาง LINE OA" : "Court + coach + equipment all included. No need to pick a date or time here — after payment our admin will schedule it with you on LINE."}</p>
+        {myOrders.length === 0 && <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7}}>{th ? "สนาม + โค้ช + อุปกรณ์ รวมในราคา — ไม่ต้องเลือกวัน-เวลาในเว็บ ชำระเงินแล้วแอดมินจะนัดวัน-เวลากับคุณทาง LINE OA" : "Court + coach + equipment all included. No need to pick a date or time here — after payment our admin will schedule it with you on LINE."}</p>}
       </section>
+
+      <MyCoachCourses orders={myOrders} bookings={myBookings} lang={lang} onPay={(o) => { setOrder(o); setLinePushed(!!o.line_pushed); }} />
+
+      {myOrders.length > 0 && (
+        <section>
+          <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:4}}>🛒 {th ? "ซื้อคอร์สเพิ่ม" : "Buy another course"}</p>
+          <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7}}>{th ? "สนาม + โค้ช + อุปกรณ์ รวมในราคา — ไม่ต้องเลือกวัน-เวลาในเว็บ ชำระเงินแล้วแอดมินจะนัดวัน-เวลากับคุณทาง LINE OA" : "Court + coach + equipment all included. No need to pick a date or time here — after payment our admin will schedule it with you on LINE."}</p>
+        </section>
+      )}
 
       <section style={{background:"var(--bl-bg)",border:"1px solid rgba(141,182,199,.4)",borderRadius:12,padding:"12px 14px"}}>
         {(th ? ["เลือกคอร์สด้านล่าง", "ชำระเงินและส่งสลิป", "กดปุ่ม \"ทักไลน์ OA\" (ข้อความถูกเตรียมไว้ให้แล้ว แค่กดส่ง) แอดมินจะนัดวัน-เวลาเรียนกับคุณในแชทนั้น"] : ["Choose a course below", "Pay and upload your slip", "Tap \"Message LINE OA\" (the text is prefilled — just send) and our admin will schedule your lesson in that chat"]).map((txt, i) => (
@@ -2287,10 +2350,8 @@ function CoachPaymentView({ order, linePushed, lang="th", onDone }) {
 
 
 // ─── Cancel / Check Booking Page ─────────────────────────────────────────────
-function CancelPage({ lang="th", initialPhone="", lockedPhone="", onResumeCoach }) {
+function CancelPage({ lang="th", initialPhone="", lockedPhone="" }) {
   const t = T[lang];
-  const [coachOrders, setCoachOrders] = useState([]);
-  useEffect(() => { if (lockedPhone) db.myCoachOrders().then(setCoachOrders).catch(() => {}); }, [lockedPhone]);
   const [phone, setPhone] = useState(lockedPhone || initialPhone);
   useEffect(() => { if (lockedPhone) setPhone(lockedPhone); }, [lockedPhone]); // ผูก LINE แล้ว → ดูได้เฉพาะการจองของเบอร์ตัวเอง
   const [bookings, setBookings] = useState([]);
@@ -2323,6 +2384,7 @@ function CancelPage({ lang="th", initialPhone="", lockedPhone="", onResumeCoach 
   return (
     <div style={{padding:"20px 16px 100px"}} className="fu">
       <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:20}}>{t.myBookings}</h2>
+      <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:10}}>📅 {lang==="th" ? "ประวัติการจอง" : "Booking history"}</p>
       <div style={{display:"flex",gap:8,marginBottom:20}}>
         <input value={phone} readOnly={!!lockedPhone} onChange={e => { if (!lockedPhone) setPhone(e.target.value.replace(/\D/g,"").slice(0,10)); }}
           placeholder={t.searchPlaceholder} inputMode="numeric"
@@ -2359,48 +2421,6 @@ function CancelPage({ lang="th", initialPhone="", lockedPhone="", onResumeCoach 
           );
         })}
       </div>
-
-      {coachOrders.length > 0 && (
-        <div style={{marginTop:20}}>
-          <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:10}}>👤 {lang==="th" ? "คอร์สเรียนกับโค้ชของฉัน" : "My coaching courses"}</p>
-          <div style={{display:"flex",flexDirection:"column",gap:12}}>
-            {coachOrders.map(o => {
-              const st = coachStatusInfo(o.status, lang);
-              return (
-                <div key={o.id} className="card">
-                  <div style={{padding:"14px 16px"}}>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:10}}>
-                      <span style={{fontWeight:700,color:"var(--br)",fontSize:13.5,lineHeight:1.4}}>{coachLabel(o, lang)}</span>
-                      <span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 10px",borderRadius:20,whiteSpace:"nowrap"}}>{st.text}</span>
-                    </div>
-                    <Row label={t.rowPrice} val={`฿${o.price?.toLocaleString()}`} />
-                    {o.status === "confirmed" && <Row label={lang==="th" ? "ใช้สิทธิ์แล้ว" : "Used"} val={`${o.sessions_used} / ${o.sessions} ${lang==="th" ? "ครั้ง" : "sessions"} (${lang==="th" ? "เหลือ" : "left"} ${o.sessions - o.sessions_used})`} />}
-                    {o.status === "confirmed" && (() => {
-                      const mine = bookings.filter(b => b.coach_order_id === o.id && b.status !== "cancelled").sort((x, y) => String(x.booking_date).localeCompare(String(y.booking_date)) || ((x.hour||0)*60 + (x.start_minute||0)) - ((y.hour||0)*60 + (y.start_minute||0)));
-                      if (mine.length === 0) return null;
-                      return (
-                        <div style={{margin:"6px 0 10px",padding:"10px 12px",background:"var(--cr)",borderRadius:10}}>
-                          <p style={{fontSize:12,fontWeight:700,color:"var(--br)",marginBottom:6}}>📅 {lang==="th" ? "นัดหมายที่แอดมินลงให้แล้ว" : "Scheduled lessons"}</p>
-                          {mine.map((b, i) => {
-                            const s = (b.hour||0)*60 + (b.start_minute||0);
-                            return <p key={b.id} style={{fontSize:12.5,color:"var(--tx)",lineHeight:1.7}}>{i + 1}. {new Date(b.booking_date + "T00:00:00").toLocaleDateString(lang==="th" ? "th-TH" : "en-GB", { weekday: "short", day: "numeric", month: "short" })} • {minutesToLabel(s)}–{minutesToLabel(s + (b.duration_minutes||60))} • Court {b.court_id}{b.coach_name ? ` • 👤 ${b.coach_name}` : ""}</p>;
-                          })}
-                        </div>
-                      );
-                    })()}
-                    {o.status === "pending" && onResumeCoach && (
-                      <button onClick={() => onResumeCoach(o)} style={{width:"100%",marginTop:4,padding:"11px",borderRadius:10,border:"none",background:"linear-gradient(90deg,var(--or),var(--or2))",color:"#fff",fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{lang==="th" ? "ไปชำระเงิน →" : "Go to payment →"}</button>
-                    )}
-                    {o.status === "reviewing" && <p style={{fontSize:12,color:"var(--mu)",lineHeight:1.6}}>{lang==="th" ? "ทางร้านกำลังตรวจสอบสลิป แล้วจะนัดวัน-เวลาเรียนทาง LINE OA" : "We're verifying your slip, then will schedule your lesson on LINE OA."}</p>}
-                    {o.status === "confirmed" && <p style={{fontSize:12,color:"var(--mu)",lineHeight:1.6}}>{lang==="th" ? "แอดมินจะนัดวัน-เวลาเรียนกับคุณทาง LINE OA (หรือส่งวัน-เวลาที่สะดวกมาในแชทได้เลย)" : "Our admin will schedule your lessons on LINE OA (or message us your preferred times)."}</p>}
-                    <a href={oaChatUrl(coachChatText(o, lang))} target="_blank" rel="noopener noreferrer" style={{display:"block",textAlign:"center",marginTop:10,padding:"10px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>💬 {lang==="th" ? "ทักไลน์ OA เพื่อนัดวัน-เวลา" : "Message LINE OA"}</a>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
 
       <div style={{marginTop:18,background:"#fff",border:"1px solid var(--dv)",borderRadius:"var(--r)",padding:"16px 18px",boxShadow:"var(--sh)"}}>
         <p style={{fontWeight:800,color:"var(--br)",fontSize:14.5,marginBottom:6}}>{lang==="th" ? "ต้องการยกเลิกหรือสอบถามเรื่องการจอง?" : "Need to cancel or ask about a booking?"}</p>
@@ -2622,7 +2642,6 @@ export default function AppV2() {
 
   // จองด้วยสิทธิ์แพ็คเกจ — จ่ายไว้ล่วงหน้าแล้ว ยืนยันทันทีไม่ต้องผ่านหน้า QR/แนบสลิปอีก
   const [pkgBookingBusy, setPkgBookingBusy] = useState(false);
-  const [coachResume, setCoachResume] = useState(null); // เปิดหน้าชำระเงินคอร์สโค้ชที่ค้างอยู่ (มาจากหน้า "การจองของฉัน")
   // จองด้วยโค้ดส่วนลดที่ครอบคลุมทั้งยอด (฿0): สร้างการจองเป็น "รอแอดมินยืนยัน" ทันที ไม่ผ่านหน้า QR
   const handleConfirmFree = async ({ name, phone, discount }) => {
     if (!booking || pkgBookingBusy) return;
@@ -2840,8 +2859,8 @@ export default function AppV2() {
             <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} resumeBooking={resumeBooking} onCreated={(id, createdAt) => setResumeBooking({ id, createdAt })} onStartOver={resetBookingFlow} />
           )}
           {!blockedByLine && tab==="package" && <PackagePage lang={lang} lineSession={lineSession} onLineLogin={handleLineLogin} onLinkPhone={handleLinkPhone} />}
-          {!blockedByLine && tab==="coach" && <CoachPage lang={lang} lineSession={lineSession} onLinkPhone={handleLinkPhone} resume={coachResume} onResumeUsed={() => setCoachResume(null)} />}
-          {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone || lineSession?.phone || ""} lockedPhone={lineSession?.phone || ""} onResumeCoach={(o) => { setCoachResume({ order: o }); goTab("coach"); }} />}
+          {!blockedByLine && tab==="coach" && <CoachPage lang={lang} lineSession={lineSession} onLinkPhone={handleLinkPhone} />}
+          {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone || lineSession?.phone || ""} lockedPhone={lineSession?.phone || ""} />}
         </main>
         <TabBar tab={tab} setTab={goTab} lang={lang} />
       </div>
