@@ -575,6 +575,56 @@ export default async function handler(req, res) {
         res.status(200).json({ ok: true, sessions_used: next });
         return;
       }
+      case "customerStats": {
+        // สถิติลูกค้า: นับ "การจองที่ยืนยันแล้ว" ต่อเบอร์ (การจอง 2 สนามที่ group_id เดียวกันนับเป็น 1 ครั้ง) ตามวันที่ลูกค้าทำการจอง
+        // days = 7 / 30 / 90 = ช่วงล่าสุดกี่วัน, 0 = ทั้งหมด — ใช้ทำมุมมอง ลูกค้าใหม่ / จองซ้ำ / จองเยอะสุด ในหน้าลูกค้า
+        const days = [0, 7, 30, 90].includes(Number(p.days)) ? Number(p.days) : 30;
+        const rows = [];
+        for (let offset = 0; offset < 100000; offset += 1000) { // ดึงเป็นหน้าละ 1,000 แถว (ฐานข้อมูลจำกัดแถวต่อคำขอ)
+          const pg = await sb(`bookings?status=eq.confirmed&select=id,customer_id,group_id,price,created_time&order=created_time.asc,id.asc&limit=1000&offset=${offset}`);
+          if (!pg.ok || !Array.isArray(pg.body)) { res.status(500).json({ error: "stats_failed" }); return; }
+          rows.push(...pg.body);
+          if (pg.body.length < 1000) break;
+        }
+        const cutoff = days ? Date.now() - days * 86400000 : 0;
+        const per = {};
+        const seen = new Set();
+        for (const b of rows) {
+          const cid = String(b.customer_id || "");
+          if (!/^[0-9]{10}$/.test(cid)) continue; // เฉพาะเบอร์ลูกค้าจริง
+          const t = new Date(b.created_time).getTime();
+          if (!Number.isFinite(t)) continue;
+          const s = (per[cid] ||= { visits: 0, visitsInPeriod: 0, spent: 0, spentInPeriod: 0, first: t, last: t });
+          const price = Number(b.price) || 0;
+          s.spent += price; if (t >= cutoff) s.spentInPeriod += price;
+          const key = `${cid}|${b.group_id || b.id}`;
+          if (!seen.has(key)) { seen.add(key); s.visits += 1; if (t >= cutoff) s.visitsInPeriod += 1; }
+          if (t < s.first) s.first = t;
+          if (t > s.last) s.last = t;
+        }
+        const stats = {};
+        for (const [cid, s] of Object.entries(per)) {
+          stats[cid] = { visits: s.visits, visitsInPeriod: s.visitsInPeriod, spent: s.spent, spentInPeriod: s.spentInPeriod, firstCreated: new Date(s.first).toISOString(), lastCreated: new Date(s.last).toISOString(), isNew: days === 0 ? true : s.first >= cutoff };
+        }
+        const list = Object.values(per);
+        const active = list.filter((s) => s.visitsInPeriod >= 1);
+        const repeat = list.filter((s) => s.visitsInPeriod >= 2).length;
+        res.status(200).json({
+          stats,
+          summary: {
+            days,
+            totalCustomers: list.length,
+            active: active.length,                                                  // มีการจองในช่วงนี้
+            newCustomers: days === 0 ? list.length : list.filter((s) => s.first >= cutoff).length, // จองครั้งแรกในช่วงนี้
+            returning: days === 0 ? 0 : active.filter((s) => s.first < cutoff).length, // ลูกค้าเก่าที่กลับมาจองในช่วงนี้
+            repeat,                                                                  // จอง 2 ครั้งขึ้นไปในช่วงนี้
+            repeatRate: active.length ? Math.round((repeat / active.length) * 100) : 0,
+            visits: list.reduce((n, s) => n + s.visitsInPeriod, 0),
+            revenue: list.reduce((n, s) => n + s.spentInPeriod, 0),
+          },
+        });
+        return;
+      }
       case "unlinkLinePhone": {
         // ปลดล็อกเบอร์ที่ผูกกับบัญชี LINE (เช่นลูกค้ากรอกเบอร์ผิดตอนผูก หรือเปลี่ยนเบอร์จริง) — ลูกค้าจะได้ผูกเบอร์ใหม่ตอนจองครั้งถัดไป
         const { phone } = p;
