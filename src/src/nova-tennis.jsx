@@ -2874,6 +2874,15 @@ function AdminDashboard({ token, onLogout }) {
   const [bookings, setBookings] = useState([]);
   const [discounts, setDiscounts] = useState([]);
   const [customers, setCustomers] = useState([]);
+  // สถิติลูกค้า (นับการจองที่ยืนยันแล้วตามวันที่ลูกค้าจอง): ช่วงเวลา + มุมมอง (ทั้งหมด / ใหม่ / จองซ้ำ / จองเยอะสุด)
+  const [custPeriod, setCustPeriod] = useState(30);
+  const [custView, setCustView] = useState("all");
+  const [custStats, setCustStats] = useState(null); // { stats: {เบอร์: {...}}, summary: {...} } | { error }
+  const loadCustStats = async (days) => {
+    setCustStats(null);
+    const r = await callAdminAction("customerStats", token, { days });
+    setCustStats(r?.stats ? r : { error: true });
+  };
   const [loading, setLoading] = useState(true);
   const [date, setDate] = useState(toIso(new Date()));
   const [newCode, setNewCode] = useState("");
@@ -3285,7 +3294,7 @@ function AdminDashboard({ token, onLogout }) {
 
   useEffect(() => { loadQueue(); }, []);
   useEffect(() => { loadBookings(); }, [date]);
-  useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") loadCustomers(); if(tab==="report") loadReport(); if(tab==="closures") loadBlocks(); if(tab==="packages") { loadPkgQueue(); loadAllPkgs(); } }, [tab]);
+  useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") { loadCustomers(); loadCustStats(custPeriod); } if(tab==="report") loadReport(); if(tab==="closures") loadBlocks(); if(tab==="packages") { loadPkgQueue(); loadAllPkgs(); } }, [tab]);
 
   const updateStatus = async (id, status, packageId, groupId, coachOrderId) => {
     const msg = status === "confirmed"
@@ -4145,29 +4154,80 @@ function AdminDashboard({ token, onLogout }) {
           {tab==="customers" && (() => {
             const q = custQuery.trim().toLowerCase();
             const digits = q.replace(/\D/g, "");
-            const shown = !q ? customers : customers.filter(c =>
-              String(c.customer_name || "").toLowerCase().includes(q) ||
-              String(linkedPhones[c.customer_id] || "").toLowerCase().includes(q) ||
-              (digits.length > 0 && String(c.customer_id).includes(digits)));
+            const st = custStats?.stats || null;
+            const sm = custStats?.summary || null;
+            const S = (c) => st?.[c.customer_id] || null;
+            const fmtD = (iso) => { try { return parseUtc(iso).toLocaleDateString("th-TH", { day: "numeric", month: "short", year: "2-digit" }); } catch { return "-"; } };
+            const bySearch = (c) => !q || String(c.customer_name || "").toLowerCase().includes(q) || String(linkedPhones[c.customer_id] || "").toLowerCase().includes(q) || (digits.length > 0 && String(c.customer_id).includes(digits));
+            const vp = (c) => S(c)?.visitsInPeriod || 0;
+            let rows = customers.filter(bySearch);
+            if (custView === "new") rows = rows.filter(c => S(c) && S(c).isNew).sort((x, y) => String(S(y).firstCreated).localeCompare(String(S(x).firstCreated)));
+            else if (custView === "repeat") rows = rows.filter(c => vp(c) >= 2).sort((x, y) => vp(y) - vp(x) || (S(y).spentInPeriod - S(x).spentInPeriod));
+            else if (custView === "top") rows = rows.filter(c => vp(c) >= 1).sort((x, y) => vp(y) - vp(x) || (S(y).spentInPeriod - S(x).spentInPeriod)).slice(0, 20);
+            else rows = [...rows].sort((x, y) => String(S(y)?.lastCreated || "").localeCompare(String(S(x)?.lastCreated || "")));
+            const periodLabel = custPeriod === 0 ? "ทั้งหมด" : `${custPeriod} วันล่าสุด`;
+            const VIEWS = [["all", "👥 ทั้งหมด"], ["new", "🆕 ลูกค้าใหม่"], ["repeat", "🔁 จองซ้ำ"], ["top", "🏆 จองเยอะสุด"]];
+            const emptyMsg = custStats === null ? "⏳ กำลังโหลดสถิติ..." : custStats.error ? "โหลดสถิติไม่สำเร็จ — กด \"ลองใหม่\" ด้านบน (ยังดูรายชื่อทั้งหมดได้ที่มุมมอง \"ทั้งหมด\")" : custView === "new" ? "ไม่มีลูกค้าใหม่ในช่วงนี้" : custView === "repeat" ? "ยังไม่มีลูกค้าที่จองซ้ำ (2 ครั้งขึ้นไป) ในช่วงนี้" : custView === "top" ? "ยังไม่มีการจองในช่วงนี้" : "ไม่พบลูกค้าที่ตรงกับคำค้นหา";
+            const Kpi = ({ label, value, sub, onClick, on }) => (
+              <button onClick={onClick} style={{textAlign:"left",background:on ? "var(--or-bg)" : "#fff",border:`1.5px solid ${on ? "var(--or)" : "var(--dv)"}`,borderRadius:12,padding:"10px 12px",cursor:onClick ? "pointer" : "default",fontFamily:"'Noto Sans Thai',sans-serif",boxShadow:"var(--sh)"}}>
+                <span style={{display:"block",fontSize:11.5,color:"var(--mu)",fontWeight:600}}>{label}</span>
+                <span style={{display:"block",fontSize:24,fontWeight:800,color:"var(--br)",lineHeight:1.2}}>{value}</span>
+                {sub && <span style={{display:"block",fontSize:11,color:"var(--mu)"}}>{sub}</span>}
+              </button>
+            );
             return (
               <div>
+                <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:12,flexWrap:"wrap"}}>
+                  <span style={{fontSize:12.5,fontWeight:700,color:"var(--br)"}}>ช่วงเวลา (นับตามวันที่ลูกค้าจอง):</span>
+                  {[[7, "7 วัน"], [30, "30 วัน"], [90, "90 วัน"], [0, "ทั้งหมด"]].map(([d, label]) => (
+                    <button key={d} onClick={() => { setCustPeriod(d); loadCustStats(d); }} style={{padding:"6px 14px",borderRadius:20,border:`1.5px solid ${custPeriod === d ? "var(--or)" : "var(--dv)"}`,background:custPeriod === d ? "var(--or-bg)" : "#fff",color:custPeriod === d ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+                  ))}
+                </div>
+
+                {custStats?.error && <p style={{fontSize:13,color:"#c0392b",marginBottom:12}}>โหลดสถิติลูกค้าไม่สำเร็จ <button onClick={() => loadCustStats(custPeriod)} style={{marginLeft:6,padding:"3px 10px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",cursor:"pointer"}}>ลองใหม่</button></p>}
+                {sm && (
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,marginBottom:14}}>
+                    <Kpi label={`ลูกค้าที่จอง (${periodLabel})`} value={sm.active} sub={`จอง ${sm.visits} ครั้ง • ฿${sm.revenue.toLocaleString()}`} onClick={() => setCustView("top")} on={custView === "top"} />
+                    <Kpi label="🆕 ลูกค้าใหม่" value={sm.newCustomers} sub={custPeriod === 0 ? "ทุกคนที่เคยจอง" : "จองครั้งแรกในช่วงนี้"} onClick={() => setCustView("new")} on={custView === "new"} />
+                    <Kpi label="🔁 จองซ้ำ (2 ครั้งขึ้นไป)" value={sm.repeat} sub={`${sm.repeatRate}% ของลูกค้าที่จอง`} onClick={() => setCustView("repeat")} on={custView === "repeat"} />
+                    <Kpi label="↩️ ลูกค้าเก่ากลับมาจอง" value={custPeriod === 0 ? "-" : sm.returning} sub={custPeriod === 0 ? "ดูได้เมื่อเลือกช่วงเวลา" : "เริ่มจองก่อนช่วงนี้"} />
+                  </div>
+                )}
+
+                <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+                  {VIEWS.map(([v, label]) => (
+                    <button key={v} onClick={() => setCustView(v)} style={{padding:"8px 14px",borderRadius:20,border:`1.5px solid ${custView === v ? "var(--or)" : "var(--dv)"}`,background:custView === v ? "var(--or-bg)" : "#fff",color:custView === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+                  ))}
+                </div>
                 <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:12,flexWrap:"wrap"}}>
                   <input value={custQuery} onChange={e => setCustQuery(e.target.value)} placeholder="🔍 ค้นหาชื่อหรือเบอร์โทร..."
                     style={{flex:1,minWidth:200,padding:"10px 14px",borderRadius:10,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}} />
-                  <span style={{fontSize:12,color:"var(--mu)"}}>แสดง {shown.length} จาก {customers.length} คน</span>
+                  <span style={{fontSize:12,color:"var(--mu)"}}>
+                    {custView === "all" ? `แสดง ${rows.length} จาก ${customers.length} คน` : custView === "top" ? `20 อันดับแรก (${periodLabel}) • แสดง ${rows.length} คน` : `${rows.length} คน (${periodLabel})`}
+                  </span>
                 </div>
                 <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
-                  {shown.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่พบลูกค้าที่ตรงกับคำค้นหา</p> : (
+                  {rows.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>{emptyMsg}</p> : (
                     <table className="adm-table">
-                      <thead><tr><th>#</th><th>ชื่อ</th><th>เบอร์โทร</th><th>LINE</th><th>จัดการ</th></tr></thead>
+                      <thead><tr style={{whiteSpace:"nowrap"}}><th>#</th><th>ชื่อ</th><th>เบอร์โทร</th><th>{custPeriod === 0 ? "จอง (ครั้ง)" : `จอง (${custPeriod} วัน / ทั้งหมด)`}</th><th>ยอดรวม</th><th>จองครั้งแรก</th><th>จองล่าสุด</th><th>LINE</th><th>จัดการ</th></tr></thead>
                       <tbody>
-                        {shown.map((c,i) => {
+                        {rows.map((c,i) => {
                           const lineName = linkedPhones[c.customer_id];
+                          const s = S(c);
+                          const medal = custView === "top" ? (["🥇", "🥈", "🥉"][i] || null) : null;
                           return (
                             <tr key={c.customer_id}>
-                              <td style={{color:"var(--mu)"}}>{i+1}</td>
-                              <td style={{fontWeight:600}}>{c.customer_name}</td>
+                              <td style={{color:"var(--mu)",whiteSpace:"nowrap"}}>{medal || i+1}</td>
+                              <td style={{fontWeight:600,minWidth:170}}>
+                                {c.customer_name}
+                                {s?.isNew && custPeriod !== 0 && <span style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#1b5e3c",background:"#DFF0E5",padding:"1px 6px",borderRadius:8}}>ใหม่</span>}
+                                {s && s.visitsInPeriod >= 2 && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>จองซ้ำ</span>}
+                              </td>
                               <td style={{fontFamily:"monospace"}}>{c.customer_id}</td>
+                              <td style={{whiteSpace:"nowrap",fontWeight:700}}>{s ? (custPeriod === 0 ? s.visits : <>{s.visitsInPeriod} <span style={{fontWeight:400,color:"var(--mu)"}}>/ {s.visits}</span></>) : <span style={{color:"var(--mu)",fontWeight:400}}>0</span>}</td>
+                              <td style={{whiteSpace:"nowrap"}} title={s ? `ยอดทั้งหมด ฿${s.spent.toLocaleString()}` : ""}>{s ? `฿${(custPeriod === 0 ? s.spent : s.spentInPeriod).toLocaleString()}` : "-"}</td>
+                              <td style={{whiteSpace:"nowrap",fontSize:12.5}}>{s ? fmtD(s.firstCreated) : "-"}</td>
+                              <td style={{whiteSpace:"nowrap",fontSize:12.5}}>{s ? fmtD(s.lastCreated) : "-"}</td>
                               <td>{lineName
                                 ? <span style={{fontSize:12}}>🔗 {lineName} <button onClick={() => unlinkPhone(c.customer_id)} style={{marginLeft:6,padding:"3px 8px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:11,cursor:"pointer"}}>ปลดล็อกเบอร์</button></span>
                                 : <span style={{fontSize:12,color:"var(--mu)"}}>ยังไม่ผูก</span>}</td>
