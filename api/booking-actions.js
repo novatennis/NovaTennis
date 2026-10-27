@@ -861,7 +861,7 @@ export default async function handler(req, res) {
         if (me.error) { res.status(403).json({ error: me.error }); return; }
         if (me.phone && me.phone !== phone) { res.status(403).json({ error: "not_owner" }); return; }
         const { body } = await sb(`packages?customer_id=eq.${phone}&select=*&order=created_time.desc`);
-        let pkgs = await Promise.all((Array.isArray(body) ? body : []).map(async (pk) => (pk.status === "active" ? { ...pk, reserved_credits: await getReservedCredits(pk.id) } : pk)));
+        let pkgs = await Promise.all((Array.isArray(body) ? body : []).map(async ({ admin_note, ...pk }) => (pk.status === "active" ? { ...pk, reserved_credits: await getReservedCredits(pk.id) } : pk))); // admin_note = หมายเหตุภายในของแอดมิน ไม่ส่งให้ลูกค้า
         // ยังไม่ผูกเบอร์ (กำลังกรอกเบอร์เป็นครั้งแรกเพื่อให้ระบบหาสิทธิ์แพ็คเกจให้) → ส่งเฉพาะข้อมูลสิทธิ์ที่จำเป็น ไม่ส่งชื่อ/ราคา/สลิป
         if (!me.phone) pkgs = pkgs.map(({ id, tier, status, total_credits, remaining_credits, expiry_date, reserved_credits }) => ({ id, tier, status, total_credits, remaining_credits, expiry_date, reserved_credits }));
         res.status(200).json({ packages: pkgs });
