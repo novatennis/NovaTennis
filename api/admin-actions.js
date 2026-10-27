@@ -106,6 +106,27 @@ async function insertBookingsAtomic(rows) {
   return { rows: ins.body };
 }
 
+// ─── ขายแพ็คเกจสนาม/คอร์สโค้ชให้ลูกค้า (แอดมินบันทึกการรับเงินโอนแทนลูกค้า) ─────────────────
+// ราคา/อายุต้องตรงกับ api/booking-actions.js (PACKAGE_PRICES, COACH_PRICES) — มีเทสต์เทียบสองไฟล์ไว้ กันราคาไม่ตรงกันเมื่อมีใครแก้ไฟล์เดียว
+const PACKAGE_PRICES = {
+  offpeak: { 2: { price: 950, days: 7 }, 5: { price: 2350, days: 60 }, 10: { price: 4600, days: 90 } },
+  peak:    { 2: { price: 1150, days: 7 }, 5: { price: 2750, days: 60 }, 10: { price: 5000, days: 90 } },
+};
+const COACH_PRICES = {
+  adult: { private: { people: 1, 1: 1190, 5: 5750, 10: 11000 }, duo: { people: 2, 1: 750, 5: 3500, 10: 6500 } },
+  kid:   { private: { people: 1, 1: 1190, 5: 5750, 10: 11000 }, duo: { people: 2, 1: 699, 5: 3295, 10: 6290 } },
+};
+const COACH_SESSIONS = [1, 5, 10];
+function coachQuote(audience, type, sessions) {
+  const row = COACH_PRICES[audience]?.[type];
+  const n = Number(sessions);
+  if (!row || !COACH_SESSIONS.includes(n)) return null;
+  const perPerson = row[n];
+  return { audience, type, sessions: n, people: row.people, perPerson, total: perPerson * row.people };
+}
+const packageLabel = (tier, credits) => `แพ็คเกจ ${tier === "peak" ? "Peak" : "Off Peak"} ${credits} ครั้ง`;
+const SALE_COLUMN_RE = /sold_by|payment_method|admin_note|list_price/;
+
 // สวิตช์ส่งข้อความอัตโนมัติจาก OA ไปหาลูกค้า (ตั้ง COACH_LINE_PUSH=on ที่ Vercel เพื่อเปิด — ปิดไว้เป็นค่าตั้งต้น ใช้แบบให้ลูกค้ากดทักไลน์ OA เอง)
 const coachPushOn = () => process.env.COACH_LINE_PUSH === "on";
 // ส่งข้อความจาก LINE OA ไปหาลูกค้า (ต้องเป็นเพื่อน OA และไม่ได้บล็อก; นับโควตาข้อความของแผน OA) — ล้มเหลวแล้วคืน false ไม่ทำให้งานหลักพัง
@@ -623,6 +644,81 @@ export default async function handler(req, res) {
             revenue: list.reduce((n, s) => n + s.spentInPeriod, 0),
           },
         });
+        return;
+      }
+      case "sellCatalog": {
+        // รายการสินค้าและราคาป้าย สำหรับหน้า "ขายให้ลูกค้า" (หน้าเว็บไม่มีตารางราคาของตัวเอง ใช้จากที่นี่ที่เดียว)
+        const packages = [];
+        for (const tier of ["peak", "offpeak"]) for (const credits of [2, 5, 10]) packages.push({ tier, credits, price: PACKAGE_PRICES[tier][credits].price, days: PACKAGE_PRICES[tier][credits].days });
+        const coach = [];
+        for (const audience of ["adult", "kid"]) for (const type of ["duo", "private"]) for (const s of COACH_SESSIONS) coach.push(coachQuote(audience, type, s));
+        res.status(200).json({ packages, coach });
+        return;
+      }
+      case "sellToCustomer": {
+        // แอดมินบันทึกขายให้ลูกค้าที่โอนเงินแล้ว (ไม่ผ่านเว็บ): ใช้งานได้ทันที ไม่ต้องรอสลิป — รับเงินโอนอย่างเดียว
+        // ปลอดภัย: ราคาป้ายคิดที่เซิร์ฟเวอร์ / ลดราคาหรือแจกฟรีได้แต่ต้องมีหมายเหตุ / สูงกว่าป้ายไม่ได้ / กันกดซ้ำ / แจ้ง Telegram ทุกครั้ง
+        const { kind, customerId } = p;
+        if (!["package", "coach"].includes(kind)) { res.status(400).json({ error: "invalid_kind" }); return; }
+        if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid_phone" }); return; }
+
+        let list, label, def = null, quote = null;
+        if (kind === "package") {
+          def = PACKAGE_PRICES[p.tier]?.[Number(p.credits)];
+          if (!def) { res.status(400).json({ error: "invalid_product" }); return; }
+          list = def.price; label = packageLabel(p.tier, Number(p.credits));
+        } else {
+          quote = coachQuote(p.audience, p.type, p.sessions);
+          if (!quote) { res.status(400).json({ error: "invalid_product" }); return; }
+          list = quote.total; label = `คอร์สโค้ช ${coachLabel(quote)}`;
+        }
+        let price = list;
+        if (p.price !== undefined && p.price !== null && p.price !== "") {
+          price = Number(p.price);
+          if (!Number.isInteger(price) || price < 0 || price > list) { res.status(400).json({ error: "invalid_price" }); return; } // ลดได้ สูงกว่าป้ายไม่ได้
+        }
+        const note = String(p.note || "").normalize("NFC").replace(/\s+/g, " ").trim();
+        if (nameLen(note) > 200) { res.status(400).json({ error: "note_too_long" }); return; }
+        if (price !== list && nameLen(note) < 3) { res.status(400).json({ error: "note_required" }); return; } // ลดราคา/แจกฟรี ต้องมีเหตุผล
+
+        // ชื่อลูกค้า: ผูก LINE แล้วใช้ชื่อ LINE (เหมือนที่ลูกค้าซื้อเอง) ถ้ายังไม่ผูกใช้ชื่อที่แอดมินพิมพ์
+        const { body: lu } = await sb(`line_users?phone=eq.${customerId}&select=display_name,line_user_id&limit=1`);
+        const linked = Array.isArray(lu) ? lu[0] : null;
+        const name = Array.from(String(linked?.display_name || p.customerName || "").normalize("NFC").replace(/\s+/g, " ").trim()).slice(0, 40).join("");
+        if (nameLen(name) < 1) { res.status(400).json({ error: "invalid_name" }); return; }
+
+        // กันกดซ้ำ: สินค้าเดียวกัน เบอร์เดียวกัน ที่แอดมินขายภายใน 2 นาที
+        const table = kind === "package" ? "packages" : "coach_orders";
+        const since = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+        const { body: recent } = await sb(`${table}?customer_id=eq.${customerId}&sold_by=eq.admin&status=neq.cancelled&created_time=gte.${since}&select=*`);
+        if (!Array.isArray(recent)) { res.status(500).json({ error: "sale_columns_missing" }); return; } // ยังไม่ได้รัน add-admin-sale-columns.sql
+        const dup = recent.find((r) => kind === "package"
+          ? r.tier === p.tier && Number(r.total_credits) === Number(p.credits)
+          : r.audience === quote.audience && r.type === quote.type && Number(r.sessions) === quote.sessions);
+        if (dup) { res.status(409).json({ error: "duplicate_recent", id: dup.id }); return; }
+
+        const nowMs = Date.now();
+        const base = { customer_id: customerId, customer_name: name, price, list_price: list, sold_by: "admin", payment_method: price > 0 ? "transfer" : "free", admin_note: note || null };
+        const row = kind === "package"
+          ? { ...base, tier: p.tier, total_credits: Number(p.credits), remaining_credits: Number(p.credits), expiry_days: def.days, status: "active", activated_at: new Date(nowMs).toISOString(), expiry_date: packageExpiryDate(nowMs, def.days) }
+          : { ...base, line_user_id: linked?.line_user_id || null, audience: quote.audience, type: quote.type, sessions: quote.sessions, people: quote.people, status: "confirmed", confirmed_time: new Date(nowMs).toISOString(), sessions_used: 0 };
+
+        await sb(`customers`, { method: "POST", headers: { Prefer: "resolution=ignore-duplicates" }, body: JSON.stringify({ customer_id: customerId, customer_name: name }) });
+        const ins = await sb(table, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(row) });
+        const created = Array.isArray(ins.body) ? ins.body[0] : null;
+        if (!ins.ok || !created) {
+          if (SALE_COLUMN_RE.test(JSON.stringify(ins.body || ""))) { res.status(500).json({ error: "sale_columns_missing" }); return; }
+          console.error("sellToCustomer insert failed:", ins.body); res.status(500).json({ error: "insert_failed" }); return;
+        }
+        await notifyTelegram(
+          `🛒 <b>แอดมินบันทึกขาย${kind === "package" ? "แพ็คเกจสนาม" : "คอร์สโค้ช"}ให้ลูกค้า</b>\n\n` +
+          `📦 ${esc(label)}\n👤 ${esc(name)}\n📞 ${customerId}\n` +
+          `💰 ฿${price.toLocaleString()}${price !== list ? ` (ราคาป้าย ฿${list.toLocaleString()} • ลด ฿${(list - price).toLocaleString()})` : ""} • ${price > 0 ? "รับเงินโอนแล้ว" : "แจกฟรี"}\n` +
+          (note ? `📝 ${esc(note)}\n` : "") +
+          `ใช้งานได้ทันที — ${kind === "package" ? `ใช้เล่นได้ถึง ${row.expiry_date}` : `รหัสคอร์ส C-${created.id}`}`
+        );
+        const { line_user_id, ...pub } = created;
+        res.status(200).json({ ok: true, kind, item: pub, label, price, listPrice: list });
         return;
       }
       case "unlinkLinePhone": {
