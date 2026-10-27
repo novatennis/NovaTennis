@@ -3133,6 +3133,82 @@ function AdminDashboard({ token, onLogout }) {
     else loadCoach();
   };
 
+  // ── ขายแพ็คเกจสนาม/คอร์สโค้ชให้ลูกค้า (แอดมินบันทึกที่ลูกค้าโอนเงินแล้ว) ──
+  const [sl, setSl] = useState({ phone: "", name: "", kind: "package", tier: "peak", credits: 5, audience: "adult", type: "duo", sessions: 5, price: "", note: "" });
+  const [slCatalog, setSlCatalog] = useState(null);
+  const [slCatFail, setSlCatFail] = useState(false);
+  const [slInfo, setSlInfo] = useState(null);
+  const [slBusy, setSlBusy] = useState(false);
+  const [slMsg, setSlMsg] = useState(null);
+  const slAutoName = useRef("");
+  useEffect(() => {
+    if (tab !== "sell" || slCatalog) return;
+    setSlCatFail(false);
+    callAdminAction("sellCatalog", token, {}).then(r => { if (r?.packages && r?.coach) setSlCatalog(r); else setSlCatFail(true); }).catch(() => setSlCatFail(true));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
+  useEffect(() => {
+    setSlInfo(null);
+    setSl(prev => (slAutoName.current && prev.name === slAutoName.current ? (slAutoName.current = "", { ...prev, name: "" }) : prev)); // ชื่อที่ระบบเติมให้จากเบอร์ก่อนหน้า ไม่ให้ค้างไปเบอร์ใหม่
+    if (!/^[0-9]{10}$/.test(sl.phone)) return;
+    let cancelled = false;
+    callAdminAction("lookupCustomer", token, { phone: sl.phone }).then(r => {
+      if (cancelled || !r || r.error) return;
+      setSlInfo(r);
+      const known = r.lineName || r.name;
+      if (known) setSl(prev => { if (prev.phone !== sl.phone || prev.name) return prev; slAutoName.current = known; return { ...prev, name: known }; });
+    }).catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sl.phone]);
+  const slItem = !slCatalog ? null : sl.kind === "package"
+    ? slCatalog.packages.find(x => x.tier === sl.tier && x.credits === sl.credits) || null
+    : slCatalog.coach.find(x => x.audience === sl.audience && x.type === sl.type && x.sessions === sl.sessions) || null;
+  const slList = slItem ? (sl.kind === "package" ? slItem.price : slItem.total) : 0;
+  const slPrice = sl.price === "" ? slList : Number(sl.price);
+  const slPriceOk = !!slItem && Number.isInteger(slPrice) && slPrice >= 0 && slPrice <= slList;
+  const slNeedNote = !!slItem && slPriceOk && slPrice !== slList;
+  const slNoteOk = !slNeedNote || sl.note.trim().length >= 3;
+  const slLinked = !!slInfo?.linked && !!slInfo?.lineName;
+  const slNameOk = slLinked || (sl.name.trim().length >= 1 && Array.from(sl.name.trim()).length <= 40);
+  const slPhoneOk = /^[0-9]{10}$/.test(sl.phone);
+  const slCanSubmit = slPhoneOk && slNameOk && slPriceOk && slNoteOk && !slBusy;
+  const slLabel = !slItem ? "" : sl.kind === "package"
+    ? `แพ็คเกจสนาม ${sl.tier === "peak" ? "Peak" : "Off Peak"} ${sl.credits} ครั้ง`
+    : `คอร์สโค้ช ${coachLabel(slItem, "th")}`;
+  // วันสุดท้ายที่แพ็คเกจใช้เล่นได้ (ตรงกับเซิร์ฟเวอร์): วันที่บันทึก (เวลาไทย) นับเป็นวันที่ 1
+  const slExpiry = (days) => { const t = new Date(Date.now() + 7 * 3600e3); return new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate() + days - 1)).toLocaleDateString("th-TH", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }); };
+  const submitSell = async () => {
+    if (!slCanSubmit) return;
+    const name = slLinked ? slInfo.lineName : sl.name.trim();
+    if (!window.confirm(`ขาย ${slLabel}\nให้ ${name} (${sl.phone})\nราคา ฿${slPrice.toLocaleString()}${slPrice !== slList ? ` (ราคาป้าย ฿${slList.toLocaleString()} • ลด ฿${(slList - slPrice).toLocaleString()})` : ""} • ${slPrice > 0 ? "รับเงินโอนแล้ว" : "แจกฟรี"}\n${sl.kind === "package" ? `ใช้เล่นได้ถึง ${slExpiry(slItem.days)}` : "ใช้งานได้ทันที"}\n\nยืนยันการบันทึกการขาย?`)) return;
+    setSlBusy(true); setSlMsg(null);
+    let r = null;
+    try {
+      r = await callAdminAction("sellToCustomer", token, {
+        kind: sl.kind, customerId: sl.phone, customerName: name, price: slPrice, note: sl.note.trim(),
+        ...(sl.kind === "package" ? { tier: sl.tier, credits: sl.credits } : { audience: sl.audience, type: sl.type, sessions: sl.sessions }),
+      });
+    } catch { r = { error: "network_or_server" }; }
+    setSlBusy(false);
+    if (r?.ok) {
+      setSlMsg({ ok: true, phone: sl.phone, text: `✅ บันทึกการขายแล้ว: ${r.label} ให้ ${name} • ฿${r.price.toLocaleString()}${r.price !== r.listPrice ? ` (ราคาป้าย ฿${r.listPrice.toLocaleString()})` : ""} — ใช้งานได้ทันที` });
+      setSl(prev => ({ ...prev, phone: "", name: "", price: "", note: "" })); setSlInfo(null);
+    } else {
+      setSlMsg({ ok: false, text:
+        r?.error === "duplicate_recent" ? "❌ เพิ่งบันทึกรายการเดียวกันให้เบอร์นี้ไปเมื่อสักครู่ (กันกดซ้ำ) — ตรวจที่แท็บ แพ็คเกจ / โค้ช ก่อน"
+        : r?.error === "note_required" ? "❌ ลดราคา/แจกฟรี ต้องใส่หมายเหตุ (อย่างน้อย 3 ตัวอักษร)"
+        : r?.error === "invalid_price" ? "❌ ราคาต้องเป็นจำนวนเต็ม และไม่สูงกว่าราคาป้าย"
+        : r?.error === "invalid_name" ? "❌ กรุณาใส่ชื่อลูกค้า (ไม่เกิน 40 ตัวอักษร)"
+        : r?.error === "invalid_phone" ? "❌ เบอร์โทรต้องเป็นตัวเลข 10 หลัก"
+        : r?.error === "invalid_product" ? "❌ สินค้านี้ไม่มีในรายการขาย"
+        : r?.error === "note_too_long" ? "❌ หมายเหตุยาวเกิน 200 ตัวอักษร"
+        : r?.error === "sale_columns_missing" ? "❌ ยังไม่ได้รัน SQL — รันไฟล์ add-admin-sale-columns.sql ที่ Supabase ก่อน (ยังไม่มีการบันทึกใดๆ)"
+        : r?.error === "network_or_server" ? "❌ เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว และดู Vercel → Logs"
+        : `❌ บันทึกไม่สำเร็จ (${r?.error || "ไม่ทราบสาเหตุ"}) ลองใหม่อีกครั้ง` });
+    }
+  };
+
   const [pkgQueue, setPkgQueue] = useState([]);
   const [pkgQueueLoading, setPkgQueueLoading] = useState(true);
   const [allPkgs, setAllPkgs] = useState([]);
@@ -3391,7 +3467,7 @@ function AdminDashboard({ token, onLogout }) {
         </header>
 
         <div style={{background:"#fff",borderBottom:"1px solid var(--dv)",display:"flex",padding:"0 20px",overflowX:"auto"}}>
-          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["newbooking","➕ จองแทน"],["packages","🎟 แพ็คเกจ"],["coach","👤 โค้ช"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
+          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["newbooking","➕ จองแทน"],["sell","🛒 ขายให้ลูกค้า"],["packages","🎟 แพ็คเกจ"],["coach","👤 โค้ช"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
             <button key={id} onClick={() => setTab(id)} style={{padding:"13px 16px",background:"none",border:"none",borderBottom:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",fontWeight:tab===id?700:400,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
               {label}
             </button>
@@ -3575,6 +3651,103 @@ function AdminDashboard({ token, onLogout }) {
                     </tbody>
                   </table>
                 )}
+              </div>
+            </div>
+          )}
+
+          {tab==="sell" && (
+            <div style={{maxWidth:560}}>
+              <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:4}}>🛒 ขายให้ลูกค้า</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginBottom:14,lineHeight:1.6}}>บันทึกการขายแพ็คเกจสนามหรือคอร์สโค้ชที่ลูกค้า <b>โอนเงินแล้ว</b> (ไม่ผ่านเว็บ) — ใช้งานได้ทันที ไม่ต้องรอสลิป จากนั้นไปแท็บ "➕ จองแทน" เพื่อตัดสิทธิ์และลงวัน-เวลา</p>
+              {slCatFail && <p style={{fontSize:13,color:"#c0392b",marginBottom:12}}>โหลดรายการสินค้าไม่สำเร็จ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว <button onClick={() => { setSlCatFail(false); callAdminAction("sellCatalog", token, {}).then(r => { if (r?.packages && r?.coach) setSlCatalog(r); else setSlCatFail(true); }).catch(() => setSlCatFail(true)); }} style={{marginLeft:6,padding:"3px 10px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",cursor:"pointer"}}>ลองใหม่</button></p>}
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",padding:18,boxShadow:"var(--sh)",display:"flex",flexDirection:"column",gap:14}}>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>เบอร์โทรลูกค้า</label>
+                  <input value={sl.phone} onChange={e => setSl(p => ({ ...p, phone: e.target.value.replace(/\D/g, "").slice(0, 10) }))} inputMode="numeric" placeholder="0812345678"
+                    style={{width:"100%",padding:"11px 12px",borderRadius:8,border:`1.5px solid ${sl.phone && !slPhoneOk ? "#c0392b" : "var(--dv)"}`,fontSize:15,outline:"none"}} />
+                  {slInfo && <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"var(--mu)"}}>{slInfo.bookingsCount > 0 ? `เคยจอง ${slInfo.bookingsCount} รายการ` : "ลูกค้าใหม่ (ยังไม่เคยจอง)"} • {slInfo.linked ? `🔗 ผูก LINE แล้ว (${slInfo.lineName || "LINE"})` : "ยังไม่ผูก LINE (ลูกค้าไม่ต้องล็อกอินก็ใช้สิทธิ์ผ่านแอดมินได้)"}</p>}
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ชื่อลูกค้า {slLinked ? "(ใช้ชื่อจาก LINE)" : "(ไม่เกิน 40 ตัวอักษร)"}</label>
+                  <input value={slLinked ? slInfo.lineName : sl.name} readOnly={slLinked} maxLength={40} onChange={e => setSl(p => ({ ...p, name: e.target.value }))} placeholder="ชื่อลูกค้า"
+                    style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,outline:"none",background:slLinked ? "var(--cr2)" : "#fff",color:slLinked ? "var(--mu)" : "var(--tx)"}} />
+                </div>
+
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>สินค้า</label>
+                  <div style={{display:"flex",gap:8}}>
+                    {[["package", "🎟 แพ็คเกจสนาม"], ["coach", "👤 คอร์สโค้ช"]].map(([v, label]) => (
+                      <button key={v} onClick={() => setSl(p => ({ ...p, kind: v, price: "", note: "" }))} style={{flex:1,padding:"10px 6px",borderRadius:8,border:`2px solid ${sl.kind === v ? "var(--or)" : "var(--dv)"}`,background:sl.kind === v ? "var(--or-bg)" : "#fff",color:sl.kind === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13.5,cursor:"pointer"}}>{label}</button>
+                    ))}
+                  </div>
+                </div>
+
+                {!slCatalog && !slCatFail && <p style={{fontSize:13,color:"var(--mu)"}}>⏳ กำลังโหลดรายการสินค้า...</p>}
+                {slCatalog && sl.kind === "package" && (
+                  <>
+                    <div style={{display:"flex",gap:8}}>
+                      {[["peak", "Peak (ทุกช่วงเวลา)"], ["offpeak", "Off Peak (จ.–ศ. ก่อน 16:00)"]].map(([v, label]) => (
+                        <button key={v} onClick={() => setSl(p => ({ ...p, tier: v, price: "" }))} style={{flex:1,padding:"9px 6px",borderRadius:8,border:`2px solid ${sl.tier === v ? "var(--or)" : "var(--dv)"}`,background:sl.tier === v ? "var(--or-bg)" : "#fff",color:sl.tier === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>{label}</button>
+                      ))}
+                    </div>
+                    <div style={{display:"flex",gap:8}}>
+                      {[2, 5, 10].map(c => { const it = slCatalog.packages.find(x => x.tier === sl.tier && x.credits === c); return (
+                        <button key={c} onClick={() => setSl(p => ({ ...p, credits: c, price: "" }))} style={{flex:1,padding:"9px 4px",borderRadius:8,border:`2px solid ${sl.credits === c ? "var(--or)" : "var(--dv)"}`,background:sl.credits === c ? "var(--or-bg)" : "#fff",color:sl.credits === c ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>{c} ครั้ง<br /><span style={{fontWeight:600}}>฿{it?.price.toLocaleString()}</span></button>
+                      ); })}
+                    </div>
+                  </>
+                )}
+                {slCatalog && sl.kind === "coach" && (
+                  <>
+                    <div style={{display:"flex",gap:8}}>
+                      {[["adult", "🧑 ผู้ใหญ่"], ["kid", "🧒 เด็ก"]].map(([v, label]) => (
+                        <button key={v} onClick={() => setSl(p => ({ ...p, audience: v, price: "" }))} style={{flex:1,padding:"9px 6px",borderRadius:8,border:`2px solid ${sl.audience === v ? "var(--or)" : "var(--dv)"}`,background:sl.audience === v ? "var(--or-bg)" : "#fff",color:sl.audience === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer"}}>{label}</button>
+                      ))}
+                      {[["duo", "Private Duo (2 คน)"], ["private", "Private (1 คน)"]].map(([v, label]) => (
+                        <button key={v} onClick={() => setSl(p => ({ ...p, type: v, price: "" }))} style={{flex:1,padding:"9px 6px",borderRadius:8,border:`2px solid ${sl.type === v ? "var(--or)" : "var(--dv)"}`,background:sl.type === v ? "var(--or-bg)" : "#fff",color:sl.type === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>{label}</button>
+                      ))}
+                    </div>
+                    <div style={{display:"flex",gap:8}}>
+                      {[1, 5, 10].map(s => { const it = slCatalog.coach.find(x => x.audience === sl.audience && x.type === sl.type && x.sessions === s); return (
+                        <button key={s} onClick={() => setSl(p => ({ ...p, sessions: s, price: "" }))} style={{flex:1,padding:"9px 4px",borderRadius:8,border:`2px solid ${sl.sessions === s ? "var(--or)" : "var(--dv)"}`,background:sl.sessions === s ? "var(--or-bg)" : "#fff",color:sl.sessions === s ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>{s === 1 ? "ครั้งเดียว" : `แพ็ค ${s} ครั้ง`}<br /><span style={{fontWeight:600}}>฿{it?.total.toLocaleString()}{it?.people > 1 ? ` (${it.people} คน)` : ""}</span></button>
+                      ); })}
+                    </div>
+                  </>
+                )}
+
+                {slItem && (
+                  <div style={{background:"var(--or-bg)",border:"1px solid var(--dv)",borderRadius:10,padding:"10px 12px",fontSize:13,color:"var(--br)",lineHeight:1.7}}>
+                    <b>{slLabel}</b><br />
+                    ราคาตามป้าย <b style={{color:"var(--or)"}}>฿{slList.toLocaleString()}</b>
+                    {sl.kind === "package" ? <> • อายุ {slItem.days} วัน (วันที่บันทึกนับเป็นวันที่ 1) → ใช้เล่นได้ถึง <b>{slExpiry(slItem.days)}</b></> : <> • ใช้สิทธิ์ครั้งละ 60 นาที ({sl.sessions} ครั้ง)</>}
+                  </div>
+                )}
+
+                {slItem && (
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ราคาที่รับจริง (บาท) — เว้นว่าง = ตามราคาป้าย</label>
+                    <input value={sl.price} onChange={e => setSl(p => ({ ...p, price: e.target.value.replace(/\D/g, "").slice(0, 6) }))} inputMode="numeric" placeholder={String(slList)}
+                      style={{width:"100%",padding:"11px 12px",borderRadius:8,border:`1.5px solid ${sl.price !== "" && !slPriceOk ? "#c0392b" : "var(--dv)"}`,fontSize:15,outline:"none"}} />
+                    {sl.price !== "" && !slPriceOk && <p style={{fontSize:12,color:"#c0392b",fontWeight:600,marginTop:6}}>⚠️ ราคาสูงกว่าราคาป้าย (฿{slList.toLocaleString()}) ไม่ได้</p>}
+                    {slNeedNote && <p style={{fontSize:12,color:"#2d7a4f",fontWeight:600,marginTop:6}}>{slPrice === 0 ? "🎁 แจกฟรี" : `ลด ฿${(slList - slPrice).toLocaleString()} จากราคาป้าย`} — ต้องใส่หมายเหตุด้านล่าง</p>}
+                  </div>
+                )}
+                {slItem && (
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>หมายเหตุ {slNeedNote ? <span style={{color:"#c0392b"}}>(จำเป็น — ลดราคา/แจกฟรี)</span> : "(ไม่บังคับ เช่น โอนเข้าบัญชีไหน เวลาเท่าไร)"}</label>
+                    <input value={sl.note} maxLength={200} onChange={e => setSl(p => ({ ...p, note: e.target.value }))} placeholder="เช่น ส่วนลดพนักงาน / โอน 14:20 เข้าบัญชีบริษัท"
+                      style={{width:"100%",padding:"11px 12px",borderRadius:8,border:`1.5px solid ${slNeedNote && !slNoteOk ? "#c0392b" : "var(--dv)"}`,fontSize:14.5,outline:"none"}} />
+                  </div>
+                )}
+                {slItem && <p style={{fontSize:12.5,color:"var(--br)",background:"var(--cr)",borderRadius:8,padding:"8px 12px",margin:0}}>{slPrice === 0 && slPriceOk ? "🎁 แจกฟรี (ไม่มีการรับเงิน)" : "💳 รับเงินโอน — ใช้ได้เฉพาะกรณีลูกค้าโอนมาแล้ว"} • ใช้งานได้ทันที ไม่ต้องรอสลิป</p>}
+
+                {slMsg && <p style={{fontSize:13,fontWeight:600,color:slMsg.ok ? "#2d7a4f" : "#c0392b",lineHeight:1.6,margin:0}}>{slMsg.text}</p>}
+                {slMsg?.ok && (
+                  <button onClick={() => { setNb(p => ({ ...p, phone: slMsg.phone })); setTab("newbooking"); }} style={{padding:"11px",borderRadius:10,border:"1.5px solid var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:800,fontSize:14,cursor:"pointer"}}>➕ ไปจองแทน / ตัดสิทธิ์ให้ลูกค้ารายนี้</button>
+                )}
+                <button onClick={submitSell} disabled={!slCanSubmit} style={{padding:"14px",borderRadius:10,border:"none",background:slCanSubmit ? "linear-gradient(90deg,var(--or),var(--or2))" : "var(--cr2)",color:slCanSubmit ? "#fff" : "var(--mu)",fontWeight:800,fontSize:15,cursor:slCanSubmit ? "pointer" : "not-allowed"}}>
+                  {slBusy ? "กำลังบันทึก..." : "บันทึกการขาย"}
+                </button>
               </div>
             </div>
           )}
@@ -3776,7 +3949,8 @@ function AdminDashboard({ token, onLogout }) {
                           </div>
                           <span style={{fontSize:11.5,fontWeight:700,color:stCol,background:`${stCol}18`,padding:"3px 10px",borderRadius:20,whiteSpace:"nowrap"}}>{stTxt}</span>
                         </div>
-                        <p style={{fontSize:13.5,color:"var(--tx)",lineHeight:1.6}}>{coachLabel(o, "th")}</p>
+                        <p style={{fontSize:13.5,color:"var(--tx)",lineHeight:1.6}}>{coachLabel(o, "th")}{o.sold_by === "admin" && <span style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>📞 แอดมินขาย{o.list_price != null && o.price < o.list_price ? " (ลดราคา)" : ""}</span>}</p>
+                        {o.sold_by === "admin" && o.admin_note && <p style={{fontSize:12,color:"var(--mu)"}}>📝 {o.admin_note}</p>}
                         <p style={{fontSize:15,fontWeight:800,color:"var(--or)",margin:"2px 0 4px"}}>฿{o.price.toLocaleString()}{o.people > 1 ? <span style={{fontSize:11.5,fontWeight:500,color:"var(--mu)"}}> ({(o.price / o.people).toLocaleString()} × {o.people} คน)</span> : null}</p>
                         {o.learner_note && <p style={{fontSize:12.5,color:"var(--mu)"}}>📝 ผู้เรียน: {o.learner_note}</p>}
                         {o.slip_url && <a href={o.slip_url} target="_blank" rel="noopener noreferrer" style={{display:"inline-block",marginTop:6,fontSize:12.5,fontWeight:700,color:"var(--br)"}}>🧾 ดูสลิป</a>}
@@ -3817,7 +3991,7 @@ function AdminDashboard({ token, onLogout }) {
                         <tr key={pk.id}>
                           <td style={{fontWeight:600}}>{pk.customer_name || "-"}</td>
                           <td>{pk.customer_id}</td>
-                          <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits} ครั้ง</td>
+                          <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits} ครั้ง{pk.sold_by === "admin" && <span title={pk.admin_note || ""} style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>📞 แอดมินขาย{pk.price < pk.list_price ? " (ลดราคา)" : ""}</span>}</td>
                           <td style={{fontWeight:700,color:"var(--or)"}}>฿{pk.price?.toLocaleString()}</td>
                           <td>{pk.slip_url ? <a href={pk.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
                           <td><span style={{fontSize:12,fontWeight:600,color:pk.status==="reviewing"?"#e67e22":"var(--mu)"}}>{pk.status==="reviewing"?"🔍 รอการยืนยัน":"⏳ รอชำระ"}</span></td>
@@ -3862,7 +4036,7 @@ function AdminDashboard({ token, onLogout }) {
                           <tr key={pk.id}>
                             <td style={{fontWeight:600}}>{pk.customer_name || "-"}</td>
                             <td>{pk.customer_id}</td>
-                            <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits}</td>
+                            <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits}{pk.sold_by === "admin" && <span title={pk.admin_note || ""} style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>📞 แอดมินขาย{pk.list_price != null && pk.price < pk.list_price ? " (ลดราคา)" : ""}</span>}</td>
                             <td>{used!=null ? `${used} ครั้ง` : "-"}</td>
                             <td>{pk.status==="active" ? `${pk.remaining_credits} / ${pk.total_credits}` : "-"}</td>
                             <td>{pk.activated_at ? parseUtc(pk.activated_at).toLocaleDateString("th-TH",{day:"2-digit",month:"short",year:"numeric",timeZone:"Asia/Bangkok"}) : "-"}</td>
