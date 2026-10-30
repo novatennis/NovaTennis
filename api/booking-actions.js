@@ -113,6 +113,43 @@ const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").
 // ─── โค้ดส่วนลด: วันหมดอายุ / ล็อกการใช้ / คืนโค้ด ───
 const todayBangkok = () => new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
 // หมดอายุ = วันที่ปัจจุบัน (เวลาไทย) เลยวันที่ในคอลัมน์ expires_at ไปแล้ว — ใช้ได้ถึงสิ้นวันที่ระบุ / ไม่ใส่ = ไม่หมดอายุ
+// ─── อายุแพ็คเกจ: เริ่มนับจาก "วันเล่นครั้งแรก" ที่จองด้วยแพ็คเกจนั้น (ไม่ใช่วันที่ซื้อ/ยืนยัน) ──────────────────────
+// ซื้อ/ยืนยัน = ยังไม่เริ่มนับ (expiry_date ว่าง) → จองด้วยแพ็คเกจครั้งแรก วันเล่นของการจองนั้นเป็นวันที่ 1 → ใช้เล่นได้ตามจำนวนวันของแพ็คเกจ
+// เช่น แพ็ค 7 วัน จองเล่นครั้งแรก 2 พ.ย. ใช้เล่นได้ 2–8 พ.ย. (ถ้าต้องการนับ "7 วันนับจากวันถัดไป" เปลี่ยน COUNT_FIRST_PLAY_DAY เป็น false)
+// แพ็คเกจเก่าที่เริ่มนับไปแล้ว (มี expiry_date แต่ไม่มี first_use_date) ใช้วันหมดอายุเดิม ไม่ถูกแก้ ฟังก์ชันชุดนี้ต้องเหมือนกันใน booking-actions.js และ admin-actions.js
+const COUNT_FIRST_PLAY_DAY = true;
+const addDaysIso = (iso, n) => { const [y, m, d] = iso.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10); };
+const packageWindowEnd = (firstPlayDate, days) => addDaysIso(firstPlayDate, Math.max(1, Number(days) || 1) - (COUNT_FIRST_PLAY_DAY ? 1 : 0));
+// ตรวจวันเล่นกับอายุแพ็คเกจ (ไม่แก้ข้อมูล): คืน { error, ... } หรือ { unstarted: true/false }
+function checkPackageWindow(pkg, bookingDate) {
+  const exp = pkg.expiry_date ? String(pkg.expiry_date).slice(0, 10) : null;
+  if (!exp) return { unstarted: true };
+  if (exp < todayBangkok()) return { error: "package_expired", expiry_date: exp };
+  const start = pkg.first_use_date ? String(pkg.first_use_date).slice(0, 10) : null;
+  if (start && bookingDate < start) return { error: "package_date_before_start", start_date: start, expiry_date: exp };
+  if (bookingDate > exp) return { error: "package_date_out_of_range", expiry_date: exp };
+  return { unstarted: false };
+}
+// เริ่มนับอายุแพ็คเกจ (ถ้ายังไม่เริ่ม) แบบ atomic — ถ้ามีคนเริ่มนับตัดหน้าพร้อมกัน จะอ่านช่วงใหม่แล้วตรวจวันเล่นของเรากับช่วงนั้น
+async function startPackageIfNeeded(pkg, bookingDate) {
+  if (pkg.expiry_date) return { ok: true, started: false };
+  const end = packageWindowEnd(bookingDate, pkg.expiry_days);
+  const upd = await sb(`packages?id=eq.${pkg.id}&expiry_date=is.null`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ first_use_date: bookingDate, expiry_date: end }) });
+  if (!upd.ok) return /first_use_date/.test(JSON.stringify(upd.body || "")) ? { error: "package_columns_missing" } : { error: "package_busy" }; // ยังไม่ได้รัน add-package-first-use-date.sql
+  if (Array.isArray(upd.body) && upd.body.length > 0) return { ok: true, started: true, expiry_date: end };
+  const { body } = await sb(`packages?id=eq.${pkg.id}&select=*`);
+  const fresh = Array.isArray(body) ? body[0] : null;
+  if (!fresh) return { error: "package_not_active" };
+  const chk = checkPackageWindow(fresh, bookingDate);
+  if (chk.error) return chk;
+  return chk.unstarted ? { error: "package_busy" } : { ok: true, started: false };
+}
+// ถ้าแพ็คเกจนี้ไม่เหลือการจองที่ใช้งานอยู่เลย (ยกเลิกหมด/บันทึกไม่สำเร็จ) → ถอยกลับเป็น "ยังไม่เริ่มนับ" ไม่ให้เสียวันฟรี (ไม่แตะแพ็คเกจเก่าที่ไม่มี first_use_date)
+async function releasePackageStartIfUnused(packageId) {
+  const { body } = await sb(`bookings?package_id=eq.${packageId}&status=neq.cancelled&select=id&limit=1`);
+  if (Array.isArray(body) && body.length === 0) await sb(`packages?id=eq.${packageId}&first_use_date=not.is.null`, { method: "PATCH", body: JSON.stringify({ first_use_date: null, expiry_date: null }) });
+}
+
 const isDiscountExpired = (d) => !!d.expires_at && String(d.expires_at).slice(0, 10) < todayBangkok();
 
 // ล็อกการใช้โค้ด "ก่อน" สร้างการจอง ด้วยการอัปเดตแบบมีเงื่อนไข (used_count ต้องยังเท่าค่าที่เพิ่งอ่าน)
@@ -518,9 +555,9 @@ export default async function handler(req, res) {
           const { body: pkgRows } = await sb(`packages?id=eq.${packageId}&customer_id=eq.${customerId}&select=*`);
           const pkg = (pkgRows || [])[0];
           if (!pkg || pkg.status !== "active") { res.status(400).json({ error: "package_not_active" }); return; }
-          if (pkg.expiry_date && String(pkg.expiry_date).slice(0, 10) < todayBangkok()) { res.status(400).json({ error: "package_expired" }); return; }
-          // "วันที่เล่น" ต้องอยู่ภายในอายุแพ็คเกจด้วย (ไม่ใช่แค่ตอนกดจองแพ็คเกจยังไม่หมดอายุ) — เช่นแพ็ค 7 วัน จองวันเล่นเลยวันสุดท้ายไม่ได้ (วันสุดท้ายเล่นได้ถึงสิ้นวัน)
-          if (pkg.expiry_date && bookingDate > String(pkg.expiry_date).slice(0, 10)) { res.status(400).json({ error: "package_date_out_of_range", expiry_date: String(pkg.expiry_date).slice(0, 10) }); return; }
+          // อายุแพ็คเกจเริ่มนับจาก "วันเล่นครั้งแรก" ที่จองด้วยแพ็คเกจนี้ — วันเล่นต้องอยู่ในช่วงนั้น (ถ้ายังไม่เริ่มนับ การจองนี้คือวันแรก)
+          const win = checkPackageWindow(pkg, bookingDate);
+          if (win.error) { res.status(400).json(win); return; }
           // สิทธิ์ที่ใช้ได้จริง = คงเหลือ − สิทธิ์ที่จองค้างรอแอดมินยืนยันอยู่ (ยังไม่ถูกหัก) กันส่งหลายออเดอร์ซ้อนจนเล่นเกินสิทธิ์
           const reserved = await getReservedCredits(packageId);
           if (pkg.remaining_credits - reserved < units) { res.status(400).json({ error: "package_no_credits", available: Math.max(0, pkg.remaining_credits - reserved), needed: units }); return; }
@@ -536,14 +573,18 @@ export default async function handler(req, res) {
             body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
           });
 
+          // เริ่มนับอายุแพ็คเกจ (ถ้าเป็นการจองครั้งแรกด้วยแพ็คเกจนี้) — ถ้าบันทึกการจองไม่สำเร็จด้านล่าง จะถอยกลับให้
+          const st = await startPackageIfNeeded(pkg, bookingDate);
+          if (st.error) { res.status(st.error === "package_columns_missing" ? 500 : 400).json(st); return; }
+
           const pins = await insertBookingsAtomic([{
             court_id: courtId, customer_id: customerId, customer_name: customerName,
             booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
             price: 0, package_id: packageId, status: "reviewing", // รอแอดมินกดยืนยันก่อนถึงจะหักสิทธิ์จริง
           }]);
-          if (pins.error === "slot_taken") { res.status(409).json({ error: "slot_taken" }); return; }
+          if (pins.error === "slot_taken") { if (st.started) await releasePackageStartIfUnused(pkg.id); res.status(409).json({ error: "slot_taken" }); return; }
           const bookingRow = (pins.rows || [])[0];
-          if (!bookingRow) { res.status(500).json({ error: "insert_failed" }); return; }
+          if (!bookingRow) { if (st.started) await releasePackageStartIfUnused(pkg.id); res.status(500).json({ error: "insert_failed" }); return; }
 
           const nowBangkok = new Date(Date.now() + 7 * 60 * 60 * 1000);
           const timeStr = nowBangkok.toISOString().substr(11, 5);
@@ -556,6 +597,7 @@ export default async function handler(req, res) {
             `📅 ${bookingDate}\n` +
             `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n` +
             `🎫 จองครั้งนี้ใช้ ${units} ครั้ง • สิทธิ์เหลือก่อนจอง: ${pkg.remaining_credits} / ${pkg.total_credits} ครั้ง\n` +
+            (st.started ? `🗓 เป็นการจองครั้งแรกของแพ็คเกจนี้ → เริ่มนับอายุวันที่ ${bookingDate} ใช้เล่นได้ถึง ${st.expiry_date}\n` : "") +
             `🕓 กดจองเมื่อเวลา ${timeStr} น. (ไทย)`;
           await notifyTelegram(text);
 
@@ -748,6 +790,7 @@ export default async function handler(req, res) {
         const row = (body || [])[0] || null;
         if (ok && row) {
           if (row.discount_code) await releaseDiscountByCode(row.discount_code); // ยกเลิกรายการที่ยังไม่ได้ชำระ/ยังไม่ยืนยัน → คืนสิทธิ์ใช้โค้ด
+          if (row.package_id) await releasePackageStartIfUnused(row.package_id); // การจองด้วยแพ็คเกจถูกยกเลิก → ถ้าไม่เหลือการจองอื่น ถอยกลับเป็นยังไม่เริ่มนับอายุ
           let courtLabel = `Court ${row.court_id}`;
           let totalPrice = row.price || 0;
           if (row.group_id) {
@@ -863,7 +906,7 @@ export default async function handler(req, res) {
         const { body } = await sb(`packages?customer_id=eq.${phone}&select=*&order=created_time.desc`);
         let pkgs = await Promise.all((Array.isArray(body) ? body : []).map(async ({ admin_note, ...pk }) => (pk.status === "active" ? { ...pk, reserved_credits: await getReservedCredits(pk.id) } : pk))); // admin_note = หมายเหตุภายในของแอดมิน ไม่ส่งให้ลูกค้า
         // ยังไม่ผูกเบอร์ (กำลังกรอกเบอร์เป็นครั้งแรกเพื่อให้ระบบหาสิทธิ์แพ็คเกจให้) → ส่งเฉพาะข้อมูลสิทธิ์ที่จำเป็น ไม่ส่งชื่อ/ราคา/สลิป
-        if (!me.phone) pkgs = pkgs.map(({ id, tier, status, total_credits, remaining_credits, expiry_date, reserved_credits }) => ({ id, tier, status, total_credits, remaining_credits, expiry_date, reserved_credits }));
+        if (!me.phone) pkgs = pkgs.map(({ id, tier, status, total_credits, remaining_credits, expiry_date, expiry_days, first_use_date, reserved_credits }) => ({ id, tier, status, total_credits, remaining_credits, expiry_date, expiry_days, first_use_date, reserved_credits }));
         res.status(200).json({ packages: pkgs });
         return;
       }
