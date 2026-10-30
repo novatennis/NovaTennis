@@ -76,13 +76,41 @@ async function getReservedCredits(packageId) {
   return (Array.isArray(body) ? body : []).reduce((s, b) => s + Math.max(1, Math.round((b.duration_minutes || 60) / 60)), 0);
 }
 const todayBangkok = () => new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
-// วันสุดท้ายที่แพ็คเกจใช้เล่นได้ = วันที่ยืนยัน (เวลาไทย) นับเป็นวันที่ 1 → ครบ N วันปฏิทินพอดี (ใช้ได้ถึงสิ้นวันนั้น) เช่นยืนยัน 25 ต.ค. แพ็ค 7 วัน = เล่นได้ 25–31 ต.ค.
-// ถ้าร้านอยากนับ "7 วันนับจากวันถัดไป" (รวมเป็น 8 วันปฏิทิน) ให้เปลี่ยน COUNT_ACTIVATION_DAY เป็น false
-const COUNT_ACTIVATION_DAY = true;
-function packageExpiryDate(activatedMs, days) {
-  const bkk = new Date(activatedMs + 7 * 60 * 60 * 1000); // เลื่อนเป็นเวลาไทย แล้วอ่านวันที่แบบ UTC
-  const base = Date.UTC(bkk.getUTCFullYear(), bkk.getUTCMonth(), bkk.getUTCDate());
-  return new Date(base + (Number(days) - (COUNT_ACTIVATION_DAY ? 1 : 0)) * 86400000).toISOString().slice(0, 10);
+// ─── อายุแพ็คเกจ: เริ่มนับจาก "วันเล่นครั้งแรก" ที่จองด้วยแพ็คเกจนั้น (ไม่ใช่วันที่ซื้อ/ยืนยัน) ──────────────────────
+// ซื้อ/ยืนยัน = ยังไม่เริ่มนับ (expiry_date ว่าง) → จองด้วยแพ็คเกจครั้งแรก วันเล่นของการจองนั้นเป็นวันที่ 1 → ใช้เล่นได้ตามจำนวนวันของแพ็คเกจ
+// เช่น แพ็ค 7 วัน จองเล่นครั้งแรก 2 พ.ย. ใช้เล่นได้ 2–8 พ.ย. (ถ้าต้องการนับ "7 วันนับจากวันถัดไป" เปลี่ยน COUNT_FIRST_PLAY_DAY เป็น false)
+// แพ็คเกจเก่าที่เริ่มนับไปแล้ว (มี expiry_date แต่ไม่มี first_use_date) ใช้วันหมดอายุเดิม ไม่ถูกแก้ ฟังก์ชันชุดนี้ต้องเหมือนกันใน booking-actions.js และ admin-actions.js
+const COUNT_FIRST_PLAY_DAY = true;
+const addDaysIso = (iso, n) => { const [y, m, d] = iso.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10); };
+const packageWindowEnd = (firstPlayDate, days) => addDaysIso(firstPlayDate, Math.max(1, Number(days) || 1) - (COUNT_FIRST_PLAY_DAY ? 1 : 0));
+// ตรวจวันเล่นกับอายุแพ็คเกจ (ไม่แก้ข้อมูล): คืน { error, ... } หรือ { unstarted: true/false }
+function checkPackageWindow(pkg, bookingDate) {
+  const exp = pkg.expiry_date ? String(pkg.expiry_date).slice(0, 10) : null;
+  if (!exp) return { unstarted: true };
+  if (exp < todayBangkok()) return { error: "package_expired", expiry_date: exp };
+  const start = pkg.first_use_date ? String(pkg.first_use_date).slice(0, 10) : null;
+  if (start && bookingDate < start) return { error: "package_date_before_start", start_date: start, expiry_date: exp };
+  if (bookingDate > exp) return { error: "package_date_out_of_range", expiry_date: exp };
+  return { unstarted: false };
+}
+// เริ่มนับอายุแพ็คเกจ (ถ้ายังไม่เริ่ม) แบบ atomic — ถ้ามีคนเริ่มนับตัดหน้าพร้อมกัน จะอ่านช่วงใหม่แล้วตรวจวันเล่นของเรากับช่วงนั้น
+async function startPackageIfNeeded(pkg, bookingDate) {
+  if (pkg.expiry_date) return { ok: true, started: false };
+  const end = packageWindowEnd(bookingDate, pkg.expiry_days);
+  const upd = await sb(`packages?id=eq.${pkg.id}&expiry_date=is.null`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ first_use_date: bookingDate, expiry_date: end }) });
+  if (!upd.ok) return /first_use_date/.test(JSON.stringify(upd.body || "")) ? { error: "package_columns_missing" } : { error: "package_busy" }; // ยังไม่ได้รัน add-package-first-use-date.sql
+  if (Array.isArray(upd.body) && upd.body.length > 0) return { ok: true, started: true, expiry_date: end };
+  const { body } = await sb(`packages?id=eq.${pkg.id}&select=*`);
+  const fresh = Array.isArray(body) ? body[0] : null;
+  if (!fresh) return { error: "package_not_active" };
+  const chk = checkPackageWindow(fresh, bookingDate);
+  if (chk.error) return chk;
+  return chk.unstarted ? { error: "package_busy" } : { ok: true, started: false };
+}
+// ถ้าแพ็คเกจนี้ไม่เหลือการจองที่ใช้งานอยู่เลย (ยกเลิกหมด/บันทึกไม่สำเร็จ) → ถอยกลับเป็น "ยังไม่เริ่มนับ" ไม่ให้เสียวันฟรี (ไม่แตะแพ็คเกจเก่าที่ไม่มี first_use_date)
+async function releasePackageStartIfUnused(packageId) {
+  const { body } = await sb(`bookings?package_id=eq.${packageId}&status=neq.cancelled&select=id&limit=1`);
+  if (Array.isArray(body) && body.length === 0) await sb(`packages?id=eq.${packageId}&first_use_date=not.is.null`, { method: "PATCH", body: JSON.stringify({ first_use_date: null, expiry_date: null }) });
 }
 
 // คืนสิทธิ์ใช้โค้ด 1 ครั้ง (ยกเลิกรายการที่ยังไม่ได้ยืนยัน = ยังไม่เคยได้ใช้ส่วนลดจริง)
@@ -238,7 +266,8 @@ export default async function handler(req, res) {
         if (before?.coach_order_id && status === "cancelled" && before.status === "confirmed" && refundCredit) {
           const { body: cur } = await sb(`coach_orders?id=eq.${before.coach_order_id}&select=sessions_used`);
           const c = Array.isArray(cur) ? cur[0] : null;
-          if (c && (c.sessions_used || 0) > 0) await sb(`coach_orders?id=eq.${before.coach_order_id}&sessions_used=eq.${c.sessions_used}`, { method: "PATCH", body: JSON.stringify({ sessions_used: c.sessions_used - 1 }) });
+          const cUnits = Math.max(1, Math.round((before.duration_minutes || 60) / 60)); // คืนเท่าที่ตัดไป: 60 นาที = 1 ครั้ง, 120 นาที = 2 ครั้ง
+          if (c && (c.sessions_used || 0) > 0) await sb(`coach_orders?id=eq.${before.coach_order_id}&sessions_used=eq.${c.sessions_used}`, { method: "PATCH", body: JSON.stringify({ sessions_used: Math.max(0, c.sessions_used - cUnits) }) });
         }
         if (before?.package_id) {
           const wasConfirmed = before.status === "confirmed";
@@ -268,6 +297,7 @@ export default async function handler(req, res) {
             }
           }
         }
+        if (status === "cancelled" && before?.package_id) await releasePackageStartIfUnused(before.package_id); // การจองด้วยแพ็คเกจถูกยกเลิก → ถ้าไม่เหลือการจองอื่น ถอยกลับเป็นยังไม่เริ่มนับอายุ
         res.status(200).json({ ok: true });
         return;
       }
@@ -302,7 +332,7 @@ export default async function handler(req, res) {
         const packageIssues = [];
         let packagesError = false;
         try {
-          const pq = await sb(`packages?customer_id=eq.${phone}&status=neq.cancelled&select=id,tier,status,total_credits,remaining_credits,expiry_date&order=created_time.asc`);
+          const pq = await sb(`packages?customer_id=eq.${phone}&status=neq.cancelled&select=*&order=created_time.asc`);
           if (!pq.ok || !Array.isArray(pq.body)) throw new Error("packages query failed");
           const today = todayBangkok();
           for (const x of pq.body) {
@@ -315,7 +345,7 @@ export default async function handler(req, res) {
             if (x.remaining_credits <= 0) { issue("สิทธิ์หมดแล้ว"); continue; }
             const reserved = await getReservedCredits(x.id);
             if (x.remaining_credits - reserved <= 0) { issue(`สิทธิ์ที่เหลือ ${x.remaining_credits} ครั้ง ถูกจองค้างรอยืนยันครบแล้ว (${reserved} ครั้ง) — ไปแท็บ "การจอง" เพื่อยืนยันหรือยกเลิกรายการที่ค้างอยู่`); continue; }
-            packages.push({ id: x.id, tier: x.tier, total_credits: x.total_credits, remaining_credits: x.remaining_credits, expiry_date: x.expiry_date, reserved_credits: reserved, available: x.remaining_credits - reserved });
+            packages.push({ id: x.id, tier: x.tier, total_credits: x.total_credits, remaining_credits: x.remaining_credits, expiry_date: x.expiry_date, expiry_days: x.expiry_days, first_use_date: x.first_use_date || null, reserved_credits: reserved, available: x.remaining_credits - reserved });
           }
         } catch (e) {
           console.error("lookupCustomer packages error:", e);
@@ -397,8 +427,8 @@ export default async function handler(req, res) {
           const { body: pkgRows } = await sb(`packages?id=eq.${encodeURIComponent(packageId)}&customer_id=eq.${customerId}&select=*`);
           pkg = (pkgRows || [])[0];
           if (!pkg || pkg.status !== "active") { res.status(400).json({ error: "package_not_active" }); return; }
-          if (pkg.expiry_date && String(pkg.expiry_date).slice(0, 10) < todayBangkok()) { res.status(400).json({ error: "package_expired" }); return; }
-          if (pkg.expiry_date && bookingDate > String(pkg.expiry_date).slice(0, 10)) { res.status(400).json({ error: "package_date_out_of_range", expiry_date: String(pkg.expiry_date).slice(0, 10) }); return; } // วันเล่นต้องอยู่ภายในอายุแพ็คเกจ
+          const win = checkPackageWindow(pkg, bookingDate); // อายุแพ็คเกจเริ่มนับจากวันเล่นครั้งแรก — วันเล่นต้องอยู่ในช่วงนั้น
+          if (win.error) { res.status(400).json(win); return; }
           const reserved = await getReservedCredits(pkg.id);
           if (pkg.remaining_credits - reserved < units) { res.status(400).json({ error: "package_no_credits", available: Math.max(0, pkg.remaining_credits - reserved), needed: units }); return; }
           // ทุกชั่วโมงที่จองต้องอยู่ในช่วงที่แพ็คครอบคลุม: แพ็ค Peak ได้ทุกชั่วโมง / แพ็ค Off Peak เฉพาะ จ.–ศ. ก่อน 16:00
@@ -408,17 +438,20 @@ export default async function handler(req, res) {
           if (!covered) { res.status(400).json({ error: "package_wrong_tier" }); return; }
           price = 0; status = "confirmed";
         }
-        // ── นัดเรียนกับโค้ช: ตัดสิทธิ์ครั้งเรียนของคอร์ส 1 ครั้ง (60 นาที) / 1 สนาม / ราคา 0 (จ่ายค่าคอร์สไปแล้ว) / ยืนยันทันที / ลงชื่อโค้ช ──
+        // ── นัดเรียนกับโค้ช: 60 นาที = ตัดสิทธิ์ 1 ครั้ง / 120 นาที = ตัด 2 ครั้ง ต่อการจอง / 1 สนาม / ราคา 0 (จ่ายค่าคอร์สไปแล้ว) / ยืนยันทันที / ลงชื่อโค้ช ──
         let coachOrder = null, coachNameClean = "";
+        const coachUnits = Math.max(1, Math.round((durationMinutes || 60) / 60));
         if (coachOrderId) {
           if (ids.length !== 1) { res.status(400).json({ error: "coach_one_court" }); return; }
-          if (durationMinutes !== 60) { res.status(400).json({ error: "coach_duration" }); return; }
+          if (![60, 120].includes(durationMinutes)) { res.status(400).json({ error: "coach_duration" }); return; }
           coachNameClean = String(p.coachName || "").normalize("NFC").replace(/\s+/g, " ").trim();
           if (!coachNameClean || nameLen(coachNameClean) > 30) { res.status(400).json({ error: "coach_name_required" }); return; }
           const { body: coRows } = await sb(`coach_orders?id=eq.${encodeURIComponent(coachOrderId)}&customer_id=eq.${customerId}&select=*`);
           coachOrder = Array.isArray(coRows) ? coRows[0] : null;
           if (!coachOrder || coachOrder.status !== "confirmed") { res.status(400).json({ error: "coach_order_not_active" }); return; }
-          if ((coachOrder.sessions_used || 0) >= coachOrder.sessions) { res.status(400).json({ error: "coach_no_sessions" }); return; }
+          const left = coachOrder.sessions - (coachOrder.sessions_used || 0);
+          if (left <= 0) { res.status(400).json({ error: "coach_no_sessions" }); return; }
+          if (left < coachUnits) { res.status(400).json({ error: "coach_not_enough_sessions", available: left, needed: coachUnits }); return; } // เหลือ 1 ครั้งแต่จะจอง 120 นาที (ต้องใช้ 2 ครั้ง)
           price = 0; status = "confirmed";
         }
         const unit = Number(price);
@@ -453,8 +486,9 @@ export default async function handler(req, res) {
             if (!c0 || c0.status !== "confirmed") { res.status(400).json({ error: "coach_order_not_active" }); return; }
             const used = c0.sessions_used || 0;
             if (used >= c0.sessions) { res.status(400).json({ error: "coach_no_sessions" }); return; }
-            const upd = await sb(`coach_orders?id=eq.${coachOrder.id}&status=eq.confirmed&sessions_used=eq.${used}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ sessions_used: used + 1 }) }); // เงื่อนไข sessions_used กันตัดซ้อนพร้อมกันจนเกินสิทธิ์
-            if (upd.ok && Array.isArray(upd.body) && upd.body.length > 0) { claimed = true; coachUsedAfter = used + 1; }
+            if (c0.sessions - used < coachUnits) { res.status(400).json({ error: "coach_not_enough_sessions", available: c0.sessions - used, needed: coachUnits }); return; }
+            const upd = await sb(`coach_orders?id=eq.${coachOrder.id}&status=eq.confirmed&sessions_used=eq.${used}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ sessions_used: used + coachUnits }) }); // เงื่อนไข sessions_used กันตัดซ้อนพร้อมกันจนเกินสิทธิ์
+            if (upd.ok && Array.isArray(upd.body) && upd.body.length > 0) { claimed = true; coachUsedAfter = used + coachUnits; }
           }
           if (!claimed) { res.status(409).json({ error: "coach_order_busy" }); return; }
         }
@@ -462,27 +496,34 @@ export default async function handler(req, res) {
           if (!coachOrder) return;
           const { body: cur } = await sb(`coach_orders?id=eq.${coachOrder.id}&select=sessions_used`);
           const c = Array.isArray(cur) ? cur[0] : null;
-          if (c) await sb(`coach_orders?id=eq.${coachOrder.id}`, { method: "PATCH", body: JSON.stringify({ sessions_used: Math.max(0, (c.sessions_used || 0) - 1) }) });
+          if (c) await sb(`coach_orders?id=eq.${coachOrder.id}`, { method: "PATCH", body: JSON.stringify({ sessions_used: Math.max(0, (c.sessions_used || 0) - coachUnits) }) });
         };
 
         let remainingAfter = null;
+        let pkgStart = null;
+        if (pkg) {
+          pkgStart = await startPackageIfNeeded(pkg, bookingDate); // เริ่มนับอายุแพ็คเกจถ้านี่คือการจองครั้งแรก (ถอยกลับให้ถ้าบันทึกไม่สำเร็จ)
+          if (pkgStart.error) { res.status(pkgStart.error === "package_columns_missing" ? 500 : 400).json(pkgStart); return; }
+        }
+        const releaseStart = async () => { if (pkgStart?.started) await releasePackageStartIfUnused(pkg.id); };
         if (pkg) {
           let claimed = false;
           for (let attempt = 0; attempt < 3 && !claimed; attempt++) {
             const { body: cur } = await sb(`packages?id=eq.${pkg.id}&select=remaining_credits`);
             const rem = (cur || [])[0]?.remaining_credits ?? 0;
             const reserved = await getReservedCredits(pkg.id);
-            if (rem - reserved < units) { res.status(400).json({ error: "package_no_credits", available: Math.max(0, rem - reserved), needed: units }); return; }
+            if (rem - reserved < units) { await releaseStart(); res.status(400).json({ error: "package_no_credits", available: Math.max(0, rem - reserved), needed: units }); return; }
             const upd = await sb(`packages?id=eq.${pkg.id}&remaining_credits=eq.${rem}`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ remaining_credits: rem - units }) });
             if (upd.ok && upd.body && upd.body.length > 0) { claimed = true; remainingAfter = rem - units; }
           }
-          if (!claimed) { res.status(409).json({ error: "package_busy" }); return; }
+          if (!claimed) { await releaseStart(); res.status(409).json({ error: "package_busy" }); return; }
         }
         const restoreCredits = async () => {
           if (!pkg) return;
           const { body: cur } = await sb(`packages?id=eq.${pkg.id}&select=remaining_credits,total_credits`);
           const c = (cur || [])[0];
           if (c) await sb(`packages?id=eq.${pkg.id}`, { method: "PATCH", body: JSON.stringify({ remaining_credits: Math.min(c.total_credits, c.remaining_credits + units) }) });
+          await releaseStart();
         };
 
         // ลูกค้าใหม่ → สร้างข้อมูลลูกค้าด้วยชื่อที่แอดมินใส่ / ลูกค้าเดิม → ไม่ทับชื่อเดิม
@@ -514,12 +555,12 @@ export default async function handler(req, res) {
           `🎾 ${ids.map(c => `Court ${c}`).join(" + ")}\n📅 ${bookingDate}\n` +
           `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n` +
           (coachOrder
-            ? `👤 นัดเรียนกับโค้ช: <b>${esc(coachNameClean)}</b>\n📋 ตัดสิทธิ์คอร์ส C-${coachOrder.id} ครั้งที่ ${coachUsedAfter}/${coachOrder.sessions} (เหลือ ${coachOrder.sessions - coachUsedAfter} ครั้ง) — ยืนยันแล้ว`
+            ? `👤 นัดเรียนกับโค้ช: <b>${esc(coachNameClean)}</b>\n📋 ตัดสิทธิ์คอร์ส C-${coachOrder.id} ${coachUnits > 1 ? `${coachUnits} ครั้ง (ครั้งที่ ${coachUsedAfter - coachUnits + 1}–${coachUsedAfter}/${coachOrder.sessions}, ${durationMinutes} นาที)` : `ครั้งที่ ${coachUsedAfter}/${coachOrder.sessions}`} (เหลือ ${coachOrder.sessions - coachUsedAfter} ครั้ง) — ยืนยันแล้ว`
             : pkg
-              ? `🎟 ตัดสิทธิ์แพ็คเกจ ${units} ครั้ง (เหลือ ${remainingAfter} / ${pkg.total_credits} ครั้ง) — ยืนยันแล้ว`
+              ? `🎟 ตัดสิทธิ์แพ็คเกจ ${units} ครั้ง (เหลือ ${remainingAfter} / ${pkg.total_credits} ครั้ง) — ยืนยันแล้ว${pkgStart?.started ? `\n🗓 จองครั้งแรกของแพ็คเกจนี้ → เริ่มนับอายุวันที่ ${bookingDate} ใช้เล่นได้ถึง ${pkgStart.expiry_date}` : ""}`
               : `💰 ฿${(Math.round(unit) * ids.length).toLocaleString()} (${status === "confirmed" ? "ชำระแล้ว" : "รอชำระ"})`)
         );
-        res.status(200).json({ ok: true, bookings: ins.body, ...(pkg ? { creditsUsed: units, remaining: remainingAfter } : {}), ...(coachOrder ? { coach: { orderId: coachOrder.id, coachName: coachNameClean, sessions: coachOrder.sessions, sessions_used: coachUsedAfter, remaining: coachOrder.sessions - coachUsedAfter } } : {}) });
+        res.status(200).json({ ok: true, bookings: ins.body, ...(pkg ? { creditsUsed: units, remaining: remainingAfter } : {}), ...(coachOrder ? { coach: { orderId: coachOrder.id, coachName: coachNameClean, sessions: coachOrder.sessions, sessions_used: coachUsedAfter, remaining: coachOrder.sessions - coachUsedAfter, units: coachUnits } } : {}) });
         return;
       }
       case "updateCustomerName": {
@@ -700,7 +741,7 @@ export default async function handler(req, res) {
         const nowMs = Date.now();
         const base = { customer_id: customerId, customer_name: name, price, list_price: list, sold_by: "admin", payment_method: price > 0 ? "transfer" : "free", admin_note: note || null };
         const row = kind === "package"
-          ? { ...base, tier: p.tier, total_credits: Number(p.credits), remaining_credits: Number(p.credits), expiry_days: def.days, status: "active", activated_at: new Date(nowMs).toISOString(), expiry_date: packageExpiryDate(nowMs, def.days) }
+          ? { ...base, tier: p.tier, total_credits: Number(p.credits), remaining_credits: Number(p.credits), expiry_days: def.days, status: "active", activated_at: new Date(nowMs).toISOString() }
           : { ...base, line_user_id: linked?.line_user_id || null, audience: quote.audience, type: quote.type, sessions: quote.sessions, people: quote.people, status: "confirmed", confirmed_time: new Date(nowMs).toISOString(), sessions_used: 0 };
 
         await sb(`customers`, { method: "POST", headers: { Prefer: "resolution=ignore-duplicates" }, body: JSON.stringify({ customer_id: customerId, customer_name: name }) });
@@ -715,7 +756,7 @@ export default async function handler(req, res) {
           `📦 ${esc(label)}\n👤 ${esc(name)}\n📞 ${customerId}\n` +
           `💰 ฿${price.toLocaleString()}${price !== list ? ` (ราคาป้าย ฿${list.toLocaleString()} • ลด ฿${(list - price).toLocaleString()})` : ""} • ${price > 0 ? "รับเงินโอนแล้ว" : "แจกฟรี"}\n` +
           (note ? `📝 ${esc(note)}\n` : "") +
-          `ใช้งานได้ทันที — ${kind === "package" ? `ใช้เล่นได้ถึง ${row.expiry_date}` : `รหัสคอร์ส C-${created.id}`}`
+          `ใช้งานได้ทันที — ${kind === "package" ? `ยังไม่เริ่มนับอายุ (เริ่มนับวันเล่นครั้งแรกที่จอง • ใช้เล่นได้ ${def.days} วัน)` : `รหัสคอร์ส C-${created.id}`}`
         );
         const { line_user_id, ...pub } = created;
         res.status(200).json({ ok: true, kind, item: pub, label, price, listPrice: list });
@@ -747,10 +788,10 @@ export default async function handler(req, res) {
         const { body: pkgRows } = await sb(`packages?id=eq.${id}&select=*`);
         const pkg = (pkgRows || [])[0];
         if (!pkg) { res.status(404).json({ error: "not_found" }); return; }
-        const expiryDateStr = packageExpiryDate(nowMs, pkg.expiry_days);
+        // ยืนยันการซื้อ = เปิดใช้งานแพ็คเกจ แต่ "ยังไม่เริ่มนับอายุ" (expiry_date ว่าง) — เริ่มนับตอนจองด้วยแพ็คเกจครั้งแรก (วันเล่นวันแรก = วันที่ 1)
         await sb(`packages?id=eq.${id}`, {
           method: "PATCH",
-          body: JSON.stringify({ status: "active", activated_at: now.toISOString(), expiry_date: expiryDateStr }),
+          body: JSON.stringify({ status: "active", activated_at: now.toISOString() }),
         });
         res.status(200).json({ ok: true });
         return;
