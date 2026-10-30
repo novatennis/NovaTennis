@@ -354,6 +354,8 @@ function startLineLogin(returnTarget = "home", pendingCheckout = null) {
 // บวก/ลบวันกับวันที่รูปแบบ YYYY-MM-DD (คิดแบบ UTC ไม่ผูกเขตเวลาของเครื่อง) + แสดงวันที่อ่านง่าย — ใช้แสดงอายุแพ็คเกจ (ต้องตรงกับเซิร์ฟเวอร์: วันเล่นวันแรกนับเป็นวันที่ 1)
 const addDaysIsoClient = (iso, n) => { const [y, m, d] = String(iso).slice(0, 10).split("-").map(Number); return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10); };
 const niceDate = (iso, lang = "th") => new Date(String(iso).slice(0, 10) + "T00:00:00").toLocaleDateString(lang === "th" ? "th-TH" : "en-GB", { day: "numeric", month: "short", year: "numeric" });
+// ประวัติการเลื่อนเวลา: moved_from = "YYYY-MM-DD HH:MM|สนาม" (เวลาเดิมครั้งแรก) → { date, time, courts }
+const parseMovedFrom = (mf) => { const [dt, courts] = String(mf || "").split("|"); const [date, time] = (dt || "").split(" "); return { date, time, courts: courts || "" }; };
 const toIso = (d) => {
   if (!d) return "";
   const y = d.getFullYear();
@@ -2427,6 +2429,7 @@ function CancelPage({ lang="th", initialPhone="", lockedPhone="" }) {
                 </div>
                 <Row label={`📅 ${t.date}`} val={new Date(b.booking_date).toLocaleDateString(lang==="th"?"th-TH":"en-GB",{year:"numeric",month:"long",day:"numeric"})} />
                 <Row label={`🕐 ${t.time}`} val={`${minutesToLabel(startMin)} – ${minutesToLabel(startMin+dur)}`} />
+                {b.moved_from && <Row label={lang==="th" ? "🕐 เลื่อนเวลาแล้ว" : "🕐 Rescheduled"} val={(() => { const m = parseMovedFrom(b.moved_from); return lang==="th" ? `เดิม ${niceDate(m.date, lang)} ${m.time}` : `Was ${niceDate(m.date, lang)} ${m.time}`; })()} />}
                 {b.coach_name && <Row label={lang==="th" ? "👤 โค้ช" : "👤 Coach"} val={b.coach_name} />}
                 <Row label={t.rowPrice} val={b.coach_order_id ? (lang==="th" ? `ชำระแล้ว (ใช้สิทธิ์คอร์ส C-${b.coach_order_id}${(b.duration_minutes || 60) >= 120 ? " • 2 ครั้ง" : ""})` : `Paid (course C-${b.coach_order_id}${(b.duration_minutes || 60) >= 120 ? " • 2 sessions" : ""})`) : `฿${b.price?.toLocaleString()}`} />
               </div>
@@ -3255,6 +3258,49 @@ function AdminDashboard({ token, onLogout }) {
   const usableCredits = usableAll.reduce((s, pk) => s + pk.remaining_credits, 0);
 
   // ── ประวัติลูกค้า: แพ็คเกจ + วันเวลาที่ใช้สิทธิ์ + ประวัติการจองทั้งหมดของเบอร์นั้น ──
+  // ── เลื่อนเวลาการจอง (แอดมิน): เปลี่ยนวัน/เวลาเริ่ม/สนาม ระยะเวลาเท่าเดิม ไม่คิดราคาใหม่ — ไม่ต้องยกเลิกแล้วจองใหม่ ──
+  const [mv, setMv] = useState(null);        // { b, date, startMin, court }
+  const [mvBusy, setMvBusy] = useState(false);
+  const [mvErr, setMvErr] = useState(null);
+  const [mvDone, setMvDone] = useState(null); // { text, warn }
+  const bkStartMin = (b) => (b.hour || 0) * 60 + (b.start_minute || 0);
+  const bkIsPast = (b) => { const t = new Date(Date.now() + 7 * 3600e3); const today = t.toISOString().slice(0, 10); const nowMin = t.getUTCHours() * 60 + t.getUTCMinutes(); return b.booking_date < today || (b.booking_date === today && bkStartMin(b) + (b.duration_minutes || 60) <= nowMin); };
+  const canMove = (b) => (b.status === "confirmed" || b.status === "reviewing") && !bkIsPast(b);
+  const openMove = (b) => { setMvErr(null); setMv({ b, date: b.booking_date, startMin: bkStartMin(b), court: b.court_id }); };
+  const tierOfBk = (d, h) => { const dow = new Date(d + "T00:00:00").getDay(); return (dow === 0 || dow === 6 || h >= 16) ? "peak" : "offpeak"; };
+  const grpCourts = (b) => b.group_id ? [...new Set([...bookings, ...queue].filter(x => x.group_id === b.group_id && x.status !== "cancelled").map(x => x.court_id))].sort() : [b.court_id];
+  const movedTag = (b) => { if (!b.moved_from) return null; const m = parseMovedFrom(b.moved_from); return <div style={{fontSize:10.5,fontWeight:700,color:"#2d5f8a",marginTop:2}}>🕐 เลื่อนแล้ว (จาก {m.date === b.booking_date ? m.time : `${niceDate(m.date)} ${m.time}`})</div>; };
+  const submitMove = async () => {
+    if (!mv || mvBusy) return;
+    const { b } = mv;
+    setMvBusy(true); setMvErr(null);
+    let r = null;
+    try { r = await callAdminAction("rescheduleBooking", token, { id: b.id, newDate: mv.date, hour: Math.floor(mv.startMin / 60), startMinute: mv.startMin % 60, ...(b.group_id ? {} : { courtId: mv.court }) }); }
+    catch { r = { error: "network_or_server" }; }
+    setMvBusy(false);
+    if (r?.ok) {
+      const courtsChanged = JSON.stringify(r.from.courts) !== JSON.stringify(r.to.courts);
+      setMvDone({ text: `✅ เลื่อนการจองของ ${b.customer_name || "ลูกค้า"} แล้ว: ${niceDate(r.from.date)} ${r.from.start} → ${niceDate(r.to.date)} ${r.to.start}–${r.to.end}${courtsChanged ? ` • ${r.to.courts.map(c => "Court " + c).join(" + ")}` : ""}`, warn: !!r.priceTierChanged });
+      setMv(null); loadQueue(); loadBookings();
+    } else {
+      setMvErr(
+        r?.error === "slot_taken" ? `❌ ช่วงเวลาใหม่ไม่ว่าง (Court ${r.court}) — เลือกเวลาอื่น`
+        : r?.error === "coach_busy" ? `❌ โค้ช ${r.coach} มีนัดซ้อนเวลาใหม่ (Court ${r.court} ${r.from}–${r.to})`
+        : r?.error === "no_change" ? "ยังไม่ได้เปลี่ยนวัน เวลา หรือสนาม"
+        : r?.error === "outside_hours" ? "❌ ต้องอยู่ในเวลาเปิดสนาม 06:00–23:00 (รวมระยะเวลาที่จอง)"
+        : r?.error === "new_time_past" ? "❌ เลือกเวลาที่ผ่านไปแล้วไม่ได้"
+        : r?.error === "booking_in_past" ? "❌ การจองนี้ผ่านไปแล้ว เลื่อนไม่ได้"
+        : r?.error === "invalid_status" ? "❌ เลื่อนได้เฉพาะการจองที่ยืนยันแล้วหรือรอตรวจสอบ"
+        : r?.error === "package_wrong_tier" ? "❌ แพ็คเกจ Off Peak ใช้กับช่วงเวลานี้ไม่ได้ (Off Peak = จ.–ศ. ก่อน 16:00 ทุกชั่วโมงที่จอง)"
+        : r?.error === "package_start_move" ? "❌ การจองนี้เป็นตัวกำหนดวันเริ่มนับอายุแพ็คเกจ เลื่อนข้ามวันไม่ได้ — ให้ยกเลิกแล้วจองใหม่ (เลื่อนเวลาในวันเดิมได้)"
+        : r?.error === "package_date_out_of_range" ? `❌ วันที่ใหม่เลยอายุแพ็คเกจ (ใช้เล่นได้ถึง ${r.expiry_date})`
+        : r?.error === "package_date_before_start" ? `❌ วันที่ใหม่อยู่ก่อนวันเริ่มนับอายุแพ็คเกจ (เริ่มนับ ${r.start_date})`
+        : r?.error === "package_expired" ? "❌ แพ็คเกจหมดอายุแล้ว"
+        : r?.error === "network_or_server" ? "❌ เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว"
+        : `❌ เลื่อนไม่สำเร็จ (${r?.error || "ไม่ทราบสาเหตุ"}) — ไม่มีการเปลี่ยนแปลง ลองใหม่อีกครั้ง`);
+    }
+  };
+
   const [histPhone, setHistPhone] = useState(null);
   const [hist, setHist] = useState(null);
   const [histLoading, setHistLoading] = useState(false);
@@ -3581,6 +3627,15 @@ function AdminDashboard({ token, onLogout }) {
             <div>
               <div style={{marginBottom:24}}>
                 <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                  {mvDone && (
+                    <div style={{background:"rgba(45,122,79,.1)",border:"1.5px solid #2d7a4f",borderRadius:10,padding:"10px 14px",marginBottom:12,fontSize:13,color:"#1b5e3c",lineHeight:1.7,display:"flex",gap:10,alignItems:"flex-start",justifyContent:"space-between"}}>
+                      <div>
+                        <div style={{fontWeight:700}}>{mvDone.text}</div>
+                        {mvDone.warn && <div style={{color:"#8a5a00",fontWeight:600,marginTop:4}}>⚠️ ช่วงเวลาใหม่เป็นคนละช่วงราคา (Peak/Off Peak) ระบบไม่ได้คิดส่วนต่างให้ — ถ้าต้องการเก็บส่วนต่าง แจ้งลูกค้าเอง</div>}
+                      </div>
+                      <button onClick={() => setMvDone(null)} style={{border:"none",background:"transparent",fontSize:16,cursor:"pointer",color:"#1b5e3c"}}>✕</button>
+                    </div>
+                  )}
                   <p style={{fontWeight:700,color:"var(--br)",fontSize:15}}>🔔 รายการที่ต้องตรวจสอบ/ยืนยัน {queue.length > 0 && `(${queue.length})`}</p>
                   <button onClick={loadQueue} style={{padding:"6px 12px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontWeight:600,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
                 </div>
@@ -3596,7 +3651,7 @@ function AdminDashboard({ token, onLogout }) {
                             <tr key={b.id}>
                               <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short"})}</td>
                               <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
-                              <td>{fmtTime(b)}</td>
+                              <td>{fmtTime(b)}{movedTag(b)}</td>
                               <td style={{fontWeight:600}}>{b.customer_name || "-"}{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}{b.coach_name && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#2d5f8a",background:"rgba(94,151,174,.22)",padding:"1px 6px",borderRadius:8}}>👤 โค้ช {b.coach_name}</span>}</td>
                               <td>{b.customer_id}</td>
                               <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
@@ -3606,6 +3661,7 @@ function AdminDashboard({ token, onLogout }) {
                                 <div style={{display:"flex",gap:6}}>
                                   <button onClick={()=>updateStatus(b.id,"confirmed",null,b.group_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>
                                   <button onClick={()=>updateStatus(b.id,"cancelled",b.package_id,b.group_id,b.coach_order_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                  {canMove(b) && <button onClick={() => openMove(b)} title="เลื่อนวัน/เวลา/สนามของการจองนี้" style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(94,151,174,.2)",color:"#2d5f8a",fontWeight:700,fontSize:12,cursor:"pointer"}}>🕐</button>}
                                 </div>
                               </td>
                             </tr>
@@ -3647,7 +3703,7 @@ function AdminDashboard({ token, onLogout }) {
                         return (
                           <tr key={b.id} id={`bk-${b.id}`} style={highlightId === b.id ? {background:"rgba(255,213,74,.4)",outline:"2px solid #E8A200"} : undefined}>
                             <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
-                            <td>{fmtTime(b)}</td>
+                            <td>{fmtTime(b)}{movedTag(b)}</td>
                             <td style={{fontWeight:600}}>{b.customer_name || "-"}{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}{b.coach_name && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#2d5f8a",background:"rgba(94,151,174,.22)",padding:"1px 6px",borderRadius:8}}>👤 โค้ช {b.coach_name}</span>}</td>
                             <td>{b.customer_id}</td>
                             <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
@@ -3658,6 +3714,7 @@ function AdminDashboard({ token, onLogout }) {
                                 <div style={{display:"flex",gap:6}}>
                                   {b.status!=="confirmed" && <button onClick={()=>updateStatus(b.id,"confirmed",null,b.group_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>}
                                   <button onClick={()=>updateStatus(b.id,"cancelled",b.package_id,b.group_id,b.coach_order_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                  {canMove(b) && <button onClick={() => openMove(b)} title="เลื่อนวัน/เวลา/สนามของการจองนี้" style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(94,151,174,.2)",color:"#2d5f8a",fontWeight:700,fontSize:12,cursor:"pointer"}}>🕐</button>}
                                 </div>
                               )}
                               {b.status==="blocked" && <span style={{fontSize:11,color:"var(--mu)"}}>จัดการที่แท็บ "ปิดสนาม"</span>}
@@ -4442,6 +4499,63 @@ function AdminDashboard({ token, onLogout }) {
           })()}
         </div>
       </div>
+
+      {mv && (() => {
+        const b = mv.b;
+        const dur = b.duration_minutes || 60;
+        const courts = grpCourts(b);
+        const opts = []; for (let m = 6 * 60; m + dur <= 23 * 60; m += 30) opts.push(m);
+        const changed = mv.date !== b.booking_date || mv.startMin !== bkStartMin(b) || (!b.group_id && mv.court !== b.court_id);
+        const tierChanged = !b.package_id && !b.coach_order_id && tierOfBk(b.booking_date, b.hour || 0) !== tierOfBk(mv.date, Math.floor(mv.startMin / 60));
+        const today = toIso(new Date());
+        return (
+          <div onClick={() => !mvBusy && setMv(null)} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(40,22,12,.55)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"20px 10px",overflowY:"auto"}}>
+            <div onClick={e => e.stopPropagation()} style={{background:"#fff",borderRadius:16,width:"100%",maxWidth:460,boxShadow:"0 12px 48px rgba(0,0,0,.35)",overflow:"hidden"}}>
+              <div style={{background:"var(--br)",color:"#fff",padding:"14px 18px",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+                <div style={{minWidth:0}}>
+                  <p style={{fontWeight:800,fontSize:16,margin:0}}>🕐 เลื่อนเวลาการจอง</p>
+                  <p style={{fontSize:12,opacity:.85,margin:"2px 0 0"}}>{b.customer_name || "-"} • 📞 {b.customer_id}</p>
+                </div>
+                <button onClick={() => !mvBusy && setMv(null)} style={{border:"none",background:"rgba(255,255,255,.18)",color:"#fff",width:34,height:34,borderRadius:17,fontSize:16,cursor:"pointer"}}>✕</button>
+              </div>
+              <div style={{padding:16,display:"flex",flexDirection:"column",gap:14}}>
+                <div style={{background:"var(--cr)",borderRadius:10,padding:"10px 12px",fontSize:13,color:"var(--br)",lineHeight:1.7}}>
+                  <b>เวลาเดิม:</b> {niceDate(b.booking_date)} • {minutesToLabel(bkStartMin(b))}–{minutesToLabel(bkStartMin(b) + dur)} • {courts.map(c => "Court " + c).join(" + ")}<br />
+                  ระยะเวลา {dur} นาที (เท่าเดิม){b.group_id ? " • จอง 2 สนาม ย้ายพร้อมกัน" : ""}{b.package_id ? " • 🎟 ใช้สิทธิ์แพ็คเกจ" : ""}{b.coach_name ? ` • 👤 โค้ช ${b.coach_name}` : ""}
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>วันที่เล่นใหม่</label>
+                  <input type="date" value={mv.date} min={today} onChange={e => setMv(p => ({ ...p, date: e.target.value }))} style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,outline:"none"}} />
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>เวลาเริ่มใหม่</label>
+                  <select value={mv.startMin} onChange={e => setMv(p => ({ ...p, startMin: Number(e.target.value) }))} style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,background:"#fff"}}>
+                    {opts.map(m => <option key={m} value={m}>{minutesToLabel(m)} – {minutesToLabel(m + dur)}</option>)}
+                  </select>
+                </div>
+                {!b.group_id && (
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>สนาม</label>
+                    <div style={{display:"flex",gap:8}}>
+                      {[1, 2].map(c => <button key={c} onClick={() => setMv(p => ({ ...p, court: c }))} style={{flex:1,padding:"10px",borderRadius:8,border:`2px solid ${mv.court === c ? "var(--or)" : "var(--dv)"}`,background:mv.court === c ? "var(--or-bg)" : "#fff",color:mv.court === c ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:14,cursor:"pointer"}}>{mv.court === c ? "✓ " : ""}Court {c}</button>)}
+                    </div>
+                  </div>
+                )}
+                <div style={{fontSize:13,color:"var(--br)",lineHeight:1.7}}>
+                  <b>เวลาใหม่:</b> {niceDate(mv.date)} • {minutesToLabel(mv.startMin)}–{minutesToLabel(mv.startMin + dur)} • {(b.group_id ? courts : [mv.court]).map(c => "Court " + c).join(" + ")}
+                </div>
+                {tierChanged && <p style={{fontSize:12.5,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:8,padding:"8px 10px",margin:0,lineHeight:1.6}}>⚠️ ช่วงเวลาใหม่เป็นคนละช่วงราคา ({tierOfBk(b.booking_date, b.hour || 0) === "peak" ? "Peak" : "Off Peak"} → {tierOfBk(mv.date, Math.floor(mv.startMin / 60)) === "peak" ? "Peak" : "Off Peak"}) ระบบ <b>ไม่คิดส่วนต่างราคา</b> ให้ — ราคาเดิม ฿{(b.price || 0).toLocaleString()} ยังคงเดิม ถ้าต้องการเก็บส่วนต่าง แจ้งลูกค้าเอง</p>}
+                {(b.package_id || b.coach_name) && <p style={{fontSize:12,color:"var(--mu)",margin:0,lineHeight:1.6}}>การจองนี้ใช้สิทธิ์แพ็คเกจ/คอร์สโค้ช — ระบบตรวจกติกาให้เอง (ประเภทแพ็คเกจ วันในอายุแพ็คเกจ โค้ชไม่ซ้อนเวลา) สิทธิ์ที่ใช้ไปไม่เปลี่ยน</p>}
+                {mvErr && <p style={{fontSize:13,color:"#c0392b",fontWeight:600,margin:0,lineHeight:1.6}}>{mvErr}</p>}
+                <div style={{display:"flex",gap:10}}>
+                  <button onClick={() => setMv(null)} disabled={mvBusy} style={{flex:1,padding:"13px",borderRadius:10,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontWeight:700,fontSize:14.5,cursor:"pointer"}}>ยกเลิก</button>
+                  <button onClick={submitMove} disabled={!changed || mvBusy || !mv.date} style={{flex:2,padding:"13px",borderRadius:10,border:"none",background:(changed && !mvBusy && mv.date) ? "linear-gradient(90deg,var(--or),var(--or2))" : "var(--cr2)",color:(changed && !mvBusy && mv.date) ? "#fff" : "var(--mu)",fontWeight:800,fontSize:15,cursor:(changed && !mvBusy && mv.date) ? "pointer" : "not-allowed"}}>{mvBusy ? "กำลังเลื่อน..." : "ยืนยันเลื่อนเวลา"}</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {histPhone && (
         <div onClick={closeHistory} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(40,22,12,.55)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"20px 10px",overflowY:"auto"}}>
