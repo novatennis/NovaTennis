@@ -182,6 +182,19 @@ async function getActiveIntervals(bookingDate, courtId) {
     .map((b) => { const s = (b.hour || 0) * 60 + (b.start_minute || 0); return [s, s + (b.duration_minutes || 60)]; });
 }
 
+// ช่วงที่ถูกจองอยู่ของสนาม/วันนั้น "ยกเว้นแถวที่ระบุ" — ใช้ตอนเลื่อนเวลา: การจองเดิมต้องไม่นับเป็นคู่ชนกับตัวเอง (10:00–11:00 → 10:30–11:30)
+// คืน null ถ้าดึงข้อมูลไม่สำเร็จ (ผู้เรียกต้องไม่ถือว่า "ว่าง")
+async function getActiveIntervalsExcluding(bookingDate, courtId, excludeIds) {
+  const { ok, body } = await sb(`bookings?booking_date=eq.${bookingDate}&court_id=eq.${courtId}&status=neq.cancelled&select=id,hour,start_minute,duration_minutes,status,created_time`);
+  if (!ok || !Array.isArray(body)) return null;
+  const now = Date.now();
+  const skip = new Set((excludeIds || []).map(String));
+  return body
+    .filter((b) => !skip.has(String(b.id)))
+    .filter((b) => (b.status === "pending" ? now - new Date(b.created_time).getTime() < 5 * 60 * 1000 : true))
+    .map((b) => { const s = (b.hour || 0) * 60 + (b.start_minute || 0); return [s, s + (b.duration_minutes || 60)]; });
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed" });
@@ -299,6 +312,105 @@ export default async function handler(req, res) {
         }
         if (status === "cancelled" && before?.package_id) await releasePackageStartIfUnused(before.package_id); // การจองด้วยแพ็คเกจถูกยกเลิก → ถ้าไม่เหลือการจองอื่น ถอยกลับเป็นยังไม่เริ่มนับอายุ
         res.status(200).json({ ok: true });
+        return;
+      }
+      case "rescheduleBooking": {
+        // แอดมินเลื่อน วัน/เวลาเริ่ม (และสนาม ถ้าเป็นการจองสนามเดียว) ของการจองที่มีอยู่ — ระยะเวลาเท่าเดิม ไม่คิดราคาใหม่ (ไม่ต้องยกเลิกแล้วจองใหม่)
+        // ตรวจ: ว่างจริง (ไม่นับตัวเอง) / ในเวลาเปิด 06:00–23:00 / ไม่ย้อนเวลาที่ผ่านไปแล้ว / กติกาแพ็คเกจ / โค้ชไม่ซ้อนเวลา — บันทึกแล้วตรวจซ้ำ ถ้าชนจะย้อนกลับ
+        const { id, newDate } = p;
+        const newHour = p.hour, newStartMinute = p.startMinute || 0;
+        if (!id) { res.status(400).json({ error: "missing id" }); return; }
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(newDate || "")) { res.status(400).json({ error: "invalid date" }); return; }
+        if (!Number.isInteger(newHour) || newHour < 0 || newHour > 23 || ![0, 30].includes(newStartMinute)) { res.status(400).json({ error: "invalid time" }); return; }
+        const { body: bRows } = await sb(`bookings?id=eq.${encodeURIComponent(id)}&select=*`);
+        const bk = Array.isArray(bRows) ? bRows[0] : null;
+        if (!bk) { res.status(404).json({ error: "not_found" }); return; }
+        if (!["confirmed", "reviewing"].includes(bk.status)) { res.status(400).json({ error: "invalid_status" }); return; } // เลื่อนได้เฉพาะ ยืนยันแล้ว / รอตรวจสอบ
+        let rows = [bk];
+        if (bk.group_id) {
+          const { body: g } = await sb(`bookings?group_id=eq.${encodeURIComponent(bk.group_id)}&status=in.(confirmed,reviewing)&select=*`);
+          if (Array.isArray(g) && g.length > 0) rows = g; // จอง 2 สนามพร้อมกัน: ย้ายทั้งกลุ่ม
+        }
+        const isGroup = rows.length > 1;
+        const dur = bk.duration_minutes || 60;
+        const oldStart = (bk.hour || 0) * 60 + (bk.start_minute || 0);
+        const targetCourts = isGroup ? rows.map((r) => r.court_id).sort() : [p.courtId ? Number(p.courtId) : bk.court_id];
+        if (targetCourts.some((c) => c !== 1 && c !== 2)) { res.status(400).json({ error: "invalid_courts" }); return; }
+        const newStart = newHour * 60 + newStartMinute, newEnd = newStart + dur;
+        if (newStart < 6 * 60 || newEnd > 23 * 60) { res.status(400).json({ error: "outside_hours" }); return; }
+        const sameCourt = isGroup || targetCourts[0] === bk.court_id;
+        if (newDate === bk.booking_date && newStart === oldStart && sameCourt) { res.status(400).json({ error: "no_change" }); return; }
+        const nowBkk = new Date(Date.now() + 7 * 3600e3);
+        const today = nowBkk.toISOString().slice(0, 10), nowMin = nowBkk.getUTCHours() * 60 + nowBkk.getUTCMinutes();
+        if (bk.booking_date < today || (bk.booking_date === today && oldStart + dur <= nowMin)) { res.status(400).json({ error: "booking_in_past" }); return; } // การจองที่จบไปแล้วไม่ให้เลื่อน
+        if (newDate < today || (newDate === today && newStart < nowMin)) { res.status(400).json({ error: "new_time_past" }); return; }
+
+        // การจองที่ใช้สิทธิ์แพ็คเกจ: ชั่วโมงใหม่ต้องตรงกับประเภทแพ็คเกจ / วันที่ใหม่ต้องอยู่ในอายุแพ็คเกจ / การจองที่เป็นตัวกำหนดวันเริ่มนับอายุ ห้ามเลื่อนข้ามวัน
+        if (bk.package_id) {
+          const { body: pr } = await sb(`packages?id=eq.${bk.package_id}&select=*`);
+          const pkg = Array.isArray(pr) ? pr[0] : null;
+          if (pkg) {
+            const units = Math.max(1, Math.round(dur / 60));
+            const dow = new Date(newDate + "T00:00:00").getDay();
+            const weekend = dow === 0 || dow === 6;
+            if (!Array.from({ length: units }, (_, i) => newHour + i).every((h) => pkg.tier === "peak" || !(weekend || h >= 16))) { res.status(400).json({ error: "package_wrong_tier" }); return; }
+            if (newDate !== bk.booking_date) {
+              if (pkg.first_use_date && String(pkg.first_use_date).slice(0, 10) === bk.booking_date) {
+                const { body: others } = await sb(`bookings?package_id=eq.${pkg.id}&status=neq.cancelled&booking_date=eq.${bk.booking_date}&id=neq.${bk.id}&select=id&limit=1`);
+                if (Array.isArray(others) && others.length === 0) { res.status(400).json({ error: "package_start_move" }); return; } // เป็นการจองแรกที่กำหนดวันเริ่มนับอายุ → ยกเลิกแล้วจองใหม่
+              }
+              const win = checkPackageWindow(pkg, newDate);
+              if (win.error) { res.status(400).json(win); return; }
+            }
+          }
+        }
+        // การนัดเรียนกับโค้ช: โค้ชคนเดิมห้ามถูกนัดซ้อนเวลาใหม่ (ไม่นับการจองนี้เอง)
+        if (bk.coach_name) {
+          const norm = (s) => String(s || "").normalize("NFC").replace(/\s+/g, "").toLowerCase();
+          const { body: dayRows } = await sb(`bookings?booking_date=eq.${newDate}&status=neq.cancelled&coach_name=not.is.null&select=id,coach_name,hour,start_minute,duration_minutes,court_id`);
+          if (!Array.isArray(dayRows)) { res.status(500).json({ error: "availability_check_failed" }); return; }
+          const clash = dayRows.find((b) => String(b.id) !== String(bk.id) && norm(b.coach_name) === norm(bk.coach_name) && (() => { const s = (b.hour || 0) * 60 + (b.start_minute || 0); return newStart < s + (b.duration_minutes || 60) && newEnd > s; })());
+          if (clash) { const s = (clash.hour || 0) * 60 + (clash.start_minute || 0); res.status(409).json({ error: "coach_busy", coach: bk.coach_name, from: minutesToLabel(s), to: minutesToLabel(s + (clash.duration_minutes || 60)), court: clash.court_id }); return; }
+        }
+        // ช่องใหม่ต้องว่าง (การจองเดิมของตัวเองไม่นับเป็นคู่ชน)
+        const excludeIds = rows.map((r) => r.id);
+        for (const cid of targetCourts) {
+          const taken = await getActiveIntervalsExcluding(newDate, cid, excludeIds);
+          if (!taken) { res.status(500).json({ error: "availability_check_failed" }); return; }
+          if (taken.some(([s, e]) => newStart < e && newEnd > s)) { res.status(409).json({ error: "slot_taken", court: cid }); return; }
+        }
+
+        const originalCourts = isGroup ? targetCourts.join("+") : String(bk.court_id);
+        const movedFrom = bk.moved_from || `${bk.booking_date} ${minutesToLabel(oldStart)}|${originalCourts}`; // เก็บเวลาเดิม "ครั้งแรก" ไว้เสมอ
+        const patchBase = { booking_date: newDate, hour: newHour, start_minute: newStartMinute, ...(!isGroup && targetCourts[0] !== bk.court_id ? { court_id: targetCourts[0] } : {}) };
+        const target = isGroup ? `bookings?group_id=eq.${encodeURIComponent(bk.group_id)}&status=in.(confirmed,reviewing)` : `bookings?id=eq.${encodeURIComponent(id)}`;
+        let hasHistory = true;
+        let upd = await sb(target, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ ...patchBase, moved_from: movedFrom, moved_at: new Date(Date.now()).toISOString() }) });
+        if (!upd.ok && /moved_from|moved_at/.test(JSON.stringify(upd.body || ""))) { // ยังไม่ได้รัน add-reschedule-columns.sql → เลื่อนให้ตามปกติ แค่ไม่มีป้ายประวัติ
+          hasHistory = false;
+          upd = await sb(target, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify(patchBase) });
+        }
+        const revert = async () => {
+          for (const r of rows) await sb(`bookings?id=eq.${r.id}`, { method: "PATCH", body: JSON.stringify({ booking_date: r.booking_date, hour: r.hour, start_minute: r.start_minute || 0, court_id: r.court_id, ...(hasHistory ? { moved_from: r.moved_from ?? null, moved_at: r.moved_at ?? null } : {}) }) });
+        };
+        if (!upd.ok || !Array.isArray(upd.body) || upd.body.length !== rows.length) { await revert(); console.error("rescheduleBooking update failed:", upd.body); res.status(500).json({ error: "update_failed" }); return; }
+        // ตรวจซ้ำหลังบันทึก: ถ้ามีคนจองชนช่องใหม่พอดีระหว่างนั้น ย้อนกลับให้
+        for (const cid of targetCourts) {
+          const taken = await getActiveIntervalsExcluding(newDate, cid, excludeIds);
+          if (!taken || taken.some(([s, e]) => newStart < e && newEnd > s)) { await revert(); res.status(taken ? 409 : 500).json(taken ? { error: "slot_taken", court: cid } : { error: "availability_check_failed" }); return; }
+        }
+        const tierOf = (d, h) => { const dow = new Date(d + "T00:00:00").getDay(); return (dow === 0 || dow === 6 || h >= 16) ? "peak" : "offpeak"; };
+        const priceTierChanged = !bk.package_id && !bk.coach_order_id && tierOf(bk.booking_date, bk.hour || 0) !== tierOf(newDate, newHour); // ช่วงราคาเปลี่ยน: ระบบไม่คิดส่วนต่างให้ แอดมินตัดสินใจเอง
+        const courtsLabel = (cs) => cs.map((c) => `Court ${c}`).join(" + ");
+        await notifyTelegram(
+          `🕐 <b>แอดมินเลื่อนเวลาการจอง</b>\n\n` +
+          `👤 ${esc(bk.customer_name || "-")}\n📞 ${bk.customer_id}\n` +
+          `📌 เดิม: ${bk.booking_date} ${minutesToLabel(oldStart)}–${minutesToLabel(oldStart + dur)} • ${courtsLabel(isGroup ? targetCourts : [bk.court_id])}\n` +
+          `✅ ใหม่: ${newDate} ${minutesToLabel(newStart)}–${minutesToLabel(newEnd)} • ${courtsLabel(targetCourts)}` +
+          (bk.coach_name ? `\n👤 โค้ช: ${esc(bk.coach_name)}` : "") +
+          (priceTierChanged ? `\n⚠️ ช่วงเวลาใหม่เป็นคนละช่วงราคา (${tierOf(bk.booking_date, bk.hour || 0) === "peak" ? "Peak" : "Off Peak"} → ${tierOf(newDate, newHour) === "peak" ? "Peak" : "Off Peak"}) ไม่ได้คิดส่วนต่างราคาให้` : "")
+        );
+        res.status(200).json({ ok: true, bookings: upd.body, priceTierChanged, from: { date: bk.booking_date, start: minutesToLabel(oldStart), courts: isGroup ? targetCourts : [bk.court_id] }, to: { date: newDate, start: minutesToLabel(newStart), end: minutesToLabel(newEnd), courts: targetCourts } });
         return;
       }
       case "sourceReport": {
