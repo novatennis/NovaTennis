@@ -82,6 +82,25 @@ const PACKAGE_PRICES = {
   peak:    { 2: { price: 1150, days: 7 }, 5: { price: 2750, days: 60 }, 10: { price: 5000, days: 90 } },
 };
 
+// ─── โปรพิเศษ 11.11 (แพ็คเกจระยะสั้น) — เซิร์ฟเวอร์เป็นคนตัดสินราคา/จำนวนครั้ง/วันใช้งานเสมอ ไม่เชื่อค่าจาก client ───
+// ขายตั้งแต่ startsAt (10 พ.ย. 00:00) ถึง endsAt (13 พ.ย. สิ้นนาที 23:59) เวลาไทย / ไม่จำกัดจำนวนแพ็คเกจต่อคน / ไม่มีกำหนดเริ่มใช้ — อายุแพ็คเกจเริ่มนับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ (กติกาเดียวกับแพ็คเกจปกติ)
+// "ALL" = ใช้ได้ทุกเวลา (tier peak) / "DAY" = จันทร์–ศุกร์ ก่อน 16:00 (tier offpeak) — ต้องตรงกับ PROMO_1111 ใน admin-actions.js และ nova-tennis.jsx (มีเทสต์เทียบไฟล์ไว้)
+const PROMO_1111 = {
+  startsAt: "2026-11-10T00:00:00+07:00",
+  endsAt: "2026-11-13T23:59:59.999+07:00",
+  items: {
+    "ALL-3":  { name: "Starter",           tier: "peak",    credits: 3,  price: 1590, days: 30 },
+    "ALL-6":  { name: "Plus",              tier: "peak",    credits: 6,  price: 2990, days: 60 },
+    "ALL-11": { name: "11.11 Special",     tier: "peak",    credits: 11, price: 4999, days: 111 },
+    "DAY-3":  { name: "Day Starter",       tier: "offpeak", credits: 3,  price: 1290, days: 30 },
+    "DAY-6":  { name: "Day Plus",          tier: "offpeak", credits: 6,  price: 2490, days: 60 },
+    "DAY-11": { name: "Day 11.11 Special", tier: "offpeak", credits: 11, price: 4399, days: 111 },
+  },
+};
+const PROMO_TAG = "1111:";
+const promoOpen = () => Date.now() >= Date.parse(PROMO_1111.startsAt) && Date.now() <= Date.parse(PROMO_1111.endsAt);
+const promoNotStarted = () => Date.now() < Date.parse(PROMO_1111.startsAt);
+
 function getDurationPrice(startHour, dateObj, durationMinutes) {
   const inPromo = dateObj >= PROMO_START && dateObj <= PROMO_END;
   const day = dateObj.getDay();
@@ -236,7 +255,7 @@ async function notifySlipPackage(row) {
     const sentAt = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().substr(11, 5);
     await notifyTelegram(
       `🔔 <b>มีลูกค้าส่งสลิปซื้อแพ็คเกจ</b>\n\n` +
-      `🎟 แพ็คเกจ ${row.tier === "peak" ? "Peak" : "Off Peak"} × ${row.total_credits} ครั้ง\n` +
+      `🎟 ${row.promo_code && PROMO_1111.items[String(row.promo_code).slice(PROMO_TAG.length)] ? `โปร 11.11 ${PROMO_1111.items[String(row.promo_code).slice(PROMO_TAG.length)].name} (${row.tier === "peak" ? "ทุกเวลา" : "จ.–ศ. ก่อน 16:00"})` : `แพ็คเกจ ${row.tier === "peak" ? "Peak" : "Off Peak"}`} × ${row.total_credits} ครั้ง\n` +
       `💰 ยอด: ฿${(row.price || 0).toLocaleString()}\n` +
       `👤 ชื่อ: ${esc(row.customer_name || "-")}\n` +
       `📞 เบอร์: ${row.customer_id}\n` +
@@ -821,13 +840,18 @@ export default async function handler(req, res) {
 
       case "createPackage": {
         // ซื้อแพ็คเกจใหม่ — เซิร์ฟเวอร์เป็นคนตัดสินราคา/วันหมดอายุเองเสมอ ไม่เชื่อค่าจาก client
-        const { tier, credits } = p;
         const who = await getLinkedCustomer(p.session);
         if (who.error) { res.status(403).json({ error: who.error }); return; }
         const customerId = who.phone;
         const customerName = who.name;
+        // โปรพิเศษ 11.11: เลือกด้วยรหัสโปร (เช่น ALL-11) — ประเภท/จำนวนครั้ง/ราคา/อายุ มาจากตารางโปรของเซิร์ฟเวอร์ ไม่ใช่ค่าที่ส่งมา
+        const promoItem = p.promo ? PROMO_1111.items[p.promo] : null;
+        if (p.promo && !promoItem) { res.status(400).json({ error: "invalid promo" }); return; }
+        if (promoItem && !promoOpen()) { res.status(400).json({ error: promoNotStarted() ? "promo_not_started" : "promo_ended" }); return; }
+        const tier = promoItem ? promoItem.tier : p.tier;
+        const credits = promoItem ? promoItem.credits : p.credits;
         if (!["offpeak", "peak"].includes(tier)) { res.status(400).json({ error: "invalid tier" }); return; }
-        const def = PACKAGE_PRICES[tier]?.[credits];
+        const def = promoItem ? { price: promoItem.price, days: promoItem.days } : PACKAGE_PRICES[tier]?.[credits];
         if (!def) { res.status(400).json({ error: "invalid credits" }); return; }
         if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid phone" }); return; }
         if (!customerName || String(customerName).trim().length < 1) {
@@ -840,17 +864,18 @@ export default async function handler(req, res) {
           body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
         });
 
-        const { body: created } = await sb(`packages`, {
+        const ins = await sb(`packages`, {
           method: "POST",
           headers: { Prefer: "return=representation" },
           body: JSON.stringify({
             customer_id: customerId, customer_name: customerName, tier,
             total_credits: credits, remaining_credits: credits,
             price: def.price, expiry_days: def.days, status: "pending",
+            ...(promoItem ? { promo_code: PROMO_TAG + p.promo } : {}),
           }),
         });
-        const pkgRow = (created || [])[0];
-        if (!pkgRow) { res.status(500).json({ error: "insert_failed" }); return; }
+        const pkgRow = Array.isArray(ins.body) ? ins.body[0] : null;
+        if (!pkgRow) { res.status(500).json({ error: /promo_code/.test(JSON.stringify(ins.body || "")) ? "promo_columns_missing" : "insert_failed" }); return; }
         res.status(200).json({ package: pkgRow });
         return;
       }
@@ -906,7 +931,7 @@ export default async function handler(req, res) {
         const { body } = await sb(`packages?customer_id=eq.${phone}&select=*&order=created_time.desc`);
         let pkgs = await Promise.all((Array.isArray(body) ? body : []).map(async ({ admin_note, ...pk }) => (pk.status === "active" ? { ...pk, reserved_credits: await getReservedCredits(pk.id) } : pk))); // admin_note = หมายเหตุภายในของแอดมิน ไม่ส่งให้ลูกค้า
         // ยังไม่ผูกเบอร์ (กำลังกรอกเบอร์เป็นครั้งแรกเพื่อให้ระบบหาสิทธิ์แพ็คเกจให้) → ส่งเฉพาะข้อมูลสิทธิ์ที่จำเป็น ไม่ส่งชื่อ/ราคา/สลิป
-        if (!me.phone) pkgs = pkgs.map(({ id, tier, status, total_credits, remaining_credits, expiry_date, expiry_days, first_use_date, reserved_credits }) => ({ id, tier, status, total_credits, remaining_credits, expiry_date, expiry_days, first_use_date, reserved_credits }));
+        if (!me.phone) pkgs = pkgs.map(({ id, tier, status, total_credits, remaining_credits, expiry_date, expiry_days, first_use_date, promo_code, reserved_credits }) => ({ id, tier, status, total_credits, remaining_credits, expiry_date, expiry_days, first_use_date, promo_code, reserved_credits }));
         res.status(200).json({ packages: pkgs });
         return;
       }
