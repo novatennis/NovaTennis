@@ -80,6 +80,24 @@ const todayBangkok = () => new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString
 // ซื้อ/ยืนยัน = ยังไม่เริ่มนับ (expiry_date ว่าง) → จองด้วยแพ็คเกจครั้งแรก วันเล่นของการจองนั้นเป็นวันที่ 1 → ใช้เล่นได้ตามจำนวนวันของแพ็คเกจ
 // เช่น แพ็ค 7 วัน จองเล่นครั้งแรก 2 พ.ย. ใช้เล่นได้ 2–8 พ.ย. (ถ้าต้องการนับ "7 วันนับจากวันถัดไป" เปลี่ยน COUNT_FIRST_PLAY_DAY เป็น false)
 // แพ็คเกจเก่าที่เริ่มนับไปแล้ว (มี expiry_date แต่ไม่มี first_use_date) ใช้วันหมดอายุเดิม ไม่ถูกแก้ ฟังก์ชันชุดนี้ต้องเหมือนกันใน booking-actions.js และ admin-actions.js
+// ─── โปรพิเศษ 11.11 (แพ็คเกจระยะสั้น) — เซิร์ฟเวอร์เป็นคนตัดสินราคา/จำนวนครั้ง/วันใช้งานเสมอ ไม่เชื่อค่าจาก client ───
+// ขายตั้งแต่ startsAt (10 พ.ย. 00:00) ถึง endsAt (13 พ.ย. สิ้นนาที 23:59) เวลาไทย / ไม่จำกัดจำนวนแพ็คเกจต่อคน / ไม่มีกำหนดเริ่มใช้ — อายุแพ็คเกจเริ่มนับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ (กติกาเดียวกับแพ็คเกจปกติ)
+// "ALL" = ใช้ได้ทุกเวลา (tier peak) / "DAY" = จันทร์–ศุกร์ ก่อน 16:00 (tier offpeak) — ต้องตรงกับ PROMO_1111 ใน admin-actions.js และ nova-tennis.jsx (มีเทสต์เทียบไฟล์ไว้)
+const PROMO_1111 = {
+  startsAt: "2026-11-10T00:00:00+07:00",
+  endsAt: "2026-11-13T23:59:59.999+07:00",
+  items: {
+    "ALL-3":  { name: "Starter",           tier: "peak",    credits: 3,  price: 1590, days: 30 },
+    "ALL-6":  { name: "Plus",              tier: "peak",    credits: 6,  price: 2990, days: 60 },
+    "ALL-11": { name: "11.11 Special",     tier: "peak",    credits: 11, price: 4999, days: 111 },
+    "DAY-3":  { name: "Day Starter",       tier: "offpeak", credits: 3,  price: 1290, days: 30 },
+    "DAY-6":  { name: "Day Plus",          tier: "offpeak", credits: 6,  price: 2490, days: 60 },
+    "DAY-11": { name: "Day 11.11 Special", tier: "offpeak", credits: 11, price: 4399, days: 111 },
+  },
+};
+const PROMO_TAG = "1111:";
+const promoOpen = () => Date.now() >= Date.parse(PROMO_1111.startsAt) && Date.now() <= Date.parse(PROMO_1111.endsAt);
+const promoNotStarted = () => Date.now() < Date.parse(PROMO_1111.startsAt);
 const COUNT_FIRST_PLAY_DAY = true;
 const addDaysIso = (iso, n) => { const [y, m, d] = iso.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10); };
 const packageWindowEnd = (firstPlayDate, days) => addDaysIso(firstPlayDate, Math.max(1, Number(days) || 1) - (COUNT_FIRST_PLAY_DAY ? 1 : 0));
@@ -457,7 +475,7 @@ export default async function handler(req, res) {
             if (x.remaining_credits <= 0) { issue("สิทธิ์หมดแล้ว"); continue; }
             const reserved = await getReservedCredits(x.id);
             if (x.remaining_credits - reserved <= 0) { issue(`สิทธิ์ที่เหลือ ${x.remaining_credits} ครั้ง ถูกจองค้างรอยืนยันครบแล้ว (${reserved} ครั้ง) — ไปแท็บ "การจอง" เพื่อยืนยันหรือยกเลิกรายการที่ค้างอยู่`); continue; }
-            packages.push({ id: x.id, tier: x.tier, total_credits: x.total_credits, remaining_credits: x.remaining_credits, expiry_date: x.expiry_date, expiry_days: x.expiry_days, first_use_date: x.first_use_date || null, reserved_credits: reserved, available: x.remaining_credits - reserved });
+            packages.push({ id: x.id, tier: x.tier, total_credits: x.total_credits, remaining_credits: x.remaining_credits, expiry_date: x.expiry_date, expiry_days: x.expiry_days, first_use_date: x.first_use_date || null, promo_code: x.promo_code || null, reserved_credits: reserved, available: x.remaining_credits - reserved });
           }
         } catch (e) {
           console.error("lookupCustomer packages error:", e);
@@ -805,18 +823,25 @@ export default async function handler(req, res) {
         for (const tier of ["peak", "offpeak"]) for (const credits of [2, 5, 10]) packages.push({ tier, credits, price: PACKAGE_PRICES[tier][credits].price, days: PACKAGE_PRICES[tier][credits].days });
         const coach = [];
         for (const audience of ["adult", "kid"]) for (const type of ["duo", "private"]) for (const s of COACH_SESSIONS) coach.push(coachQuote(audience, type, s));
-        res.status(200).json({ packages, coach });
+        const promo = { open: promoOpen(), startsAt: PROMO_1111.startsAt, endsAt: PROMO_1111.endsAt, items: Object.entries(PROMO_1111.items).map(([code, it]) => ({ code, ...it })) };
+        res.status(200).json({ packages, coach, promo });
         return;
       }
       case "sellToCustomer": {
         // แอดมินบันทึกขายให้ลูกค้าที่โอนเงินแล้ว (ไม่ผ่านเว็บ): ใช้งานได้ทันที ไม่ต้องรอสลิป — รับเงินโอนอย่างเดียว
         // ปลอดภัย: ราคาป้ายคิดที่เซิร์ฟเวอร์ / ลดราคาหรือแจกฟรีได้แต่ต้องมีหมายเหตุ / สูงกว่าป้ายไม่ได้ / กันกดซ้ำ / แจ้ง Telegram ทุกครั้ง
         const { kind, customerId } = p;
-        if (!["package", "coach"].includes(kind)) { res.status(400).json({ error: "invalid_kind" }); return; }
+        if (!["package", "coach", "promo"].includes(kind)) { res.status(400).json({ error: "invalid_kind" }); return; }
         if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid_phone" }); return; }
 
-        let list, label, def = null, quote = null;
-        if (kind === "package") {
+        let list, label, def = null, quote = null, pkgTier = p.tier, pkgCredits = Number(p.credits);
+        if (kind === "promo") {
+          const item = PROMO_1111.items[p.promo];
+          if (!item) { res.status(400).json({ error: "invalid_product" }); return; }
+          if (!promoOpen()) { res.status(400).json({ error: promoNotStarted() ? "promo_not_started" : "promo_ended" }); return; }
+          pkgTier = item.tier; pkgCredits = item.credits; def = { price: item.price, days: item.days };
+          list = item.price; label = `โปร 11.11 ${item.name} (${item.tier === "peak" ? "ทุกเวลา" : "จ.–ศ. ก่อน 16:00"}) ${item.credits} ครั้ง`;
+        } else if (kind === "package") {
           def = PACKAGE_PRICES[p.tier]?.[Number(p.credits)];
           if (!def) { res.status(400).json({ error: "invalid_product" }); return; }
           list = def.price; label = packageLabel(p.tier, Number(p.credits));
@@ -841,34 +866,35 @@ export default async function handler(req, res) {
         if (nameLen(name) < 1) { res.status(400).json({ error: "invalid_name" }); return; }
 
         // กันกดซ้ำ: สินค้าเดียวกัน เบอร์เดียวกัน ที่แอดมินขายภายใน 2 นาที
-        const table = kind === "package" ? "packages" : "coach_orders";
+        const table = kind === "coach" ? "coach_orders" : "packages";
         const since = new Date(Date.now() - 2 * 60 * 1000).toISOString();
         const { body: recent } = await sb(`${table}?customer_id=eq.${customerId}&sold_by=eq.admin&status=neq.cancelled&created_time=gte.${since}&select=*`);
         if (!Array.isArray(recent)) { res.status(500).json({ error: "sale_columns_missing" }); return; } // ยังไม่ได้รัน add-admin-sale-columns.sql
-        const dup = recent.find((r) => kind === "package"
-          ? r.tier === p.tier && Number(r.total_credits) === Number(p.credits)
+        const dup = recent.find((r) => kind !== "coach"
+          ? r.tier === pkgTier && Number(r.total_credits) === pkgCredits && (kind === "promo" ? r.promo_code === PROMO_TAG + p.promo : !r.promo_code)
           : r.audience === quote.audience && r.type === quote.type && Number(r.sessions) === quote.sessions);
         if (dup) { res.status(409).json({ error: "duplicate_recent", id: dup.id }); return; }
 
         const nowMs = Date.now();
         const base = { customer_id: customerId, customer_name: name, price, list_price: list, sold_by: "admin", payment_method: price > 0 ? "transfer" : "free", admin_note: note || null };
-        const row = kind === "package"
-          ? { ...base, tier: p.tier, total_credits: Number(p.credits), remaining_credits: Number(p.credits), expiry_days: def.days, status: "active", activated_at: new Date(nowMs).toISOString() }
+        const row = kind !== "coach"
+          ? { ...base, tier: pkgTier, total_credits: pkgCredits, remaining_credits: pkgCredits, expiry_days: def.days, status: "active", activated_at: new Date(nowMs).toISOString(), ...(kind === "promo" ? { promo_code: PROMO_TAG + p.promo } : {}) }
           : { ...base, line_user_id: linked?.line_user_id || null, audience: quote.audience, type: quote.type, sessions: quote.sessions, people: quote.people, status: "confirmed", confirmed_time: new Date(nowMs).toISOString(), sessions_used: 0 };
 
         await sb(`customers`, { method: "POST", headers: { Prefer: "resolution=ignore-duplicates" }, body: JSON.stringify({ customer_id: customerId, customer_name: name }) });
         const ins = await sb(table, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(row) });
         const created = Array.isArray(ins.body) ? ins.body[0] : null;
         if (!ins.ok || !created) {
+          if (kind === "promo" && /promo_code/.test(JSON.stringify(ins.body || ""))) { res.status(500).json({ error: "promo_columns_missing" }); return; }
           if (SALE_COLUMN_RE.test(JSON.stringify(ins.body || ""))) { res.status(500).json({ error: "sale_columns_missing" }); return; }
           console.error("sellToCustomer insert failed:", ins.body); res.status(500).json({ error: "insert_failed" }); return;
         }
         await notifyTelegram(
-          `🛒 <b>แอดมินบันทึกขาย${kind === "package" ? "แพ็คเกจสนาม" : "คอร์สโค้ช"}ให้ลูกค้า</b>\n\n` +
+          `🛒 <b>แอดมินบันทึกขาย${kind === "coach" ? "คอร์สโค้ช" : kind === "promo" ? "แพ็คเกจโปร 11.11" : "แพ็คเกจสนาม"}ให้ลูกค้า</b>\n\n` +
           `📦 ${esc(label)}\n👤 ${esc(name)}\n📞 ${customerId}\n` +
           `💰 ฿${price.toLocaleString()}${price !== list ? ` (ราคาป้าย ฿${list.toLocaleString()} • ลด ฿${(list - price).toLocaleString()})` : ""} • ${price > 0 ? "รับเงินโอนแล้ว" : "แจกฟรี"}\n` +
           (note ? `📝 ${esc(note)}\n` : "") +
-          `ใช้งานได้ทันที — ${kind === "package" ? `ยังไม่เริ่มนับอายุ (เริ่มนับวันเล่นครั้งแรกที่จอง • ใช้เล่นได้ ${def.days} วัน)` : `รหัสคอร์ส C-${created.id}`}`
+          `ใช้งานได้ทันที — ${kind === "coach" ? `รหัสคอร์ส C-${created.id}` : `ยังไม่เริ่มนับอายุ (เริ่มนับวันเล่นครั้งแรกที่จอง • ใช้เล่นได้ ${def.days} วัน)`}`
         );
         const { line_user_id, ...pub } = created;
         res.status(200).json({ ok: true, kind, item: pub, label, price, listPrice: list });
