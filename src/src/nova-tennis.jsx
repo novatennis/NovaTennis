@@ -48,8 +48,8 @@ const db = {
     if (error) return { error, available, needed, expiry_date, start_date };
     return { booking };
   },
-  async createPackage({ tier, credits, customerId, customerName }) {
-    const { package: pkg, error } = await callBookingAction("createPackage", { tier, credits, customerId, customerName });
+  async createPackage({ tier, credits, promo, customerId, customerName }) {
+    const { package: pkg, error } = await callBookingAction("createPackage", { tier, credits, ...(promo ? { promo } : {}), customerId, customerName });
     if (error) return { error };
     return { package: pkg };
   },
@@ -202,6 +202,30 @@ function getSlotPrice(hour, dateObj) { return getDurationPrice(hour, dateObj, 60
 // โปรโมชั่นจองครั้งแรก (แสดงผลเท่านั้น — เซิร์ฟเวอร์เป็นคนตัดสินราคาจริง ต้องแก้ให้ตรงกับ FIRST_TIME_PROMO ใน booking-actions.js ถ้าเปลี่ยน)
 // ใช้ได้กับ "วันที่เล่น" ถึง lastPlayDate (รวมวันนั้น)
 const FIRST_TIME_PROMO = { weekday: 450, weekend: 490, lastPlayDate: "2026-10-31", endTh: "31 ต.ค. 2569", endEn: "31 Oct 2026" };
+
+// โปรพิเศษ 11.11 (แพ็คเกจระยะสั้น) — แสดงผลเท่านั้น เซิร์ฟเวอร์ตัดสินราคา/จำนวนครั้ง/กติกาจริง (ต้องตรงกับ PROMO_1111 ใน booking-actions.js และ admin-actions.js)
+// "all" = ใช้ได้ทุกเวลา (เทียบ Peak ฿590/ชม.) / "day" = จ.–ศ. ก่อน 16:00 (เทียบ Off Peak ฿490/ชม.) — ขายตั้งแต่ startsAtMs (10 พ.ย. 00:00) ถึง endsAtMs (13 พ.ย. 23:59), ไม่จำกัดจำนวนต่อคน, ไม่มีกำหนดเริ่มใช้ (อายุเริ่มนับจากวันเล่นครั้งแรก)
+const PROMO_1111 = {
+  startsAtMs: Date.parse("2026-11-10T00:00:00+07:00"), endsAtMs: Date.parse("2026-11-13T23:59:59.999+07:00"), endTh: "13 พ.ย. 69 เวลา 23:59", endEn: "13 Nov 2026, 23:59",
+  items: [
+    { code: "ALL-3",  group: "all", name: "Starter",           tier: "peak",    credits: 3,  price: 1590, days: 30 },
+    { code: "ALL-6",  group: "all", name: "Plus",              tier: "peak",    credits: 6,  price: 2990, days: 60 },
+    { code: "ALL-11", group: "all", name: "11.11 Special",     tier: "peak",    credits: 11, price: 4999, days: 111 },
+    { code: "DAY-3",  group: "day", name: "Day Starter",       tier: "offpeak", credits: 3,  price: 1290, days: 30 },
+    { code: "DAY-6",  group: "day", name: "Day Plus",          tier: "offpeak", credits: 6,  price: 2490, days: 60 },
+    { code: "DAY-11", group: "day", name: "Day 11.11 Special", tier: "offpeak", credits: 11, price: 4399, days: 111 },
+  ],
+};
+const promoOf = (code) => PROMO_1111.items.find(i => code === "1111:" + i.code) || null;
+const promoNormal = (it) => it.credits * (it.tier === "peak" ? 590 : 490);      // ราคาปกติถ้าจ่ายรายชั่วโมง
+const promoAvg = (it) => Math.round(it.price / it.credits);
+const promoLabel = (it, th = true) => `🔥 11.11 ${it.name} • ${it.credits} ${th ? "ครั้ง" : "sessions"} (${it.tier === "peak" ? (th ? "ทุกเวลา" : "all times") : (th ? "จ.–ศ. ก่อน 16:00" : "Mon–Fri before 16:00")})`;
+function usePromo1111() { // โปรเปิดเฉพาะช่วงเริ่มขาย–ปิดขาย (เวลาไทย) แล้วเปิด/ปิดเอง — ตรวจเวลาทุก 30 วินาทีเท่านั้น (ไม่วาดหน้าใหม่ทุกวินาที) หยุดตรวจเมื่อจบโปรแล้ว
+  const [now, setNow] = useState(() => Date.now());
+  const finished = now > PROMO_1111.endsAtMs;
+  useEffect(() => { if (finished) return; const id = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(id); }, [finished]);
+  return { active: now >= PROMO_1111.startsAtMs && now <= PROMO_1111.endsAtMs, msLeft: Math.max(0, PROMO_1111.endsAtMs - now) };
+}
 
 // ราคาแพ็คเกจสำหรับแสดงผลเท่านั้น — เซิร์ฟเวอร์เป็นคนตัดสินราคาจริงเสมอ (ต้องแก้ให้ตรงกับ PACKAGE_PRICES ใน booking-actions.js ถ้าเปลี่ยนราคา)
 const PACKAGE_TIERS = {
@@ -619,7 +643,135 @@ function PendingPaymentBanner({ createdAt, onResume, lang="th" }) {
   );
 }
 
+function Promo1111Countdown({ msLeft, lang = "th" }) {
+  const m = Math.floor(msLeft / 60000), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mi = m % 60;
+  const th = lang === "th";
+  const box = (v, label) => (
+    <div style={{minWidth:58,background:"rgba(0,0,0,.28)",border:"1px solid rgba(255,255,255,.22)",borderRadius:10,padding:"6px 4px 5px",textAlign:"center"}}>
+      <div style={{fontSize:22,fontWeight:900,lineHeight:1}}>{String(v).padStart(2, "0")}</div>
+      <div style={{fontSize:9.5,opacity:.85,marginTop:2}}>{label}</div>
+    </div>
+  );
+  return <div role="timer" data-testid="promo-countdown" style={{display:"flex",gap:8,justifyContent:"center"}}>{box(d, th ? "วัน" : "days")}{box(h, th ? "ชม." : "hrs")}{box(mi, th ? "นาที" : "min")}</div>;
+}
+
+// แบนเนอร์หน้าแรก 11.11 (โทนเดียวกับโปสเตอร์: น้ำตาล/ส้ม/ฟ้า) — กดแล้วไปหน้าแพ็คเกจ / หายเองหลังปิดขาย
+function Promo1111Banner({ onClick, lang = "th", msLeft }) {
+  const th = lang === "th";
+  const all = PROMO_1111.items.find(i => i.code === "ALL-11"), day = PROMO_1111.items.find(i => i.code === "DAY-11");
+  const small = Math.min(...PROMO_1111.items.map(i => i.price));
+  return (
+    <div style={{padding:"14px 16px 0"}} data-testid="promo-banner">
+      <style>{`
+        @keyframes p1111-float{0%,100%{transform:translateY(0) rotate(-8deg)}50%{transform:translateY(-9px) rotate(10deg)}}
+        @keyframes p1111-pulse{0%,100%{transform:scale(1);box-shadow:0 6px 18px rgba(0,0,0,.35)}50%{transform:scale(1.035);box-shadow:0 10px 26px rgba(244,126,31,.6)}}
+        .p1111-ball{position:absolute;animation:p1111-float 3.6s ease-in-out infinite;pointer-events:none;filter:drop-shadow(0 6px 8px rgba(0,0,0,.35))}
+        .p1111-cta{animation:p1111-pulse 1.8s ease-in-out infinite}
+        @media (prefers-reduced-motion: reduce){.p1111-ball,.p1111-cta{animation:none}}
+      `}</style>
+      <button onClick={onClick} aria-label={th ? "โปรพิเศษ 11.11 แพ็คเกจ 11 ครั้ง 4,999 บาท กดเพื่อดูรายละเอียดและซื้อ" : "11.11 special offer: 11 sessions for 4,999 baht. Tap to view and buy"}
+        style={{position:"relative",overflow:"hidden",width:"100%",border:"none",borderRadius:22,padding:"18px 14px 14px",cursor:"pointer",textAlign:"center",color:"#fff",fontFamily:"'Noto Sans Thai',sans-serif",
+          background:"radial-gradient(circle at 88% 6%,rgba(244,126,31,.6) 0%,rgba(244,126,31,0) 46%),radial-gradient(circle at 8% 98%,rgba(141,182,199,.4) 0%,rgba(141,182,199,0) 52%),linear-gradient(165deg,#7a4529 0%,#663924 42%,#35200f 100%)",
+          boxShadow:"0 12px 30px rgba(102,57,36,.5)"}}>
+        <span className="p1111-ball" style={{top:-10,left:-8,fontSize:50}}>🎾</span>
+        <span className="p1111-ball" style={{bottom:70,right:-12,fontSize:44,animationDelay:"1.2s"}}>🎾</span>
+
+        <div style={{position:"relative"}}>
+          <p style={{fontSize:12,fontWeight:800,letterSpacing:3,color:"#FAA05A"}}>NOVA <span style={{color:"#8DB6C7"}}>TENNIS</span></p>
+          <p style={{fontSize:76,fontWeight:900,lineHeight:.95,letterSpacing:-2,margin:"2px 0 6px",color:"#fff",WebkitTextStroke:"3px #F47E1F",paintOrder:"stroke fill",textShadow:"0 5px 0 #F47E1F,0 10px 20px rgba(0,0,0,.4)"}}>11.11</p>
+          <p style={{display:"inline-block",background:"#2a1409",border:"1px solid rgba(250,160,90,.6)",borderRadius:12,padding:"4px 16px",fontSize:13,fontWeight:900,letterSpacing:2.4}}>SPECIAL OFFER</p>
+
+          <div style={{background:"#FFF3E3",color:"#663924",borderRadius:18,padding:"12px 10px 12px",marginTop:12,boxShadow:"inset 0 -3px 0 rgba(102,57,36,.1)"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
+              <span style={{fontSize:68,fontWeight:900,lineHeight:.9}}>{all.credits}</span>
+              <span style={{textAlign:"left"}}>
+                <span style={{display:"block",fontSize:22,fontWeight:900,lineHeight:1}}>SESSIONS</span>
+                <span style={{display:"inline-block",marginTop:4,background:"#C5DCE6",borderRadius:8,padding:"2px 9px",fontSize:12.5,fontWeight:900}}>🕒 ALL TIME <span style={{fontWeight:700}}>{th ? "เข้าได้ทุกเวลา" : "any time"}</span></span>
+              </span>
+            </div>
+            <div style={{margin:"10px auto 0",background:"linear-gradient(90deg,#E8690F,#F47E1F 55%,#FAA05A)",borderRadius:44,padding:"4px 16px 6px",color:"#fff",boxShadow:"0 5px 14px rgba(232,105,15,.45)"}}>
+              <span style={{fontSize:56,fontWeight:900,lineHeight:1.05,textShadow:"0 2px 6px rgba(0,0,0,.25)"}}>{all.price.toLocaleString()}</span>
+              <span style={{fontSize:20,fontWeight:900,marginLeft:6}}>{th ? "บาท" : "THB"}</span>
+            </div>
+            <p style={{display:"inline-block",marginTop:8,background:"#F6DDC1",borderRadius:20,padding:"4px 14px",fontSize:14,fontWeight:800}}>{th ? "เฉลี่ยเพียง" : "Only"} <b style={{fontSize:20,color:"#C2530A"}}>฿{promoAvg(all)}</b> {th ? "บาท/ครั้ง" : "/ session"} <span style={{fontSize:11.5,opacity:.75,textDecoration:"line-through",marginLeft:4}}>{th ? "ปกติ" : "reg."} ฿{promoNormal(all).toLocaleString()}</span></p>
+            <p style={{marginTop:8,background:"rgba(141,182,199,.35)",borderRadius:10,padding:"5px 8px",fontSize:12.5,fontWeight:800,lineHeight:1.5}}>
+              ☀️ DAY {th ? "จ.–ศ. ก่อน 16:00" : "Mon–Fri before 16:00"} • {day.credits} {th ? "ครั้ง" : "sessions"} <b style={{color:"#C2530A"}}>฿{day.price.toLocaleString()}</b> <span style={{fontWeight:700}}>(฿{promoAvg(day)}/{th ? "ครั้ง" : "session"})</span>
+            </p>
+            <p style={{marginTop:6,fontSize:11.5,fontWeight:700,opacity:.8}}>{th ? `มีแพ็คเล็กให้เลือก เริ่มต้นเพียง ฿${small.toLocaleString()} (3 ครั้ง)` : `Smaller packs from just ฿${small.toLocaleString()} (3 sessions)`}</p>
+          </div>
+
+          <p style={{marginTop:12,fontSize:12.5,fontWeight:800,opacity:.95}}>⏰ {th ? `ซื้อได้ถึง ${PROMO_1111.endTh}` : `Buy until ${PROMO_1111.endEn}`}</p>
+          <div style={{marginTop:7}}><Promo1111Countdown msLeft={msLeft} lang={lang} /></div>
+          <span className="p1111-cta" style={{display:"block",marginTop:12,background:"#fff",color:"#B84F00",fontWeight:900,fontSize:16,padding:"12px 8px",borderRadius:30}}>{th ? "ซื้อแพ็คเกจ 11.11 เลย →" : "Get the 11.11 package →"}</span>
+          <p style={{marginTop:9,fontSize:10.5,opacity:.8,lineHeight:1.5}}>{th ? `1 ครั้ง = 1 ชั่วโมง • ใช้ได้ ${all.days} วันนับจากวันเล่นครั้งแรก • ซื้อได้ไม่จำกัดจำนวน` : `1 session = 1 hour • valid ${all.days} days from your first play date • buy as many as you like`}</p>
+        </div>
+      </button>
+    </div>
+  );
+}
+
+// ส่วนเลือกซื้อโปร 11.11 ในหน้าแพ็คเกจ (แทนรายการแพ็คเกจปกติระหว่างโปร)
+function Promo1111Section({ lang = "th", selected, onSelect, msLeft }) {
+  const th = lang === "th";
+  const groups = [
+    { id: "all", title: th ? "⏱ ALL TIME — ใช้ได้ทุกเวลา" : "⏱ ALL TIME — any time", sub: th ? "เทียบค่าสนาม Peak ฿590/ชม." : "vs. Peak ฿590/hr", color: "#B84F00" },
+    { id: "day", title: th ? "☀️ DAY — จันทร์–ศุกร์ ก่อน 16:00" : "☀️ DAY — Mon–Fri before 16:00", sub: th ? "เทียบค่าสนาม Off Peak ฿490/ชม." : "vs. Off Peak ฿490/hr", color: "#2d5f8a" },
+  ];
+  return (
+    <section data-testid="promo-section">
+      <div style={{background:"linear-gradient(165deg,#7a4529,#4a2a1a)",color:"#fff",borderRadius:16,padding:"14px 14px 12px",marginBottom:14,textAlign:"center",boxShadow:"0 6px 18px rgba(102,57,36,.35)"}}>
+        <p style={{fontSize:12,fontWeight:800,letterSpacing:2.5,color:"#FAA05A"}}>11.11 SPECIAL OFFER</p>
+        <p style={{fontSize:15,fontWeight:800,marginTop:3}}>⏰ {th ? `ซื้อได้ถึง ${PROMO_1111.endTh}` : `Buy until ${PROMO_1111.endEn}`}</p>
+        <div style={{marginTop:8}}><Promo1111Countdown msLeft={msLeft} lang={lang} /></div>
+      </div>
+      {groups.map(g => (
+        <div key={g.id} style={{marginBottom:16}}>
+          <p style={{fontSize:14,fontWeight:800,color:g.color}}>{g.title}</p>
+          <p style={{fontSize:11.5,color:"var(--mu)",marginBottom:8}}>{g.sub}</p>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {PROMO_1111.items.filter(i => i.group === g.id).map(it => {
+              const sel = selected?.promo === it.code, save = promoNormal(it) - it.price, best = it.credits === 11;
+              return (
+                <button key={it.code} onClick={() => onSelect({ promo: it.code, tier: it.tier, credits: it.credits, price: it.price, days: it.days, name: it.name })} aria-pressed={sel} data-testid={`promo-${it.code}`}
+                  style={{position:"relative",textAlign:"left",padding:"12px 14px",borderRadius:12,border:`2px solid ${sel ? "var(--or)" : best ? g.color : "var(--dv)"}`,background:sel ? "var(--or-bg)" : "#fff",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                  {best && <span style={{position:"absolute",top:-9,left:12,background:g.color,color:"#fff",fontSize:10.5,fontWeight:900,padding:"2px 9px",borderRadius:10,letterSpacing:.6}}>{th ? "คุ้มที่สุด" : "BEST VALUE"}</span>}
+                  <span>
+                    <span style={{display:"block",fontSize:15,fontWeight:800,color:"var(--br)"}}>{it.credits} {th ? "ครั้ง" : "sessions"} <span style={{fontSize:12,fontWeight:700,color:"var(--mu)"}}>• {it.name}</span></span>
+                    <span style={{display:"block",fontSize:12,color:"var(--tx)",marginTop:3}}>{th ? "เฉลี่ย" : "avg."} <b>฿{promoAvg(it)}</b>/{th ? "ครั้ง" : "session"} • {th ? `ใช้ได้ ${it.days} วัน` : `valid ${it.days} days`}</span>
+                  </span>
+                  <span style={{textAlign:"right",flexShrink:0}}>
+                    <span style={{display:"block",fontSize:11,color:"var(--mu)",textDecoration:"line-through"}}>฿{promoNormal(it).toLocaleString()}</span>
+                    <span style={{display:"block",fontSize:20,fontWeight:900,color:sel ? "var(--or)" : "var(--br)",lineHeight:1.1}}>฿{it.price.toLocaleString()}</span>
+                    <span style={{display:"block",fontSize:10.5,fontWeight:800,color:"#2d7a4f"}}>{th ? "ประหยัด" : "save"} ฿{save.toLocaleString()}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+      <div style={{background:"var(--bl-bg)",border:"1px solid rgba(141,182,199,.4)",borderRadius:12,padding:"12px 14px"}}>
+        <p style={{fontSize:12.5,fontWeight:800,color:"var(--br)",marginBottom:6}}>{th ? "📌 เงื่อนไขโปร 11.11" : "📌 11.11 terms"}</p>
+        {(th ? [
+          "1 ครั้ง = 1 ชั่วโมง (จอง 2 ชั่วโมง ตัด 2 ครั้ง)",
+          `อายุแพ็คเกจเริ่มนับจาก "วันเล่นครั้งแรก" ที่จองด้วยแพ็คเกจ (วันนั้นนับเป็นวันที่ 1) — 11 ครั้ง ใช้ได้ 111 วัน`,
+          "ซื้อได้ไม่จำกัดจำนวนแพ็คเกจต่อบัญชี • ไม่ใช้ร่วมกับโค้ดส่วนลด • ไม่คืนเงิน",
+          "แพ็ค DAY จองได้เฉพาะ จันทร์–ศุกร์ ที่เริ่มก่อน 16:00",
+          "แพ็คเกจปกติ (2 / 5 / 10 ครั้ง) กลับมาให้ซื้อหลังจบโปร",
+        ] : [
+          "1 session = 1 hour (a 2-hour booking uses 2 sessions)",
+          `Validity starts on the first play date booked with the package (that day counts as day 1) — 11 sessions: 111 days`,
+          "Buy as many packages as you like • cannot be combined with discount codes • non-refundable",
+          "DAY packages: Mon–Fri bookings starting before 16:00 only",
+          "Regular packages (2 / 5 / 10 sessions) return after the promo ends",
+        ]).map((x, i) => <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:3}}><span style={{fontSize:11.5,fontWeight:800,color:"var(--br)",flexShrink:0}}>{i + 1}.</span><p style={{fontSize:12,color:"var(--tx)",lineHeight:1.6}}>{x}</p></div>)}
+      </div>
+    </section>
+  );
+}
+
 function HomePage({ goBook, goPackage, goCoach, lang="th" }) {
+  const promo = usePromo1111();
   const t = T[lang];
   const now = new Date();
   const inPromo = now <= PROMO_END;
@@ -720,7 +872,7 @@ function HomePage({ goBook, goPackage, goCoach, lang="th" }) {
 
       {/* แบนเนอร์คู่: โปรจองครั้งแรก + แพ็คเกจ — วางข้างกันให้เห็นพร้อมกันโดยไม่ต้องเลื่อนหน้า
           (โปรจองครั้งแรกหายเองหลังพ้นวันสุดท้าย เหลือแพ็คเกจเต็มความกว้าง) */}
-      {(() => {
+      {promo.active ? <Promo1111Banner onClick={goPackage} lang={lang} msLeft={promo.msLeft} /> : (() => {
         const promoActive = toIso(new Date()) <= FIRST_TIME_PROMO.lastPlayDate;
         const th = lang === "th";
         const pill = (bg, color) => ({ display:"inline-block", alignSelf:"flex-start", background:bg, color, borderRadius:20, padding:"3px 10px", fontSize:11, fontWeight:800 });
@@ -1631,6 +1783,7 @@ function Dot({ color, label }) {
 // ─── Package (แพ็คเกจสมาชิก) ──────────────────────────────────────────────────
 function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
   const t = T[lang];
+  const promo = usePromo1111(); // โปร 11.11 เปิดอยู่ → แสดงรายการโปรแทนแพ็คเกจปกติ
   const [selected, setSelected] = useState(null); // { tier, credits, price, days }
   const lineName = toFormName(lineSession?.displayName || lineSession?.name) || "ลูกค้า LINE"; // ชื่อในการจอง = ชื่อ LINE เสมอ (เซิร์ฟเวอร์ก็ใช้ชื่อนี้ ไม่เชื่อชื่อที่ส่งมาจากหน้าเว็บ)
   const [name, setName] = useState(lineName);
@@ -1680,10 +1833,11 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
     }
     setCreating(true);
     const { package: pkgRow, error } = await db.createPackage({
-      tier: selected.tier, credits: selected.credits, customerId: phone, customerName: name.trim(),
+      tier: selected.tier, credits: selected.credits, promo: selected.promo, customerId: phone, customerName: name.trim(),
     });
     setCreating(false);
-    if (error || !pkgRow) { setCreateErr(accountErrMsg(error, lang) || (lang==="th" ? "สร้างรายการไม่สำเร็จ ลองใหม่อีกครั้ง" : "Failed to create order, please try again")); return; }
+    const promoErr = { promo_ended: lang==="th" ? "โปร 11.11 ปิดรับซื้อแล้ว" : "The 11.11 promo has ended", promo_not_started: lang==="th" ? "โปร 11.11 ยังไม่เปิดขาย (เริ่ม 10 พ.ย. 69 เวลา 00:00)" : "The 11.11 promo hasn't started yet (starts 10 Nov 2026, 00:00)", promo_columns_missing: lang==="th" ? "ระบบโปรยังตั้งค่าไม่ครบ กรุณาแจ้งแอดมิน" : "Promo setup is incomplete. Please contact admin." }[error];
+    if (error || !pkgRow) { setCreateErr(promoErr || accountErrMsg(error, lang) || (lang==="th" ? "สร้างรายการไม่สำเร็จ ลองใหม่อีกครั้ง" : "Failed to create order, please try again")); return; }
     setPkg(pkgRow);
     const utm = getStoredUtm();
     if (utm) db.recordSource("package", pkgRow.id, utm).catch(() => {});
@@ -1758,7 +1912,7 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
                 <div key={p.id} className="card">
                   <div style={{padding:"13px 16px"}}>
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-                      <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{p.tier==="peak"?"Peak":"Off Peak"} × {p.total_credits} {lang==="th"?"ครั้ง":"sessions"}</span>
+                      <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{promoOf(p.promo_code) ? promoLabel(promoOf(p.promo_code), lang==="th") : <>{p.tier==="peak"?"Peak":"Off Peak"} × {p.total_credits} {lang==="th"?"ครั้ง":"sessions"}</>}</span>
                       <span style={{fontSize:11.5,fontWeight:600,color:expired?"#c0392b":st.color,background:`${expired?"#c0392b":st.color}18`,padding:"3px 9px",borderRadius:20}}>
                         {expired ? (lang==="th"?"หมดอายุแล้ว":"Expired") : st.text}
                       </span>
@@ -1788,42 +1942,49 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
         )}
       </section>
 
-      {/* เลือกซื้อแพ็คเกจใหม่ */}
-      <section>
-        <StepHead n="🎟" label={lang==="th"?"ซื้อแพ็คเกจใหม่":"Buy a New Package"} />
-        {["offpeak","peak"].map(tier => (
-          <div key={tier} style={{marginBottom:14}}>
-            <p style={{fontSize:13,fontWeight:700,color:"var(--br)",marginBottom:8}}>
-              {tier==="peak" ? "Peak" : "Off Peak"}
-              <span style={{fontWeight:400,color:"var(--mu)",fontSize:11.5,marginLeft:6}}>
-                {tier==="peak" ? (lang==="th"?"(ใช้ได้ทุกช่วงเวลา: Peak + Off Peak)":"(valid for all times: Peak + Off Peak)") : (lang==="th"?"(เฉพาะ จ.-ศ. 06:00–16:00)":"(Mon-Fri 06:00–16:00 only)")}
-              </span>
-            </p>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-              {PACKAGE_TIERS[tier].map(opt => {
-                const sel = selected?.tier===tier && selected?.credits===opt.credits;
-                return (
-                  <button key={opt.credits} onClick={() => setSelected({ tier, ...opt })}
-                    style={{padding:"12px 6px",borderRadius:10,border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:sel?"var(--or-bg)":"#fff",cursor:"pointer",textAlign:"center"}}>
-                    <p className="bb" style={{fontSize:20,color:sel?"var(--or)":"var(--br)",lineHeight:1}}>{opt.credits}</p>
-                    <p style={{fontSize:10,color:"var(--mu)",marginTop:2}}>{lang==="th"?"ครั้ง":"sessions"}</p>
-                    <p style={{fontSize:10.5,color:"var(--mu)",textDecoration:"line-through",marginTop:4}}>฿{opt.fullPrice.toLocaleString()}</p>
-                    <p style={{fontSize:14,fontWeight:800,color:sel?"var(--or)":"var(--br)"}}>฿{opt.price.toLocaleString()}</p>
-                    <p style={{fontSize:9.5,color:"var(--mu)",marginTop:2}}>{lang==="th"?`อายุการใช้งาน ${opt.days} วัน`:`Valid ${opt.days} days`}</p>
-                  </button>
-                );
-              })}
+      {/* เลือกซื้อแพ็คเกจใหม่ — ระหว่างโปร 11.11 แสดงรายการโปรแทนแพ็คเกจปกติ */}
+      {promo.active ? (
+        <section>
+          <StepHead n="🔥" label={lang==="th"?"โปรพิเศษ 11.11":"11.11 Special Offer"} />
+          <Promo1111Section lang={lang} selected={selected} onSelect={setSelected} msLeft={promo.msLeft} />
+        </section>
+      ) : (
+        <section>
+          <StepHead n="🎟" label={lang==="th"?"ซื้อแพ็คเกจใหม่":"Buy a New Package"} />
+          {["offpeak","peak"].map(tier => (
+            <div key={tier} style={{marginBottom:14}}>
+              <p style={{fontSize:13,fontWeight:700,color:"var(--br)",marginBottom:8}}>
+                {tier==="peak" ? "Peak" : "Off Peak"}
+                <span style={{fontWeight:400,color:"var(--mu)",fontSize:11.5,marginLeft:6}}>
+                  {tier==="peak" ? (lang==="th"?"(ใช้ได้ทุกช่วงเวลา: Peak + Off Peak)":"(valid for all times: Peak + Off Peak)") : (lang==="th"?"(เฉพาะ จ.-ศ. 06:00–16:00)":"(Mon-Fri 06:00–16:00 only)")}
+                </span>
+              </p>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+                {PACKAGE_TIERS[tier].map(opt => {
+                  const sel = selected?.tier===tier && selected?.credits===opt.credits;
+                  return (
+                    <button key={opt.credits} onClick={() => setSelected({ tier, ...opt })}
+                      style={{padding:"12px 6px",borderRadius:10,border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:sel?"var(--or-bg)":"#fff",cursor:"pointer",textAlign:"center"}}>
+                      <p className="bb" style={{fontSize:20,color:sel?"var(--or)":"var(--br)",lineHeight:1}}>{opt.credits}</p>
+                      <p style={{fontSize:10,color:"var(--mu)",marginTop:2}}>{lang==="th"?"ครั้ง":"sessions"}</p>
+                      <p style={{fontSize:10.5,color:"var(--mu)",textDecoration:"line-through",marginTop:4}}>฿{opt.fullPrice.toLocaleString()}</p>
+                      <p style={{fontSize:14,fontWeight:800,color:sel?"var(--or)":"var(--br)"}}>฿{opt.price.toLocaleString()}</p>
+                      <p style={{fontSize:9.5,color:"var(--mu)",marginTop:2}}>{lang==="th"?`อายุการใช้งาน ${opt.days} วัน`:`Valid ${opt.days} days`}</p>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
-          </div>
-        ))}
-      </section>
+          ))}
+        </section>
+      )}
 
       {selected && (
         <section>
           <StepHead n="📝" label={lang==="th"?"กรอกข้อมูลผู้ซื้อ":"Buyer Info"} />
           <div className="card" style={{marginBottom:14}}>
             <div className="card-body">
-              <Row label={lang==="th"?"แพ็คเกจที่เลือก":"Selected package"} val={`${selected.tier==="peak"?"Peak":"Off Peak"} × ${selected.credits} ${lang==="th"?"ครั้ง":"sessions"}`} />
+              <Row label={lang==="th"?"แพ็คเกจที่เลือก":"Selected package"} val={selected.promo ? promoLabel(PROMO_1111.items.find(i => i.code === selected.promo), lang==="th") : `${selected.tier==="peak"?"Peak":"Off Peak"} × ${selected.credits} ${lang==="th"?"ครั้ง":"sessions"}`} />
               <Row label={t.total} val={`฿${selected.price.toLocaleString()}`} />
             </div>
           </div>
@@ -1949,7 +2110,7 @@ function PackagePaymentView({ pkg, lang="th", onDone }) {
         <div className="card-body">
           <Row label="👤" val={pkg.customer_name} />
           <Row label="📞" val={pkg.customer_id} />
-          <Row label="🎟" val={`${pkg.tier==="peak"?"Peak":"Off Peak"} × ${pkg.total_credits} ${lang==="th"?"ครั้ง":"sessions"}`} />
+          <Row label="🎟" val={promoOf(pkg.promo_code) ? promoLabel(promoOf(pkg.promo_code), lang==="th") : `${pkg.tier==="peak"?"Peak":"Off Peak"} × ${pkg.total_credits} ${lang==="th"?"ครั้ง":"sessions"}`} />
         </div>
       </div>
 
@@ -2887,6 +3048,136 @@ export default function AppV2() {
 }
 
 // ─── Admin Dashboard (inline) ─────────────────────────────────────────────────
+// ─── รูปคูปองส่วนลด (วาดด้วย canvas ขนาด 1200×630 — แบบเดียวกับคูปองที่เคยทำไว้) ────────────────────────
+// ใช้ในหน้า "ส่วนลด" ของแอดมิน: ตัวอย่างสดตอนกรอก / รูปพร้อมดาวน์โหลดและส่ง LINE หลังสร้างโค้ด / เปิดดูคูปองของโค้ดที่มีอยู่
+const CP_W = 1200, CP_H = 630, CP_SX = 830;
+const CP_FONT = "'Sukhumvit Set','Thonburi','Noto Sans Thai','Leelawadee UI','Sarabun','Tahoma','Loma',sans-serif";
+const CP_MONO = "ui-monospace,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono','Courier New',monospace";
+const CP_THEMES = {
+  orange: { label: "ส้ม (NOVA)", stub: "#F47E1F", accent: "#F47E1F", ink: "#663924" },
+  brown:  { label: "น้ำตาล",     stub: "#663924", accent: "#B5651D", ink: "#4a2a1a" },
+  blue:   { label: "ฟ้า",        stub: "#5E97AE", accent: "#4E8AA3", ink: "#2c4a58" },
+};
+const CP_PRESET_HINTS = { 490: "เท่ากับค่าสนาม Off Peak 1 ชม. (จ.–ศ. ก่อน 16:00)", 590: "เท่ากับค่าสนาม Peak 1 ชม. (จ.–ศ. หลัง 16:00 / ส.–อา.)" };
+const CP_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
+const cpThaiDate = (iso) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || ""); return m ? `${+m[3]} ${CP_MONTHS[+m[2] - 1]} ${+m[1] + 543}` : ""; };
+const cpHexA = (hex, a) => { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; };
+const cpRound = (ctx, x, y, w, h, r) => { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); };
+const cpFit = (ctx, text, maxW, startPx, weight, family) => { let px = startPx; do { ctx.font = `${weight} ${px}px ${family}`; if (ctx.measureText(text).width <= maxW) break; px -= 2; } while (px > 12); return px; };
+const cpSpaced = (ctx, text, cx, y, gap) => { // วาดโค้ดทีละตัวพร้อมเว้นระยะ
+  const chars = [...text]; const ws = chars.map(c => ctx.measureText(c).width);
+  const total = ws.reduce((a, b) => a + b, 0) + gap * (chars.length - 1); let x = cx - total / 2;
+  ctx.textAlign = "left"; chars.forEach((c, i) => { ctx.fillText(c, x, y); x += ws[i] + gap; });
+};
+let _cpLogo = null; // โลโก้โหลดครั้งเดียว (ไฟล์เดียวกับเว็บ จึงไม่ติดข้อจำกัดข้ามโดเมน) — โหลดไม่ได้ก็วาดเป็นข้อความแทน
+const cpLoadLogo = () => (_cpLogo ||= new Promise((resolve) => { const img = new Image(); img.onload = () => resolve(img); img.onerror = () => resolve(null); img.src = "/nova-logo.png"; }));
+async function drawCouponImage(cv, o) {
+  try { await Promise.all(["600", "700", "800", "900"].map(w => document.fonts.load(`${w} 24px "Noto Sans Thai"`))); } catch { /* ใช้ฟอนต์ของเครื่องแทน */ }
+  const logo = await cpLoadLogo();
+  const T = CP_THEMES[o.theme] || CP_THEMES.orange;
+  cv.width = CP_W; cv.height = CP_H; const ctx = cv.getContext("2d");
+  const W = CP_W, H = CP_H, SX = CP_SX;
+  ctx.fillStyle = "#F9E8D4"; ctx.fillRect(0, 0, W, H);
+  const X0 = 40, Y0 = 40, TW = 1120, TH = 550;
+  ctx.save(); ctx.shadowColor = "rgba(102,57,36,.22)"; ctx.shadowBlur = 28; ctx.shadowOffsetY = 10;
+  cpRound(ctx, X0, Y0, TW, TH, 30); ctx.fillStyle = "#fff"; ctx.fill(); ctx.restore();
+  ctx.save(); cpRound(ctx, X0, Y0, SX - X0, TH, 30); ctx.clip();
+  ctx.fillStyle = cpHexA(T.accent, .06); ctx.beginPath(); ctx.arc(640, 340, 255, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = cpHexA(T.accent, .12); ctx.lineWidth = 16; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.arc(405, 215, 330, -0.25 * Math.PI, 0.25 * Math.PI); ctx.stroke();
+  ctx.beginPath(); ctx.arc(875, 465, 330, 0.75 * Math.PI, 1.25 * Math.PI); ctx.stroke();
+  ctx.restore();
+  ctx.save(); cpRound(ctx, X0, Y0, TW, TH, 30); ctx.clip(); ctx.fillStyle = T.stub; ctx.fillRect(SX, Y0, X0 + TW - SX, TH); ctx.restore();
+  ctx.fillStyle = "#F9E8D4"; [Y0, Y0 + TH].forEach(y => { ctx.beginPath(); ctx.arc(SX, y, 24, 0, Math.PI * 2); ctx.fill(); });
+  ctx.save(); ctx.strokeStyle = "rgba(255,255,255,.9)"; ctx.lineWidth = 3; ctx.setLineDash([10, 12]); ctx.beginPath(); ctx.moveTo(SX, Y0 + 40); ctx.lineTo(SX, Y0 + TH - 40); ctx.stroke(); ctx.restore();
+
+  // ── ด้านซ้าย ──
+  ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+  let lw;
+  if (logo) { const lh = 86; lw = lh * logo.width / logo.height; ctx.drawImage(logo, 86, 66, lw, lh); }
+  else { ctx.font = `900 54px ${CP_FONT}`; ctx.fillStyle = T.accent; ctx.fillText("NOVA", 86, 132); lw = ctx.measureText("NOVA").width; }
+  const pill = "คูปองส่วนลด"; ctx.font = `800 26px ${CP_FONT}`; const pw = ctx.measureText(pill).width + 40;
+  cpRound(ctx, 86 + lw + 28, 92, pw, 42, 21); ctx.fillStyle = cpHexA(T.accent, .13); ctx.fill();
+  ctx.fillStyle = T.accent; ctx.fillText(pill, 86 + lw + 48, 122);
+  ctx.fillStyle = T.ink; ctx.font = `800 30px ${CP_FONT}`; ctx.fillText("ส่วนลดค่าสนามเทนนิส", 90, 196);
+  const isPct = !!o.percent;
+  const amt = String(Math.max(0, Math.round(+(isPct ? o.percent : o.amount) || 0)));
+  if (isPct) {
+    ctx.font = `900 84px ${CP_FONT}`; const sw = ctx.measureText("%").width;
+    const aPx = cpFit(ctx, amt, 470 - sw, 214, "900", CP_FONT);
+    ctx.font = `900 ${aPx}px ${CP_FONT}`; ctx.fillStyle = T.ink; ctx.fillText(amt, 92, 372);
+    const aw = ctx.measureText(amt).width;
+    ctx.font = `900 96px ${CP_FONT}`; ctx.fillStyle = T.accent; ctx.fillText("%", 100 + aw, 372);
+  } else {
+    ctx.font = `900 84px ${CP_FONT}`; const bw = ctx.measureText("฿").width;
+    const aPx = cpFit(ctx, amt, 470 - bw, 214, "900", CP_FONT);
+    ctx.font = `900 84px ${CP_FONT}`; ctx.fillStyle = T.accent; ctx.fillText("฿", 88, 372 - (aPx * 0.40));
+    ctx.font = `900 ${aPx}px ${CP_FONT}`; ctx.fillStyle = T.ink; ctx.fillText(amt, 92 + bw, 372);
+    const aw = ctx.measureText(amt).width;
+    ctx.font = `800 52px ${CP_FONT}`; ctx.fillStyle = T.accent; ctx.fillText("บาท", 100 + bw + aw, 372);
+  }
+  if (o.hint) { const px = cpFit(ctx, o.hint, 700, 28, "700", CP_FONT); ctx.font = `700 ${px}px ${CP_FONT}`; ctx.fillStyle = cpHexA(T.ink, .85); ctx.fillText("= " + o.hint.replace(/^=\s*/, ""), 90, 428); }
+  const uses = Math.max(1, Math.round(+o.maxUses || 1));
+  const lines = ["ใส่โค้ดในช่อง “โค้ดส่วนลด” ตอนกรอกข้อมูลจอง", uses > 1 ? `โค้ดนี้ใช้ได้รวม ${uses} ครั้ง ใช้ครบแล้วหมดสิทธิ์` : "ใช้ได้ 1 ครั้งต่อ 1 โค้ด ใช้ซ้ำไม่ได้", "ไม่ใช้ร่วมกับโปรจองครั้งแรก แพ็คเกจ และจอง 2 สนามพร้อมกัน"];
+  lines.forEach((t, i) => { ctx.fillStyle = T.accent; ctx.beginPath(); ctx.arc(98, 487 + i * 35 - 7, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = cpHexA(T.ink, .8); const px = cpFit(ctx, t, 690, 24, "600", CP_FONT); ctx.font = `600 ${px}px ${CP_FONT}`; ctx.fillText(t, 116, 487 + i * 35); });
+
+  // ── แถบโค้ดด้านขวา ──
+  const cx = SX + (X0 + TW - SX) / 2; ctx.textAlign = "center"; ctx.fillStyle = "#fff";
+  ctx.font = `800 28px ${CP_FONT}`; ctx.fillText("โค้ดส่วนลดของคุณ", cx, 128);
+  const bx = cx - 150, by = 152, bW = 300, bH = 112;
+  cpRound(ctx, bx, by, bW, bH, 18); ctx.fillStyle = "#fff"; ctx.fill();
+  ctx.save(); ctx.strokeStyle = cpHexA(T.ink, .5); ctx.lineWidth = 3; ctx.setLineDash([9, 8]); cpRound(ctx, bx + 9, by + 9, bW - 18, bH - 18, 12); ctx.stroke(); ctx.restore();
+  const code = String(o.code || "").toUpperCase(); ctx.fillStyle = T.ink;
+  let cp = 58; ctx.font = `800 ${cp}px ${CP_MONO}`; const gap = 5;
+  while (cp > 22) { ctx.font = `800 ${cp}px ${CP_MONO}`; const tw = [...code].reduce((s, c) => s + ctx.measureText(c).width, 0) + gap * (Math.max(code.length, 1) - 1); if (tw <= bW - 44) break; cp -= 2; }
+  cpSpaced(ctx, code, cx, by + bH / 2 + cp * 0.34, gap);
+  ctx.textAlign = "center"; ctx.fillStyle = "rgba(255,255,255,.92)"; ctx.font = `600 23px ${CP_FONT}`; ctx.fillText("พิมพ์โค้ดนี้ตอนจองสนาม", cx, 306);
+  const ed = cpThaiDate(o.expiry);
+  ctx.fillStyle = "rgba(255,255,255,.85)"; ctx.font = `700 25px ${CP_FONT}`; ctx.fillText(ed ? "ใช้ได้ถึง" : "ระยะเวลาใช้งาน", cx, 380);
+  const label = ed || "ไม่มีวันหมดอายุ"; const ep = cpFit(ctx, label, 290, ed ? 50 : 40, "900", CP_FONT); ctx.fillStyle = "#fff"; ctx.font = `900 ${ep}px ${CP_FONT}`; ctx.fillText(label, cx, 380 + 56);
+  ctx.fillStyle = "rgba(255,255,255,.95)"; ctx.font = `800 23px ${CP_FONT}`; ctx.fillText("nova-tennis.vercel.app", cx, 530);
+  ctx.fillStyle = "rgba(255,255,255,.8)"; ctx.font = `600 21px ${CP_FONT}`; ctx.fillText("LINE @347mlhra", cx, 500);
+  cv.dataset.coupon = JSON.stringify({ code, amount: isPct ? null : +amt, percent: isPct ? +amt : null, expiry: o.expiry || "", theme: o.theme || "orange", hint: o.hint || "", uses, logo: !!logo });
+}
+function CouponImage({ code, amount, percent, expiry, theme = "orange", hint = "", maxUses = 1, showActions = false }) {
+  const ref = useRef(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    setFailed(false);
+    drawCouponImage(ref.current, { code, amount, percent, expiry, theme, hint, maxUses }).catch(() => { if (alive) setFailed(true); });
+    return () => { alive = false; };
+  }, [code, amount, percent, expiry, theme, hint, maxUses]);
+  const fileName = `NOVA-coupon-${String(code || "code").toUpperCase()}.png`;
+  const toBlob = () => new Promise((resolve) => { try { ref.current.toBlob(b => resolve(b), "image/png"); } catch { resolve(null); } });
+  const download = async () => {
+    const b = await toBlob();
+    if (!b) { alert("สร้างไฟล์รูปไม่สำเร็จ — ลองแคปหน้าจอรูปคูปองแทน"); return; }
+    const url = URL.createObjectURL(b); const a = document.createElement("a"); a.href = url; a.download = fileName; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 3000);
+  };
+  const share = async () => {
+    const b = await toBlob();
+    if (!b) { alert("สร้างไฟล์รูปไม่สำเร็จ — ลองแคปหน้าจอรูปคูปองแทน"); return; }
+    const file = new File([b], fileName, { type: "image/png" });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { try { await navigator.share({ files: [file], title: "คูปองส่วนลด NOVA Tennis" }); } catch { /* ยกเลิกการแชร์ */ } }
+    else alert("เครื่องนี้ยังแชร์รูปตรงๆ ไม่ได้ — กด “ดาวน์โหลดรูป” แล้วส่งรูปทาง LINE แทน");
+  };
+  return (
+    <div>
+      <canvas ref={ref} width={CP_W} height={CP_H} style={{ width: "100%", height: "auto", display: "block", borderRadius: 12, boxShadow: "0 6px 24px rgba(102,57,36,.18)" }} />
+      {failed && <p style={{ fontSize: 12, color: "#c0392b", marginTop: 6 }}>วาดรูปคูปองไม่สำเร็จ — ลองรีเฟรชหน้า</p>}
+      {showActions && (
+        <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+          <button onClick={download} style={{ flex: 1, minWidth: 150, padding: "12px 14px", borderRadius: 10, border: "none", background: "linear-gradient(90deg,var(--or),var(--or2))", color: "#fff", fontWeight: 800, fontSize: 14, cursor: "pointer", fontFamily: "'Noto Sans Thai',sans-serif" }}>⬇️ ดาวน์โหลดรูป</button>
+          <button onClick={share} style={{ flex: 1, minWidth: 150, padding: "12px 14px", borderRadius: 10, border: "1.5px solid var(--dv)", background: "#fff", color: "var(--br)", fontWeight: 800, fontSize: 14, cursor: "pointer", fontFamily: "'Noto Sans Thai',sans-serif" }}>📤 ส่งต่อ (LINE / แอปอื่น)</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AdminDashboard({ token, onLogout }) {
   const [tab, setTab] = useState("bookings");
   const [bookings, setBookings] = useState([]);
@@ -2907,6 +3198,12 @@ function AdminDashboard({ token, onLogout }) {
   const [newAmt, setNewAmt] = useState("50");
   const [newMax, setNewMax] = useState("1");
   const [newExp, setNewExp] = useState(""); // วันหมดอายุ (เว้นว่าง = ไม่หมดอายุ)
+  // รูปคูปองส่วนลด: สี / ข้อความอธิบายมูลค่า (เติมให้อัตโนมัติสำหรับ ฿490 / ฿590 จนกว่าแอดมินจะแก้เอง) / คูปองที่เพิ่งสร้าง / คูปองที่เปิดดูจากตาราง
+  const [cpTheme, setCpTheme] = useState("orange");
+  const [cpHint, setCpHint] = useState("");
+  const [cpHintTouched, setCpHintTouched] = useState(false);
+  const [cpCreated, setCpCreated] = useState(null);
+  const [cpView, setCpView] = useState(null);
 
   const [queue, setQueue] = useState([]);
   const [queueLoading, setQueueLoading] = useState(true);
@@ -3156,7 +3453,7 @@ function AdminDashboard({ token, onLogout }) {
   };
 
   // ── ขายแพ็คเกจสนาม/คอร์สโค้ชให้ลูกค้า (แอดมินบันทึกที่ลูกค้าโอนเงินแล้ว) ──
-  const [sl, setSl] = useState({ phone: "", name: "", kind: "package", tier: "peak", credits: 5, audience: "adult", type: "duo", sessions: 5, price: "", note: "" });
+  const [sl, setSl] = useState({ phone: "", name: "", kind: "package", promo: "ALL-11", tier: "peak", credits: 5, audience: "adult", type: "duo", sessions: 5, price: "", note: "" });
   const [slCatalog, setSlCatalog] = useState(null);
   const [slCatFail, setSlCatFail] = useState(false);
   const [slInfo, setSlInfo] = useState(null);
@@ -3183,10 +3480,12 @@ function AdminDashboard({ token, onLogout }) {
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sl.phone]);
-  const slItem = !slCatalog ? null : sl.kind === "package"
+  const slItem = !slCatalog ? null : sl.kind === "promo"
+    ? (slCatalog.promo?.items || []).find(x => x.code === sl.promo) || null
+    : sl.kind === "package"
     ? slCatalog.packages.find(x => x.tier === sl.tier && x.credits === sl.credits) || null
     : slCatalog.coach.find(x => x.audience === sl.audience && x.type === sl.type && x.sessions === sl.sessions) || null;
-  const slList = slItem ? (sl.kind === "package" ? slItem.price : slItem.total) : 0;
+  const slList = slItem ? (sl.kind === "coach" ? slItem.total : slItem.price) : 0;
   const slPrice = sl.price === "" ? slList : Number(sl.price);
   const slPriceOk = !!slItem && Number.isInteger(slPrice) && slPrice >= 0 && slPrice <= slList;
   const slNeedNote = !!slItem && slPriceOk && slPrice !== slList;
@@ -3195,19 +3494,19 @@ function AdminDashboard({ token, onLogout }) {
   const slNameOk = slLinked || (sl.name.trim().length >= 1 && Array.from(sl.name.trim()).length <= 40);
   const slPhoneOk = /^[0-9]{10}$/.test(sl.phone);
   const slCanSubmit = slPhoneOk && slNameOk && slPriceOk && slNoteOk && !slBusy;
-  const slLabel = !slItem ? "" : sl.kind === "package"
+  const slLabel = !slItem ? "" : sl.kind === "promo" ? `โปร 11.11 ${slItem.name} (${slItem.tier === "peak" ? "ทุกเวลา" : "จ.–ศ. ก่อน 16:00"}) ${slItem.credits} ครั้ง` : sl.kind === "package"
     ? `แพ็คเกจสนาม ${sl.tier === "peak" ? "Peak" : "Off Peak"} ${sl.credits} ครั้ง`
     : `คอร์สโค้ช ${coachLabel(slItem, "th")}`;
   const submitSell = async () => {
     if (!slCanSubmit) return;
     const name = slLinked ? slInfo.lineName : sl.name.trim();
-    if (!window.confirm(`ขาย ${slLabel}\nให้ ${name} (${sl.phone})\nราคา ฿${slPrice.toLocaleString()}${slPrice !== slList ? ` (ราคาป้าย ฿${slList.toLocaleString()} • ลด ฿${(slList - slPrice).toLocaleString()})` : ""} • ${slPrice > 0 ? "รับเงินโอนแล้ว" : "แจกฟรี"}\n${sl.kind === "package" ? `อายุ ${slItem.days} วัน (เริ่มนับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ)` : "ใช้งานได้ทันที"}\n\nยืนยันการบันทึกการขาย?`)) return;
+    if (!window.confirm(`ขาย ${slLabel}\nให้ ${name} (${sl.phone})\nราคา ฿${slPrice.toLocaleString()}${slPrice !== slList ? ` (ราคาป้าย ฿${slList.toLocaleString()} • ลด ฿${(slList - slPrice).toLocaleString()})` : ""} • ${slPrice > 0 ? "รับเงินโอนแล้ว" : "แจกฟรี"}\n${sl.kind !== "coach" ? `อายุ ${slItem.days} วัน (เริ่มนับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ)` : "ใช้งานได้ทันที"}\n\nยืนยันการบันทึกการขาย?`)) return;
     setSlBusy(true); setSlMsg(null);
     let r = null;
     try {
       r = await callAdminAction("sellToCustomer", token, {
         kind: sl.kind, customerId: sl.phone, customerName: name, price: slPrice, note: sl.note.trim(),
-        ...(sl.kind === "package" ? { tier: sl.tier, credits: sl.credits } : { audience: sl.audience, type: sl.type, sessions: sl.sessions }),
+        ...(sl.kind === "promo" ? { promo: sl.promo } : sl.kind === "package" ? { tier: sl.tier, credits: sl.credits } : { audience: sl.audience, type: sl.type, sessions: sl.sessions }),
       });
     } catch { r = { error: "network_or_server" }; }
     setSlBusy(false);
@@ -3223,6 +3522,9 @@ function AdminDashboard({ token, onLogout }) {
         : r?.error === "invalid_phone" ? "❌ เบอร์โทรต้องเป็นตัวเลข 10 หลัก"
         : r?.error === "invalid_product" ? "❌ สินค้านี้ไม่มีในรายการขาย"
         : r?.error === "note_too_long" ? "❌ หมายเหตุยาวเกิน 200 ตัวอักษร"
+        : r?.error === "promo_ended" ? "❌ โปร 11.11 ปิดการขายแล้ว (เลยวันที่ 13 พ.ย. 23:59)"
+        : r?.error === "promo_not_started" ? "❌ โปร 11.11 ยังไม่เปิดขาย (เริ่มขาย 10 พ.ย. เวลา 00:00)"
+        : r?.error === "promo_columns_missing" ? "❌ ยังไม่ได้รัน SQL — รันไฟล์ add-promo-1111-columns.sql ที่ Supabase ก่อน (ยังไม่มีการบันทึกใดๆ)"
         : r?.error === "sale_columns_missing" ? "❌ ยังไม่ได้รัน SQL — รันไฟล์ add-admin-sale-columns.sql ที่ Supabase ก่อน (ยังไม่มีการบันทึกใดๆ)"
         : r?.error === "network_or_server" ? "❌ เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว และดู Vercel → Logs"
         : `❌ บันทึกไม่สำเร็จ (${r?.error || "ไม่ทราบสาเหตุ"}) ลองใหม่อีกครั้ง` });
@@ -3458,7 +3760,9 @@ function AdminDashboard({ token, onLogout }) {
     if (!newCode.trim()) return;
     const r = await callAdminAction("createDiscount", token, { code: newCode, amount: newAmt, maxUses: newMax, expiresAt: newExp || null });
     if (!r?.ok) { alert(r?.error === "invalid_date" ? "รูปแบบวันหมดอายุไม่ถูกต้อง" : "สร้างโค้ดไม่สำเร็จ (ถ้าตั้งวันหมดอายุ ต้องรัน SQL เพิ่มคอลัมน์ expires_at ที่ Supabase ก่อน)"); return; }
+    setCpCreated({ code: newCode.trim().toUpperCase(), amount: Number(newAmt) || 0, expiry: newExp || "", maxUses: Number(newMax) || 1, theme: cpTheme, hint: cpHint });
     setNewCode(""); loadDiscounts();
+    setTimeout(() => document.getElementById("cp-created")?.scrollIntoView({ behavior: "smooth", block: "center" }), 150);
   };
 
   const genCode = () => {
@@ -3750,13 +4054,27 @@ function AdminDashboard({ token, onLogout }) {
                 <div>
                   <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>สินค้า</label>
                   <div style={{display:"flex",gap:8}}>
-                    {[["package", "🎟 แพ็คเกจสนาม"], ["coach", "👤 คอร์สโค้ช"]].map(([v, label]) => (
+                    {[["package", "🎟 แพ็คเกจสนาม"], ["coach", "👤 คอร์สโค้ช"], ...(slCatalog?.promo?.open ? [["promo", "🔥 โปร 11.11"]] : [])].map(([v, label]) => (
                       <button key={v} onClick={() => setSl(p => ({ ...p, kind: v, price: "", note: "" }))} style={{flex:1,padding:"10px 6px",borderRadius:8,border:`2px solid ${sl.kind === v ? "var(--or)" : "var(--dv)"}`,background:sl.kind === v ? "var(--or-bg)" : "#fff",color:sl.kind === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13.5,cursor:"pointer"}}>{label}</button>
                     ))}
                   </div>
                 </div>
 
                 {!slCatalog && !slCatFail && <p style={{fontSize:13,color:"var(--mu)"}}>⏳ กำลังโหลดรายการสินค้า...</p>}
+                {slCatalog && sl.kind === "promo" && (
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {[["all", "ALL TIME — ใช้ได้ทุกเวลา"], ["day", "DAY — จ.–ศ. ก่อน 16:00"]].map(([g, gl]) => (
+                      <div key={g}>
+                        <p style={{fontSize:12,fontWeight:700,color:"var(--br)",marginBottom:6}}>{gl}</p>
+                        <div style={{display:"flex",gap:8}}>
+                          {(slCatalog.promo.items || []).filter(x => (x.tier === "peak" ? "all" : "day") === g).map(it => (
+                            <button key={it.code} onClick={() => setSl(p => ({ ...p, promo: it.code, price: "" }))} style={{flex:1,padding:"9px 4px",borderRadius:8,border:`2px solid ${sl.promo === it.code ? "var(--or)" : "var(--dv)"}`,background:sl.promo === it.code ? "var(--or-bg)" : "#fff",color:sl.promo === it.code ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>{it.credits} ครั้ง<br /><span style={{fontWeight:600}}>฿{it.price.toLocaleString()}</span></button>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {slCatalog && sl.kind === "package" && (
                   <>
                     <div style={{display:"flex",gap:8}}>
@@ -3793,7 +4111,7 @@ function AdminDashboard({ token, onLogout }) {
                   <div style={{background:"var(--or-bg)",border:"1px solid var(--dv)",borderRadius:10,padding:"10px 12px",fontSize:13,color:"var(--br)",lineHeight:1.7}}>
                     <b>{slLabel}</b><br />
                     ราคาตามป้าย <b style={{color:"var(--or)"}}>฿{slList.toLocaleString()}</b>
-                    {sl.kind === "package" ? <> • อายุ {slItem.days} วัน — <b>ยังไม่เริ่มนับ</b> จะเริ่มนับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ (วันเล่นวันแรกนับเป็นวันที่ 1)</> : <> • ใช้สิทธิ์ 60 นาที = 1 ครั้ง (จอง 120 นาที = ตัด 2 ครั้ง) • รวม {sl.sessions} ครั้ง</>}
+                    {sl.kind !== "coach" ? <> • อายุ {slItem.days} วัน — <b>ยังไม่เริ่มนับ</b> จะเริ่มนับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ (วันเล่นวันแรกนับเป็นวันที่ 1)</> : <> • ใช้สิทธิ์ 60 นาที = 1 ครั้ง (จอง 120 นาที = ตัด 2 ครั้ง) • รวม {sl.sessions} ครั้ง</>}
                   </div>
                 )}
 
@@ -4066,7 +4384,7 @@ function AdminDashboard({ token, onLogout }) {
                         <tr key={pk.id}>
                           <td style={{fontWeight:600}}>{pk.customer_name || "-"}</td>
                           <td>{pk.customer_id}</td>
-                          <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits} ครั้ง{pk.sold_by === "admin" && <span title={pk.admin_note || ""} style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>📞 แอดมินขาย{pk.price < pk.list_price ? " (ลดราคา)" : ""}</span>}</td>
+                          <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits} ครั้ง{pk.promo_code && <span style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#fff",background:"#E8690F",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>🔥 11.11</span>}{pk.sold_by === "admin" && <span title={pk.admin_note || ""} style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>📞 แอดมินขาย{pk.price < pk.list_price ? " (ลดราคา)" : ""}</span>}</td>
                           <td style={{fontWeight:700,color:"var(--or)"}}>฿{pk.price?.toLocaleString()}</td>
                           <td>{pk.slip_url ? <a href={pk.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
                           <td><span style={{fontSize:12,fontWeight:600,color:pk.status==="reviewing"?"#e67e22":"var(--mu)"}}>{pk.status==="reviewing"?"🔍 รอการยืนยัน":"⏳ รอชำระ"}</span></td>
@@ -4111,7 +4429,7 @@ function AdminDashboard({ token, onLogout }) {
                           <tr key={pk.id}>
                             <td style={{fontWeight:600}}>{pk.customer_name || "-"}</td>
                             <td>{pk.customer_id}</td>
-                            <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits}{pk.sold_by === "admin" && <span title={pk.admin_note || ""} style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>📞 แอดมินขาย{pk.list_price != null && pk.price < pk.list_price ? " (ลดราคา)" : ""}</span>}</td>
+                            <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits}{pk.promo_code && <span style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#fff",background:"#E8690F",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>🔥 11.11</span>}{pk.sold_by === "admin" && <span title={pk.admin_note || ""} style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>📞 แอดมินขาย{pk.list_price != null && pk.price < pk.list_price ? " (ลดราคา)" : ""}</span>}</td>
                             <td>{used!=null ? `${used} ครั้ง` : "-"}</td>
                             <td>{pk.status==="active" ? `${pk.remaining_credits} / ${pk.total_credits}` : "-"}</td>
                             <td>{pk.activated_at ? parseUtc(pk.activated_at).toLocaleDateString("th-TH",{day:"2-digit",month:"short",year:"numeric",timeZone:"Asia/Bangkok"}) : "-"}</td>
@@ -4357,7 +4675,7 @@ function AdminDashboard({ token, onLogout }) {
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
                   <div>
                     <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>ส่วนลด (บาท)</label>
-                    <input type="number" value={newAmt} onChange={e=>setNewAmt(e.target.value)} min="1"
+                    <input type="number" value={newAmt} onChange={e=>{ setNewAmt(e.target.value); if (!cpHintTouched) setCpHint(CP_PRESET_HINTS[+e.target.value] || ""); }} min="1"
                       style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
                   </div>
                   <div>
@@ -4371,10 +4689,32 @@ function AdminDashboard({ token, onLogout }) {
                   <input type="date" value={newExp} onChange={e=>setNewExp(e.target.value)}
                     style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
                 </div>
+                <div style={{marginBottom:14}}>
+                  <p style={{fontSize:12.5,fontWeight:700,color:"var(--br)",marginBottom:8}}>🎟 รูปคูปอง (ตัวอย่างเปลี่ยนตามที่กรอก — ได้รูปพร้อมส่งหลังกด "สร้างรหัส")</p>
+                  <CouponImage code={newCode || "XXXXXXXX"} amount={Number(newAmt) || 0} expiry={newExp} theme={cpTheme} hint={cpHint} maxUses={Number(newMax) || 1} />
+                  <div style={{display:"flex",gap:8,margin:"12px 0 10px",flexWrap:"wrap",alignItems:"center"}}>
+                    <span style={{fontSize:12,color:"var(--mu)"}}>สีคูปอง:</span>
+                    {Object.entries(CP_THEMES).map(([k, t]) => (
+                      <button key={k} onClick={() => setCpTheme(k)} aria-label={`สี${t.label}`} style={{padding:"6px 14px",borderRadius:20,border:`2px solid ${cpTheme === k ? t.stub : "var(--dv)"}`,background:cpTheme === k ? `${t.stub}22` : "#fff",color:cpTheme === k ? t.ink : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}><span style={{display:"inline-block",width:10,height:10,borderRadius:5,background:t.stub,marginRight:6}} />{t.label}</button>
+                    ))}
+                  </div>
+                  <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>ข้อความอธิบายมูลค่าบนคูปอง (ไม่บังคับ) — ใส่ ฿490 / ฿590 จะเติมให้เอง</label>
+                  <input value={cpHint} onChange={e => { setCpHint(e.target.value); setCpHintTouched(true); }} placeholder="เช่น เท่ากับค่าสนาม Off Peak 1 ชม." maxLength={80}
+                    style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                </div>
                 <button onClick={createCode} disabled={!newCode.trim()} style={{width:"100%",padding:"12px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
                   สร้างรหัส
                 </button>
               </div>
+              {cpCreated && (
+                <div id="cp-created" style={{background:"#fff",borderRadius:12,padding:18,marginBottom:20,border:"2px solid #2d7a4f",boxShadow:"var(--sh)"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:12}}>
+                    <p style={{fontWeight:800,color:"#1b5e3c",fontSize:14.5,lineHeight:1.6,margin:0}}>✅ สร้างรหัส <span style={{fontFamily:"monospace"}}>{cpCreated.code}</span> แล้ว — รูปคูปองพร้อมส่งให้ลูกค้า</p>
+                    <button onClick={() => setCpCreated(null)} aria-label="ปิด" style={{border:"none",background:"transparent",fontSize:18,cursor:"pointer",color:"var(--mu)"}}>✕</button>
+                  </div>
+                  <CouponImage code={cpCreated.code} amount={cpCreated.amount} expiry={cpCreated.expiry} theme={cpCreated.theme} hint={cpCreated.hint} maxUses={cpCreated.maxUses} showActions />
+                </div>
+              )}
               <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
                 <table className="adm-table">
                   <thead><tr><th>รหัส</th><th>ส่วนลด</th><th>ใช้แล้ว/ทั้งหมด</th><th>หมดอายุ</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
@@ -4391,7 +4731,7 @@ function AdminDashboard({ token, onLogout }) {
                           const [txt, col] = !c.active ? ["ปิดใช้งาน","#c0392b"] : expired ? ["หมดอายุแล้ว","#c0392b"] : used ? ["ใช้ครบแล้ว","#8a5a00"] : ["ใช้งานได้","#2d7a4f"];
                           return <span style={{fontSize:12,fontWeight:600,color:col,background:`${col}1a`,padding:"3px 8px",borderRadius:20}}>{txt}</span>;
                         })()}</td>
-                        <td><button onClick={()=>toggleDiscount(c.id,!c.active)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:c.active?"rgba(192,57,43,.1)":"rgba(45,122,79,.1)",color:c.active?"#c0392b":"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{c.active?"ปิด":"เปิด"}</button>{c.used_count > 0 && <button onClick={()=>resetDiscount(c)} title="รีเซ็ตจำนวนที่ใช้เป็น 0" style={{marginLeft:6,padding:"5px 10px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:12,cursor:"pointer"}}>รีเซ็ต</button>}</td>
+                        <td><button onClick={() => setCpView(c)} title="ดู/ดาวน์โหลดรูปคูปองของโค้ดนี้" style={{marginRight:6,padding:"5px 10px",borderRadius:6,border:"1px solid var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🎟 คูปอง</button><button onClick={()=>toggleDiscount(c.id,!c.active)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:c.active?"rgba(192,57,43,.1)":"rgba(45,122,79,.1)",color:c.active?"#c0392b":"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{c.active?"ปิด":"เปิด"}</button>{c.used_count > 0 && <button onClick={()=>resetDiscount(c)} title="รีเซ็ตจำนวนที่ใช้เป็น 0" style={{marginLeft:6,padding:"5px 10px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:12,cursor:"pointer"}}>รีเซ็ต</button>}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -4556,6 +4896,27 @@ function AdminDashboard({ token, onLogout }) {
           </div>
         );
       })()}
+
+      {cpView && (
+        <div onClick={() => setCpView(null)} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(40,22,12,.55)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"20px 10px",overflowY:"auto"}}>
+          <div onClick={e => e.stopPropagation()} style={{background:"#fff",borderRadius:16,width:"100%",maxWidth:620,boxShadow:"0 12px 48px rgba(0,0,0,.35)",overflow:"hidden"}}>
+            <div style={{background:"var(--br)",color:"#fff",padding:"14px 18px",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+              <p style={{fontWeight:800,fontSize:16,margin:0}}>🎟 คูปอง <span style={{fontFamily:"monospace"}}>{cpView.code}</span></p>
+              <button onClick={() => setCpView(null)} aria-label="ปิด" style={{border:"none",background:"rgba(255,255,255,.18)",color:"#fff",width:34,height:34,borderRadius:17,fontSize:16,cursor:"pointer"}}>✕</button>
+            </div>
+            <div style={{padding:16}}>
+              <CouponImage code={cpView.code} amount={cpView.discount_amount || 0} percent={cpView.discount_amount ? 0 : (cpView.discount_percent || 0)} expiry={cpView.expires_at ? String(cpView.expires_at).slice(0, 10) : ""} theme={cpTheme} hint={cpView.discount_amount ? (CP_PRESET_HINTS[cpView.discount_amount] || "") : ""} maxUses={cpView.max_uses || 1} showActions />
+              <div style={{display:"flex",gap:8,margin:"14px 0 0",flexWrap:"wrap",alignItems:"center"}}>
+                <span style={{fontSize:12,color:"var(--mu)"}}>สีคูปอง:</span>
+                {Object.entries(CP_THEMES).map(([k, t]) => (
+                  <button key={k} onClick={() => setCpTheme(k)} style={{padding:"6px 14px",borderRadius:20,border:`2px solid ${cpTheme === k ? t.stub : "var(--dv)"}`,background:cpTheme === k ? `${t.stub}22` : "#fff",color:cpTheme === k ? t.ink : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}><span style={{display:"inline-block",width:10,height:10,borderRadius:5,background:t.stub,marginRight:6}} />{t.label}</button>
+                ))}
+              </div>
+              <p style={{fontSize:12,color:"var(--mu)",margin:"12px 0 0",lineHeight:1.6}}>สถานะตอนนี้: ใช้แล้ว {cpView.used_count}/{cpView.max_uses} ครั้ง{cpView.active ? "" : " • ปิดใช้งานอยู่ (ลูกค้าจะใช้โค้ดนี้ไม่ได้)"}</p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {histPhone && (
         <div onClick={closeHistory} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(40,22,12,.55)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"20px 10px",overflowY:"auto"}}>
