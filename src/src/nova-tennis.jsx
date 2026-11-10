@@ -1790,6 +1790,8 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
   const [creating, setCreating] = useState(false);
   const [createErr, setCreateErr] = useState("");
   const [pkg, setPkg] = useState(null); // แพ็คเกจที่สร้างแล้ว รอชำระเงิน
+  const [resumed, setResumed] = useState(false); // true = เปิดกลับมาจากรายการที่ค้างอยู่ (ไม่ใช่เพิ่งสร้าง)
+  const [busyId, setBusyId] = useState(null);
 
   const [lookupPhone, setLookupPhone] = useState(() => lineSession?.phone || "");
   const [myPkgs, setMyPkgs] = useState([]);
@@ -1841,8 +1843,24 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
     if (utm) db.recordSource("package", pkgRow.id, utm).catch(() => {});
   };
 
+  // โหลดรายการ "แพ็คเกจของฉัน" ใหม่ (หลังชำระ/ยกเลิก/กลับจากหน้าชำระเงิน) เพื่อให้สถานะตรงกับเซิร์ฟเวอร์
+  const reloadMine = async () => {
+    const ph = lineSession?.phone || lookupPhone;
+    if (!/^[0-9]{10}$/.test(ph || "")) return;
+    const rows = await db.myPackages(ph).catch(() => null);
+    if (rows) setMyPkgs(rows);
+  };
+  const cancelPending = async (row) => {
+    const sure = window.confirm(lang==="th" ? "ยกเลิกรายการนี้ใช่หรือไม่?\n\n(ถ้าคุณโอนเงินไปแล้ว อย่ายกเลิก — ให้กด “ไปชำระเงินต่อ” แล้วแนบสลิปแทน)" : "Cancel this order?\n\n(If you've already paid, don't cancel — tap “Continue to payment” and attach your slip instead.)");
+    if (!sure) return;
+    setBusyId(row.id);
+    await db.cancelPendingPackage(row.id).catch(() => {});
+    await reloadMine();
+    setBusyId(null);
+  };
   if (pkg) {
-    return <PackagePaymentView pkg={pkg} lang={lang} onDone={() => { setPkg(null); setSelected(null); setName(lineName); setPhone(lineSession?.phone || ""); }} />;
+    const leave = () => { setPkg(null); setResumed(false); reloadMine(); };
+    return <PackagePaymentView pkg={pkg} lang={lang} resumed={resumed} onBack={leave} onDone={() => { setSelected(null); setName(lineName); setPhone(lineSession?.phone || ""); leave(); }} />;
   }
 
   const pkgStatusInfo = (s) => {
@@ -1907,7 +1925,7 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
               const st = pkgStatusInfo(p.status);
               const expired = p.status==="active" && p.expiry_date && new Date(p.expiry_date+"T23:59:59") < new Date();
               return (
-                <div key={p.id} className="card">
+                <div key={p.id} className="card" style={p.status==="pending" ? {border:"2px solid var(--or)"} : undefined}>
                   <div style={{padding:"13px 16px"}}>
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
                       <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{promoOf(p.promo_code) ? promoLabel(promoOf(p.promo_code), lang==="th") : <>{p.tier==="peak"?"Peak":"Off Peak"} × {p.total_credits} {lang==="th"?"ครั้ง":"sessions"}</>}</span>
@@ -1932,6 +1950,16 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
                       <Row label={lang==="th"?"อายุการใช้งาน":"Valid for"} val={lang==="th"?`${p.expiry_days} วัน (นับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ)`:`${p.expiry_days} days (counted from your first play date)`} />
                     )}
                     <Row label={t.rowPrice} val={`฿${p.price?.toLocaleString()}`} />
+                    {p.status==="pending" && (
+                      <div style={{display:"flex",gap:8,marginTop:12}}>
+                        <button onClick={() => { setResumed(true); setPkg(p); }} data-testid={`resume-${p.id}`} style={{flex:2,padding:"12px 8px",borderRadius:10,border:"none",background:"linear-gradient(90deg,var(--or),var(--or2))",color:"#fff",fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                          💳 {lang==="th" ? "ไปชำระเงินต่อ →" : "Continue to payment →"}
+                        </button>
+                        <button onClick={() => cancelPending(p)} disabled={busyId===p.id} data-testid={`cancel-${p.id}`} style={{flex:1,padding:"12px 8px",borderRadius:10,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                          {busyId===p.id ? "..." : (lang==="th" ? "ยกเลิก" : "Cancel")}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               );
@@ -2023,9 +2051,14 @@ function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
 }
 
 // หน้าชำระเงินสำหรับแพ็คเกจ (QR + แนบสลิป) — คล้ายหน้าชำระเงินจองสนาม แต่เรียบง่ายกว่า
-function PackagePaymentView({ pkg, lang="th", onDone }) {
+function PackagePaymentView({ pkg, lang="th", onDone, onBack, resumed=false }) {
   const t = T[lang];
-  const [secs, setSecs] = useState(300);
+  // เปิดซ้ำจากรายการที่ค้างอยู่ (resumed): เวลาที่เหลือนับจากเวลาที่สร้างรายการจริง ไม่เริ่ม 5:00 ใหม่ทุกครั้ง — หมดเวลาแล้วก็ยังแนบสลิป/ยกเลิกได้ (เซิร์ฟเวอร์ไม่จำกัดเวลา)
+  const [secs, setSecs] = useState(() => {
+    if (!resumed || !pkg.created_time) return 300;
+    const el = Math.floor((Date.now() - parseUtc(pkg.created_time).getTime()) / 1000);
+    return Number.isFinite(el) ? Math.max(0, 300 - Math.max(0, el)) : 300;
+  });
   const [expired, setExpired] = useState(false);
   const [slip, setSlip] = useState(null);
   const [slipPreview, setSlipPreview] = useState(null);
@@ -2077,6 +2110,11 @@ function PackagePaymentView({ pkg, lang="th", onDone }) {
 
   return (
     <div style={{padding:"20px 16px 90px"}} className="fu">
+      {onBack && !uploaded && (
+        <button onClick={onBack} data-testid="pay-back" style={{background:"none",border:"none",color:"var(--mu)",fontSize:13,fontWeight:600,cursor:"pointer",padding:"0 0 10px",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+          {lang==="th" ? "← กลับไปหน้าแพ็คเกจ (รายการนี้ยังรอชำระอยู่ กลับมาชำระต่อได้)" : "← Back to packages (this order is still awaiting payment — you can come back to pay)"}
+        </button>
+      )}
       <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:18}}>{t.payment}</h2>
 
       <div style={{background:"#fff",borderRadius:"var(--r)",marginBottom:16,border:`1.5px solid ${expired?"#c0392b":"var(--dv)"}`,padding:"16px 20px",textAlign:"center",boxShadow:"var(--sh)"}}>
@@ -2086,6 +2124,11 @@ function PackagePaymentView({ pkg, lang="th", onDone }) {
           <button onClick={handleStartOver} style={{marginTop:12,background:"none",border:"none",color:"#c0392b",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
             {lang==="th" ? "ยกเลิกรายการนี้" : "Cancel this order"}
           </button>
+        )}
+        {expired && !uploaded && (
+          <p data-testid="pay-expired-note" style={{marginTop:10,fontSize:12.5,color:"var(--tx)",lineHeight:1.6}}>
+            {lang==="th" ? "หมดเวลาที่แนะนำแล้ว — ถ้าคุณโอนเงินแล้ว แนบสลิปด้านล่างได้เลย ทีมงานจะตรวจสอบให้ / ถ้ายังไม่ได้โอน กดยกเลิกแล้วเลือกแพ็คเกจใหม่" : "The suggested time has passed — if you've already transferred, just attach your slip below and we'll verify it. If not, cancel and pick a package again."}
+          </p>
         )}
       </div>
 
