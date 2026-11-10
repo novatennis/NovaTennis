@@ -722,7 +722,7 @@ function Promo1111Section({ lang = "th", selected, onSelect, msLeft }) {
           <p style={{fontSize:14,fontWeight:800,color:g.color}}>{g.title}</p>
           <p style={{fontSize:11.5,color:"var(--mu)",marginBottom:8}}>{g.sub}</p>
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
-            {PROMO_1111.items.filter(i => i.group === g.id).map(it => {
+            {PROMO_1111.items.filter(i => i.group === g.id).sort((a, b) => b.credits - a.credits).map(it => { // เรียงจากแพ็คใหญ่สุดไว้บนสุด: 11 → 6 → 3 ครั้ง
               const sel = selected?.promo === it.code, save = promoNormal(it) - it.price, best = it.credits === 11;
               return (
                 <button key={it.code} onClick={() => onSelect({ promo: it.code, tier: it.tier, credits: it.credits, price: it.price, days: it.days, name: it.name })} aria-pressed={sel} data-testid={`promo-${it.code}`}
