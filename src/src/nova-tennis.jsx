@@ -200,13 +200,13 @@ function getDurationPrice(startHour, dateObj, durationMinutes) {
 function getSlotPrice(hour, dateObj) { return getDurationPrice(hour, dateObj, 60); }
 
 // โปรโมชั่นจองครั้งแรก (แสดงผลเท่านั้น — เซิร์ฟเวอร์เป็นคนตัดสินราคาจริง ต้องแก้ให้ตรงกับ FIRST_TIME_PROMO ใน booking-actions.js ถ้าเปลี่ยน)
-// ใช้ได้กับ "วันที่เล่น" ถึง lastPlayDate (รวมวันนั้น)
-const FIRST_TIME_PROMO = { weekday: 450, weekend: 490, lastPlayDate: "2026-10-31", endTh: "31 ต.ค. 2569", endEn: "31 Oct 2026" };
+// ถาวร ไม่มีวันสิ้นสุด — ใช้ได้กับการจอง 60 นาที 1 สนาม ครั้งแรกของลูกค้าใหม่
+const FIRST_TIME_PROMO = { weekday: 450, weekend: 490 }; // ถาวร: ไม่มีวันสิ้นสุด
 
 // โปรพิเศษ 11.11 (แพ็คเกจระยะสั้น) — แสดงผลเท่านั้น เซิร์ฟเวอร์ตัดสินราคา/จำนวนครั้ง/กติกาจริง (ต้องตรงกับ PROMO_1111 ใน booking-actions.js และ admin-actions.js)
-// "all" = ใช้ได้ทุกเวลา (เทียบ Peak ฿590/ชม.) / "day" = จ.–ศ. ก่อน 16:00 (เทียบ Off Peak ฿490/ชม.) — ขายตั้งแต่ startsAtMs (10 พ.ย. 00:00) ถึง endsAtMs (13 พ.ย. 23:59), ไม่จำกัดจำนวนต่อคน, ไม่มีกำหนดเริ่มใช้ (อายุเริ่มนับจากวันเล่นครั้งแรก)
+// "all" = ใช้ได้ทุกเวลา (เทียบ Peak ฿590/ชม.) / "day" = จ.–ศ. ก่อน 16:00 (เทียบ Off Peak ฿490/ชม.) — ขายตั้งแต่ startsAtMs (10 พ.ย. 00:00) ถึง endsAtMs (17 พ.ย. 23:59), ไม่จำกัดจำนวนต่อคน, ไม่มีกำหนดเริ่มใช้ (อายุเริ่มนับจากวันเล่นครั้งแรก)
 const PROMO_1111 = {
-  startsAtMs: Date.parse("2026-11-10T00:00:00+07:00"), endsAtMs: Date.parse("2026-11-13T23:59:59.999+07:00"), endTh: "13 พ.ย. 69 เวลา 23:59", endEn: "13 Nov 2026, 23:59",
+  startsAtMs: Date.parse("2026-11-10T00:00:00+07:00"), endsAtMs: Date.parse("2026-11-17T23:59:59.999+07:00"), endTh: "17 พ.ย. 69 เวลา 23:59", endEn: "17 Nov 2026, 23:59",
   items: [
     { code: "ALL-3",  group: "all", name: "Starter",           tier: "peak",    credits: 3,  price: 1590, days: 30 },
     { code: "ALL-6",  group: "all", name: "Plus",              tier: "peak",    credits: 6,  price: 2990, days: 60 },
@@ -863,19 +863,44 @@ function HomePage({ goBook, goPackage, goCoach, lang="th" }) {
         <button className="btn-primary" onClick={goBook}>{t.bookNow}</button>
       </div>
 
-      {/* แบนเนอร์คู่: โปรจองครั้งแรก + แพ็คเกจ — วางข้างกันให้เห็นพร้อมกันโดยไม่ต้องเลื่อนหน้า
-          (โปรจองครั้งแรกหายเองหลังพ้นวันสุดท้าย เหลือแพ็คเกจเต็มความกว้าง) */}
-      {promo.active ? <Promo1111Banner onClick={() => { window.__promoScroll = true; goPackage(); }} lang={lang} msLeft={promo.msLeft} /> : (() => {
-        const promoActive = toIso(new Date()) <= FIRST_TIME_PROMO.lastPlayDate;
+      {/* โปรจองครั้งแรก (ถาวร ไม่มีวันหมดอายุ) + แพ็คเกจ: ปกติวางคู่กัน / ช่วงโปร 11.11 แบนเนอร์ไฟอยู่บนสุด แล้วตามด้วยแถบโปรจองครั้งแรก */}
+      {(() => {
         const th = lang === "th";
         const pill = (bg, color) => ({ display:"inline-block", alignSelf:"flex-start", background:bg, color, borderRadius:20, padding:"3px 10px", fontSize:11, fontWeight:800 });
         const cardBase = { position:"relative", overflow:"hidden", width:"100%", minHeight:232, padding:"14px 13px 13px", borderRadius:"var(--r)", border:"none", cursor:"pointer", textAlign:"left", color:"#fff", display:"flex", flexDirection:"column", justifyContent:"space-between", gap:6 };
         const cta = (color) => ({ display:"block", textAlign:"center", background:"#fff", color, fontWeight:800, fontSize:14, padding:"9px 6px", borderRadius:22, boxShadow:"0 3px 10px rgba(0,0,0,.22)" });
+        const note = (
+          <p data-testid="first-time-note" style={{fontSize:10.5,color:"var(--mu)",marginTop:8,lineHeight:1.5}}>
+            {th ? "* โปรจองครั้งแรก: ลูกค้าใหม่ • จอง 60 นาที • 1 สนาม • 1 สิทธิ์ต่อ 1 คน • ไม่ร่วมกับโค้ดส่วนลดหรือแพ็คเกจ" : "* First-booking offer: new customers • 60 min • 1 court • one per customer • cannot combine with discount codes or packages"}
+          </p>
+        );
+        if (promo.active) return (
+          <>
+            <Promo1111Banner onClick={() => { window.__promoScroll = true; goPackage(); }} lang={lang} msLeft={promo.msLeft} />
+            <div style={{padding:"10px 16px 0"}}>
+              <button onClick={goBook} data-testid="first-time-strip" style={{position:"relative",overflow:"hidden",display:"block",width:"100%",border:"none",borderRadius:"var(--r)",padding:"13px 14px",cursor:"pointer",textAlign:"left",color:"#fff",background:"linear-gradient(160deg,#1E4E66 0%,#2F7A94 60%,#4BA3B8 100%)",boxShadow:"0 6px 20px rgba(47,122,148,.4)",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                <span className="promo-spark" style={{top:8,right:84,fontSize:15}}>✨</span>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                  <span className="promo-tag" style={pill("#FFD54A","#5A3A00")}>🎁 {th ? "ลูกค้าใหม่ • จองครั้งแรก" : "NEW CUSTOMER • FIRST BOOKING"}</span>
+                  <span style={{...cta("#1E4E66"),padding:"6px 14px",fontSize:13,whiteSpace:"nowrap"}}>{th ? "จองเลย →" : "Book →"}</span>
+                </div>
+                <div style={{display:"flex",gap:10,marginTop:10}}>
+                  {[[FIRST_TIME_PROMO.weekday, th ? "จันทร์–ศุกร์" : "Mon–Fri"], [FIRST_TIME_PROMO.weekend, th ? "เสาร์–อาทิตย์" : "Sat–Sun"]].map(([price, label]) => (
+                    <div key={label} style={{flex:1,background:"rgba(255,255,255,.15)",borderRadius:12,padding:"7px 10px"}}>
+                      <p style={{fontSize:11.5,fontWeight:700}}>{label}</p>
+                      <p style={{fontSize:30,fontWeight:900,color:"#FFD54A",lineHeight:1.05,textShadow:"0 2px 8px rgba(0,0,0,.3)"}}>฿{price}<span style={{fontSize:12,fontWeight:700,color:"#fff"}}>/{th ? "ชม." : "hr"}</span></p>
+                    </div>
+                  ))}
+                </div>
+                <p style={{fontSize:11,fontWeight:700,opacity:.95,marginTop:8}}>{th ? "จอง 60 นาที • 1 สนาม • 1 สิทธิ์ต่อ 1 คน" : "60 min • 1 court • one per customer"}</p>
+              </button>
+              {note}
+            </div>
+          </>
+        );
         return (
           <div style={{padding:"14px 16px 0"}}>
-            <div style={{display:"grid",gridTemplateColumns:promoActive?"1fr 1fr":"1fr",gap:10,alignItems:"stretch"}}>
-
-              {promoActive && (
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,alignItems:"stretch"}}>
                 <button onClick={goBook} style={{...cardBase,background:"linear-gradient(160deg,#1E4E66 0%,#2F7A94 60%,#4BA3B8 100%)",boxShadow:"0 6px 20px rgba(47,122,148,.4)"}}>
                   <span className="promo-spark" style={{top:8,right:10,fontSize:18}}>✨</span>
                   <span className="promo-spark" style={{top:46,right:30,fontSize:12,animationDelay:".7s"}}>✨</span>
@@ -885,11 +910,10 @@ function HomePage({ goBook, goPackage, goCoach, lang="th" }) {
                     <p className="promo-price" style={{fontSize:40,fontWeight:900,lineHeight:1.05,color:"#FFD54A",marginTop:4,textShadow:"0 2px 8px rgba(0,0,0,.3)"}}>฿{FIRST_TIME_PROMO.weekday}<span style={{fontSize:13,fontWeight:700,color:"#fff"}}>/{th?"ชม.":"hr"}</span></p>
                     <p style={{fontSize:12.5,fontWeight:700,marginTop:1}}>{th?"จันทร์–ศุกร์":"Mon–Fri"}</p>
                     <p style={{fontSize:13,fontWeight:800,marginTop:6,background:"rgba(255,255,255,.2)",borderRadius:10,padding:"4px 8px",display:"inline-block"}}>฿{FIRST_TIME_PROMO.weekend} {th?"เสาร์–อาทิตย์":"Sat–Sun"}</p>
-                    <p style={{fontSize:11.5,fontWeight:700,marginTop:7,opacity:.95}}>⏰ {th?`ถึง ${FIRST_TIME_PROMO.endTh}`:`Until ${FIRST_TIME_PROMO.endEn}`}</p>
+                    <p style={{fontSize:11.5,fontWeight:700,marginTop:7,opacity:.95}}>{th?"60 นาที • 1 สิทธิ์ต่อ 1 คน":"60 min • one per customer"}</p>
                   </div>
                   <span style={cta("#1E4E66")}>{th?"จองเลย →":"Book now →"}</span>
                 </button>
-              )}
 
               <button onClick={goPackage} className="pkg-fire" style={{...cardBase,background:"linear-gradient(160deg,#9E1B0A 0%,#E8420F 55%,#FF9A1F 100%)"}}>
                 <span className="pkg-shine" />
@@ -906,13 +930,7 @@ function HomePage({ goBook, goPackage, goCoach, lang="th" }) {
                 <span style={{...cta("#C2330C"),position:"relative"}}>{th?"ดูแพ็คเกจ →":"View packages →"}</span>
               </button>
             </div>
-            {promoActive && (
-              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:8,lineHeight:1.5}}>
-                {th
-                  ? `* โปรจองครั้งแรก: ลูกค้าใหม่ • จอง 60 นาที • 1 สนาม • วันเล่นถึง ${FIRST_TIME_PROMO.endTh} • ไม่ร่วมกับโค้ดส่วนลดหรือแพ็คเกจ`
-                  : `* First-booking offer: new customers • 60 min • 1 court • play date up to ${FIRST_TIME_PROMO.endEn} • cannot combine with discount codes or packages`}
-              </p>
-            )}
+            {note}
           </div>
         );
       })()}
@@ -1433,7 +1451,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
             <span style={{fontSize:20,flexShrink:0}}>🎉</span>
             <div>
               <p style={{fontSize:13.5,fontWeight:700,color:"#2d7a4f"}}>{lang==="th"?"ยินดีต้อนรับ! ราคาพิเศษสำหรับการจองครั้งแรก":"Welcome! Special first-booking price"}</p>
-              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือจ่ายแค่ ฿${firstTimePrice} (จากปกติ ฿${slot.price}) — ใช้ได้กับการจอง 60 นาทีครั้งแรกเท่านั้น สำหรับวันเล่นถึง ${FIRST_TIME_PROMO.endTh}`:`Only ฿${firstTimePrice} (normally ฿${slot.price}) — first 60-minute booking only, for play dates up to ${FIRST_TIME_PROMO.endEn}`}</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือจ่ายแค่ ฿${firstTimePrice} (จากปกติ ฿${slot.price}) — ใช้ได้กับการจอง 60 นาทีครั้งแรกเท่านั้น `:`Only ฿${firstTimePrice} (normally ฿${slot.price}) — first 60-minute booking only`}</p>
             </div>
           </div>
         )}
@@ -3563,7 +3581,7 @@ function AdminDashboard({ token, onLogout }) {
         : r?.error === "invalid_phone" ? "❌ เบอร์โทรต้องเป็นตัวเลข 10 หลัก"
         : r?.error === "invalid_product" ? "❌ สินค้านี้ไม่มีในรายการขาย"
         : r?.error === "note_too_long" ? "❌ หมายเหตุยาวเกิน 200 ตัวอักษร"
-        : r?.error === "promo_ended" ? "❌ โปร 11.11 ปิดการขายแล้ว (เลยวันที่ 13 พ.ย. 23:59)"
+        : r?.error === "promo_ended" ? "❌ โปร 11.11 ปิดการขายแล้ว (เลยวันที่ 17 พ.ย. 23:59)"
         : r?.error === "promo_not_started" ? "❌ โปร 11.11 ยังไม่เปิดขาย (เริ่มขาย 10 พ.ย. เวลา 00:00)"
         : r?.error === "promo_columns_missing" ? "❌ ยังไม่ได้รัน SQL — รันไฟล์ add-promo-1111-columns.sql ที่ Supabase ก่อน (ยังไม่มีการบันทึกใดๆ)"
         : r?.error === "sale_columns_missing" ? "❌ ยังไม่ได้รัน SQL — รันไฟล์ add-admin-sale-columns.sql ที่ Supabase ก่อน (ยังไม่มีการบันทึกใดๆ)"
