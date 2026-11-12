@@ -15,6 +15,50 @@ async function callBookingAction(action, payload) {
   return res.json();
 }
 
+// ─── ล็อกอิน LINE: ลองซ้ำเมื่อเชื่อมต่อช้า/ขัดข้องชั่วคราว (code ของ LINE ใช้ได้ครั้งเดียว แต่เซิร์ฟเวอร์คืนผลเดิมให้ถ้าส่ง code เดิมซ้ำ) ───
+const LINE_LOGIN_RETRY_DELAYS = [0, 1200, 2500];   // ลองสูงสุด 3 ครั้ง
+const LINE_LOGIN_CLIENT_TIMEOUT_MS = 28000;
+const LINE_PERMANENT_ERRORS = ["line_token_failed", "missing code", "line_not_configured"]; // code ใช้ไม่ได้/ตั้งค่าไม่ครบ → ลองซ้ำไม่ช่วย ให้ล็อกอินใหม่
+async function lineLoginWithRetry(code) {
+  let last = { error: "network" };
+  for (let i = 0; i < LINE_LOGIN_RETRY_DELAYS.length; i++) {
+    if (LINE_LOGIN_RETRY_DELAYS[i]) await new Promise(r => setTimeout(r, LINE_LOGIN_RETRY_DELAYS[i]));
+    const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), LINE_LOGIN_CLIENT_TIMEOUT_MS);
+    try {
+      const res = await fetch("/api/booking-actions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "lineLogin", code }), signal: ctrl.signal });
+      let body = null; try { body = await res.json(); } catch { body = null; }
+      clearTimeout(timer);
+      if (res.ok && body?.session) return body;
+      last = { error: body?.error || (res.status >= 500 ? "server" : "bad_response"), line_error: body?.line_error, http: res.status };
+      if (body?.error && LINE_PERMANENT_ERRORS.includes(body.error)) return last;
+    } catch (e) { clearTimeout(timer); last = { error: e?.name === "AbortError" ? "timeout" : "network" }; }
+  }
+  return last;
+}
+const isInAppBrowser = () => { try { return /FBAN|FBAV|FB_IAB|Instagram|TikTok|musical_ly/i.test(navigator.userAgent || ""); } catch { return false; } };
+// แจ้งเซิร์ฟเวอร์ว่าล็อกอินล้มเหลวเพราะอะไร (บันทึกเป็น log ไว้ไล่หาสาเหตุ — ไม่ส่งข้อมูลส่วนตัว)
+const reportLineFail = (reason, extra = {}) => {
+  try { fetch("/api/booking-actions", { method: "POST", headers: { "Content-Type": "application/json" }, keepalive: true, body: JSON.stringify({ action: "lineLoginFailed", reason, line_error: extra.line_error || null, inapp: isInAppBrowser(), ua: (navigator.userAgent || "").slice(0, 140) }) }).catch(() => {}); } catch { /* no-op */ }
+};
+const normalizeLineErr = (r) => {
+  const e = r && r.error;
+  if (e === "internal error") return "server"; if (e === "missing code") return "no_code";
+  return ["timeout", "network", "bad_response", "server", "line_token_failed", "line_timeout", "line_unreachable", "line_profile_failed", "db_failed", "line_not_configured"].includes(e) ? e : "server";
+};
+const LINE_ERR_TEXT = (() => {
+  const slow = ["การเชื่อมต่อช้าหรือไม่เสถียร กรุณาตรวจสัญญาณอินเทอร์เน็ตแล้วลองใหม่อีกครั้ง", "Your connection is slow or unstable. Please check your internet and try again."];
+  const down = ["ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง ถ้ายังไม่ได้ ทักแอดมินทาง LINE ให้ช่วยได้เลย", "Temporary problem. Please try again — if it still fails, our admin can help on LINE."];
+  const none = ["LINE ไม่ได้ส่งข้อมูลการเข้าสู่ระบบกลับมา กรุณาลองใหม่อีกครั้ง", "LINE didn't send the sign-in details back. Please try again."];
+  return {
+    cancelled: ["คุณยกเลิกการเข้าสู่ระบบ LINE กรุณากดลองใหม่เมื่อพร้อม", "You cancelled the LINE sign-in. Tap try again when you're ready."],
+    line_denied: none, no_code: none,
+    state: ["การเข้าสู่ระบบหมดอายุหรือเริ่มซ้อนกัน (เช่น กดหลายครั้ง) กรุณากดลองใหม่เพียงครั้งเดียวแล้วรอสักครู่", "The sign-in expired or was started twice (e.g. several taps). Tap try again once and wait a moment."],
+    timeout: slow, network: slow, line_timeout: slow, line_unreachable: slow,
+    line_token_failed: ["ลิงก์เข้าสู่ระบบหมดอายุหรือถูกใช้ไปแล้ว กรุณากดลองใหม่ (ถ้าเคยอนุญาตไว้แล้วจะเข้าได้ทันที)", "The sign-in link expired or was already used. Tap try again (it's instant if you've already allowed access)."],
+    line_profile_failed: down, db_failed: down, line_not_configured: down, server: down, bad_response: down, unexpected: down,
+  };
+})();
+
 const db = {
   // ดึงเวลาที่ถูกจองแล้ว ผ่านเซิร์ฟเวอร์ (ไม่เปิดตารางให้เบราว์เซอร์อ่านตรง)
   async getBookings(date, courtId) {
@@ -74,7 +118,7 @@ const db = {
     const { packages } = await callBookingAction("myPackages", { phone });
     return packages || [];
   },
-  async lineLogin(code) { return callBookingAction("lineLogin", { code }); },
+  async lineLogin(code) { return lineLoginWithRetry(code); },
   async lineMe(session) { return callBookingAction("lineMe", { session }); },
   async lineLinkPhone(session, name, phone) { return callBookingAction("lineLinkPhone", { session, name, phone }); },
   async recordSource(kind, id, utm) { await callBookingAction("recordSource", { kind, id, utm }); },
@@ -340,7 +384,7 @@ const accountErrMsg = (code, lang = "th") => ({
 }[code] || null);
 // true = ในโหมด "booking" พอลูกค้ากด "จองสนาม"/"แพ็คเกจ" ตอนยังไม่ล็อกอิน ให้พาไปหน้า LINE Login ทันที (ข้ามหน้าแจ้งของเรา)
 // false = แสดงหน้าแจ้ง "เข้าสู่ระบบด้วย LINE" ของเราก่อน แล้วค่อยกดไปล็อกอิน
-const LINE_SKIP_INTRO = true;
+const LINE_SKIP_INTRO = false; // false: ลูกค้าที่ยังไม่ล็อกอินเห็นหน้าของเราก่อน (มีปุ่มทักแอดมิน/โทร) แล้วค่อยกดไป LINE — กันติดอยู่ที่หน้า LINE โดยไม่มีทางขอความช่วยเหลือ (ถ้าอยากข้ามหน้านี้ให้เป็น true)
 
 const loadLineSession = () => {
   try { return JSON.parse(localStorage.getItem(LINE_SESSION_KEY) || "null"); } catch { return null; }
@@ -360,7 +404,11 @@ const toFormName = (s) => graphemeList(String(s || "").trim()).slice(0, 20).join
 // pendingCheckout = ข้อมูลที่ลูกค้าเลือกไว้ (วัน/สนาม/เวลา) เก็บไว้ก่อนเด้งไปหน้า LINE แล้วคืนให้ตอนกลับมา
 function startLineLogin(returnTarget = "home", pendingCheckout = null) {
   const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
-  try { localStorage.setItem("nova_line_nonce", nonce); } catch { /* no-op */ }
+  try {
+    localStorage.setItem("nova_line_nonce", nonce);
+    const prev = JSON.parse(localStorage.getItem("nova_line_nonces") || "[]");
+    localStorage.setItem("nova_line_nonces", JSON.stringify([...(Array.isArray(prev) ? prev : []), nonce].slice(-3))); // จำ 3 ตัวล่าสุด: ลูกค้ากดล็อกอินซ้อนก็ไม่ถูกปฏิเสธ
+  } catch { /* no-op */ }
   try {
     if (pendingCheckout) localStorage.setItem("nova_pending_checkout", JSON.stringify(pendingCheckout));
     else localStorage.removeItem("nova_pending_checkout");
@@ -519,6 +567,40 @@ function NovaLogo({ width }) {
   return <img src="/nova-logo.png" alt="NOVA Tennis" style={{ width, height: "auto", display: "block", margin: "0 auto" }} />;
 }
 
+// ปุ่มขอความช่วยเหลือ: ทักแอดมินทาง LINE OA (เปิดหน้าเพิ่มเพื่อน/แชท) + โทรหาแอดมิน — ใช้ในหน้าล็อกอินและหน้าข้อผิดพลาด
+function LineHelpLinks({ lang = "th" }) {
+  const th = lang === "th";
+  return (
+    <div data-testid="line-help" style={{display:"flex",flexDirection:"column",gap:8,width:"100%",maxWidth:300}}>
+      <a href={LINE_OA_URL} target="_blank" rel="noreferrer" data-testid="help-line-oa" style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,padding:"12px 14px",borderRadius:12,background:"#06C755",color:"#fff",fontWeight:800,fontSize:14.5,textDecoration:"none"}}>
+        <span style={{background:"#fff",color:"#06C755",fontWeight:900,fontSize:10.5,padding:"2px 6px",borderRadius:5}}>LINE</span>
+        {th ? "ทักแอดมินทาง LINE OA ให้ช่วย" : "Chat with our admin on LINE OA"}
+      </a>
+      <a href={adminTel()} data-testid="help-phone" style={{display:"block",textAlign:"center",padding:"10px 12px",borderRadius:12,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--br)",fontWeight:700,fontSize:13.5,textDecoration:"none"}}>
+        📞 {th ? `หรือโทรหาแอดมิน ${ADMIN_CONTACT_PHONE}` : `Or call the admin ${ADMIN_CONTACT_PHONE}`}
+      </a>
+    </div>
+  );
+}
+
+// หน้าแสดงเมื่อล็อกอิน LINE ไม่สำเร็จ: บอกสาเหตุ + ลองใหม่ได้ทันที + ทักแอดมินทาง LINE OA / โทร (ไม่มีการให้กรอกชื่อ-เบอร์เอง — ระบบไม่เปิดให้ทำ)
+function LineLoginError({ lang = "th", code, onRetry, onHome }) {
+  const th = lang === "th";
+  const msg = LINE_ERR_TEXT[code] || LINE_ERR_TEXT.server;
+  return (
+    <>
+      <p style={{fontSize:16,color:"#c0392b",fontWeight:800}}>{th ? "เข้าสู่ระบบด้วย LINE ไม่สำเร็จ" : "LINE sign-in failed"}</p>
+      <p data-testid="line-err-cause" style={{fontSize:13.5,color:"var(--tx)",lineHeight:1.7,maxWidth:310}}>{th ? msg[0] : msg[1]}</p>
+      <button className="btn-primary" data-testid="line-retry" style={{maxWidth:300}} onClick={onRetry}>{th ? "🔄 ลองเข้าสู่ระบบ LINE อีกครั้ง" : "🔄 Try LINE sign-in again"}</button>
+      <p style={{fontSize:12.5,fontWeight:700,color:"var(--br)",marginTop:4}}>{th ? "ยังเข้าไม่ได้? ให้แอดมินช่วยได้เลย" : "Still can't sign in? Our admin can help."}</p>
+      <LineHelpLinks lang={lang} />
+      {isInAppBrowser() && <p data-testid="line-inapp-hint" style={{fontSize:12,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:10,padding:"8px 12px",maxWidth:310,lineHeight:1.6}}>💡 {th ? "ถ้าเปิดลิงก์มาจาก Facebook / Instagram แล้วเข้าไม่ได้ ลองกด ⋯ แล้วเลือก “เปิดในเบราว์เซอร์” (Safari / Chrome)" : "If you opened this from Facebook / Instagram and can't sign in, tap ⋯ and choose “Open in browser” (Safari / Chrome)."}</p>}
+      <button onClick={onHome} data-testid="line-home" style={{background:"none",border:"none",color:"var(--mu)",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{th ? "กลับหน้าแรก" : "Back to Home"}</button>
+      <p data-testid="line-err-code" style={{fontSize:10.5,color:"#b0a59a"}}>{th ? "รหัสข้อผิดพลาด" : "Error code"}: {code || "unknown"}</p>
+    </>
+  );
+}
+
 // หน้า/การ์ดบอกให้ล็อกอินด้วย LINE — fullscreen (โหมด gate) หรือแทรกในหน้า (compact)
 function LineLoginGate({ lang="th", setLang, onLogin, compact=false }) {
   const body = (
@@ -539,9 +621,10 @@ function LineLoginGate({ lang="th", setLang, onLogin, compact=false }) {
           {lang==="th" ? "ระหว่างล็อกอิน LINE จะชวนให้เพิ่มเพื่อน LINE OA ของร้าน — ต้องเพิ่มเพื่อนด้วยจึงจะจองได้" : "During sign-in, LINE will ask you to add our LINE OA — adding it is required to book."}
         </p>
       )}
-      <a href={adminTel()} style={{display:"block",marginTop:14,fontSize:12.5,fontWeight:700,color:"var(--br)",textDecoration:"underline"}}>
-        {lang==="th" ? `ไม่มี LINE? โทรจองกับแอดมิน ${ADMIN_CONTACT_PHONE}` : `No LINE? Call the admin to book: ${ADMIN_CONTACT_PHONE}`}
-      </a>
+      <div style={{marginTop:16,display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
+        <p style={{fontSize:12.5,fontWeight:700,color:"var(--br)"}}>{lang==="th" ? "ไม่มี LINE หรือเข้าสู่ระบบไม่ได้? ให้แอดมินช่วยจองได้" : "No LINE, or can't sign in? Our admin can book for you."}</p>
+        <LineHelpLinks lang={lang} />
+      </div>
       <p style={{fontSize:11,color:"var(--mu)",marginTop:14,lineHeight:1.6}}>
         {lang==="th"
           ? "ระบบเก็บเฉพาะชื่อและรหัสผู้ใช้ LINE ของคุณ ไม่เห็นรหัสผ่านหรือข้อความแชทใดๆ"
@@ -2700,6 +2783,9 @@ export default function AppV2() {
   const [lineSession, setLineSession] = useState(() => loadLineSession());
   const [lineCbStatus, setLineCbStatus] = useState(() => (isLineCallbackPath() ? "processing" : null));
   const lineCbStarted = useRef(false);
+  const [lineCbError, setLineCbError] = useState(null);   // { code } เมื่อล็อกอินล้มเหลว (ใช้แสดงสาเหตุ + รหัสให้แอดมินดู)
+  const [lineCbSlow, setLineCbSlow] = useState(false);      // true เมื่อรอนานกว่า 7 วินาที → บอกให้รอ ห้ามรีเฟรช
+  const lineCbReturn = useRef("home");                       // หน้าที่ลูกค้ากดมา (ใช้ตอนกด 'ลองใหม่')
 
   const clearResumeParam = () => {
     try {
@@ -2785,6 +2871,7 @@ export default function AppV2() {
   }, [page, tab]);
 
   // จัดการตอน LINE ส่งลูกค้ากลับมาที่ /line-callback — แลก code ที่เซิร์ฟเวอร์ แล้วพากลับไปหน้าเดิม
+  // ล้มเหลวทุกแบบมี "รหัส" บอกสาเหตุ (แสดงในหน้า + รายงานเป็น log ที่เซิร์ฟเวอร์) และลองซ้ำเองเมื่อเป็นปัญหาการเชื่อมต่อ
   useEffect(() => {
     if (lineCbStatus !== "processing" || lineCbStarted.current) return;
     lineCbStarted.current = true;
@@ -2792,13 +2879,18 @@ export default function AppV2() {
     const code = params.get("code");
     const state = params.get("state") || "";
     const [returnTarget, nonce] = state.split(".");
-    let storedNonce = null;
-    try { storedNonce = localStorage.getItem("nova_line_nonce"); } catch { /* no-op */ }
-    if (params.get("error") || !code) { setLineCbStatus("error"); return; }
-    // ถ้าเบราว์เซอร์นี้เป็นตัวที่เริ่มล็อกอินและค่าไม่ตรง = ปฏิเสธ (กันถูกหลอกให้ล็อกอินด้วยลิงก์ของคนอื่น)
-    if (storedNonce && nonce && storedNonce !== nonce) { setLineCbStatus("error"); return; }
+    lineCbReturn.current = ["home", "book", "package", "coach", "cancel"].includes(returnTarget) ? returnTarget : "home";
+    const fail = (c, extra = {}) => { setLineCbError({ code: c }); setLineCbStatus("error"); reportLineFail(c, extra); };
+    if (params.get("error")) { fail(params.get("error") === "access_denied" ? "cancelled" : "line_denied"); return; }
+    if (!code) { fail("no_code"); return; }
+    // ตรวจ nonce กันถูกหลอกให้ล็อกอินด้วยลิงก์ของคนอื่น: เบราว์เซอร์ที่เริ่มล็อกอินจำ nonce ได้หลายตัว (กดซ้อนก็ไม่ถูกปฏิเสธ) / ถ้าเป็นเบราว์เซอร์คนละตัว (ไม่มี nonce เก็บไว้) ผ่านตามเดิม
+    let known = [];
+    try { known = [...JSON.parse(localStorage.getItem("nova_line_nonces") || "[]"), localStorage.getItem("nova_line_nonce")].filter(Boolean); } catch { /* no-op */ }
+    if (known.length && nonce && !known.includes(nonce)) { fail("state"); return; }
+    const slowTimer = setTimeout(() => setLineCbSlow(true), 7000);
     db.lineLogin(code).then(result => {
-      if (!result || result.error || !result.session) { setLineCbStatus("error"); return; }
+      clearTimeout(slowTimer);
+      if (!result || result.error || !result.session) { fail(normalizeLineErr(result), { line_error: result?.line_error }); return; }
       const p = result.profile || {};
       const sess = {
         token: result.session, displayName: p.displayName || "", pictureUrl: p.pictureUrl || "",
@@ -2807,7 +2899,7 @@ export default function AppV2() {
       };
       saveLineSession(sess); setLineSession(sess);
       trackFb("CompleteRegistration", { status: true });
-      try { localStorage.removeItem("nova_line_nonce"); } catch { /* no-op */ }
+      try { localStorage.removeItem("nova_line_nonce"); localStorage.removeItem("nova_line_nonces"); } catch { /* no-op */ }
       window.history.replaceState(null, "", "/");
       let restored = false;
       try {
@@ -2825,7 +2917,7 @@ export default function AppV2() {
         setTab(["home", "book", "package", "coach", "cancel"].includes(returnTarget) ? returnTarget : "home");
       }
       setLineCbStatus(null);
-    }).catch(() => setLineCbStatus("error"));
+    }).catch(() => { clearTimeout(slowTimer); fail("unexpected"); });
   }, [lineCbStatus]);
 
   // ตอนเปิดเว็บ เช็คว่า session LINE เดิมยังใช้ได้ไหม (และดึงชื่อ/เบอร์ที่ผูกไว้ล่าสุดมาอัปเดต)
@@ -2989,18 +3081,12 @@ export default function AppV2() {
       <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16,padding:24,textAlign:"center"}}>
         <NovaLogo width={120} />
         {lineCbStatus === "processing" ? (
-          <p style={{fontSize:15,color:"var(--br)",fontWeight:600}}>{lang==="th" ? "กำลังเข้าสู่ระบบด้วย LINE..." : "Signing in with LINE..."}</p>
-        ) : (
           <>
-            <p style={{fontSize:15,color:"#c0392b",fontWeight:700}}>{lang==="th" ? "เข้าสู่ระบบด้วย LINE ไม่สำเร็จ" : "LINE sign-in failed"}</p>
-            <p style={{fontSize:13,color:"var(--mu)"}}>{lang==="th" ? "กรุณาลองใหม่อีกครั้ง หรือกรอกชื่อ-เบอร์โทรเองได้ตามปกติ" : "Please try again, or enter your name and phone manually."}</p>
-            <button className="btn-primary" style={{maxWidth:260}} onClick={() => { window.history.replaceState(null, "", "/"); setLineCbStatus(null); setTab("home"); }}>
-              {lang==="th" ? (LINE_GATE_MODE==="gate" || LINE_GATE_MODE==="booking" ? "ลองใหม่อีกครั้ง" : "กลับหน้าแรก") : (LINE_GATE_MODE==="gate" || LINE_GATE_MODE==="booking" ? "Try again" : "Back to Home")}
-            </button>
-            <a href={adminTel()} style={{fontSize:13,fontWeight:700,color:"var(--br)",textDecoration:"underline"}}>
-              {lang==="th" ? `ไม่มี LINE หรือเข้าไม่ได้ โทรจองกับแอดมิน ${ADMIN_CONTACT_PHONE}` : `No LINE or can't sign in? Call the admin: ${ADMIN_CONTACT_PHONE}`}
-            </a>
+            <p style={{fontSize:15,color:"var(--br)",fontWeight:600}}>{lang==="th" ? "กำลังเข้าสู่ระบบด้วย LINE..." : "Signing in with LINE..."}</p>
+            {lineCbSlow && <p data-testid="line-slow" style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7,maxWidth:300}}>{lang==="th" ? "ใช้เวลานานกว่าปกติเล็กน้อย กรุณารอสักครู่ — อย่ารีเฟรชหรือปิดหน้านี้" : "Taking a little longer than usual — please wait. Don't refresh or close this page."}</p>}
           </>
+        ) : (
+          <LineLoginError lang={lang} code={lineCbError?.code} onRetry={() => startLineLogin(lineCbReturn.current)} onHome={() => { window.history.replaceState(null, "", "/"); setLineCbStatus(null); setLineCbError(null); setTab("home"); }} />
         )}
       </div>
     </>
