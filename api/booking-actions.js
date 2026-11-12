@@ -1,1121 +1,5071 @@
-// /api/booking-actions.js
-// All public (non-admin) reads/writes to the bookings/customers/discount_codes
-// tables go through this single endpoint, using the Supabase Service Role Key
-// server-side. The browser's anon key no longer has any direct table access
-// at all — this closes the hole where anyone could previously query the
-// entire bookings table (every customer's name/phone/price) in one request,
-// and prevents a customer from tampering with price or setting their own
-// booking status straight to "confirmed".
+import { useState, useEffect, useRef, Fragment } from "react";
 
-import crypto from "crypto";
+// ─── Supabase (เก็บไว้ใช้แค่สำหรับอัปโหลดสลิปขึ้น Storage เท่านั้น) ────────────
+// ตาราง bookings / customers / discount_codes ทั้งหมดเข้าถึงผ่าน /api/booking-actions
+// และ /api/admin-actions เท่านั้น ไม่มีการเรียก Supabase ตรงจากเบราว์เซอร์อีกต่อไป
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-// ─── LINE Login (ช่วยกรอกชื่อ/เบอร์อัตโนมัติ) ───────────────────────────────────────
-// Channel ID/secret อ่านจาก Environment Variables ของ Vercel เท่านั้น (ห้ามฝังในโค้ด)
-const LINE_LOGIN_CHANNEL_ID = process.env.LINE_LOGIN_CHANNEL_ID;
-const LINE_LOGIN_CHANNEL_SECRET = process.env.LINE_LOGIN_CHANNEL_SECRET;
-const LINE_REDIRECT_URI = "https://nova-tennis.vercel.app/line-callback"; // ต้องตรงกับ Callback URL ที่ตั้งใน LINE Developers เป๊ะ
-const LINE_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // session อยู่ได้ 30 วัน
-
-// session token = userId.expiry.signature (HMAC) — ไม่ต้องเก็บ session ฝั่งเซิร์ฟเวอร์
-function signLineSession(userId) {
-  const payload = `${userId}.${Date.now() + LINE_SESSION_TTL_MS}`;
-  const sig = crypto.createHmac("sha256", LINE_LOGIN_CHANNEL_SECRET).update(payload).digest("hex");
-  return `${payload}.${sig}`;
-}
-function verifyLineSession(token) {
-  if (!token || typeof token !== "string" || !LINE_LOGIN_CHANNEL_SECRET) return null;
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [userId, expiryStr, sig] = parts;
-  const expiry = Number(expiryStr);
-  if (!userId || !expiry || Date.now() > expiry) return null;
-  const expected = crypto.createHmac("sha256", LINE_LOGIN_CHANNEL_SECRET).update(`${userId}.${expiryStr}`).digest("hex");
-  try {
-    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected)) ? userId : null;
-  } catch { return null; }
-}
-
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
-const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_TELEGRAM_CHAT_IDS = process.env.ADMIN_TELEGRAM_CHAT_IDS; // comma-separated
-
-async function notifyTelegram(text) {
-  if (!TELEGRAM_BOT_TOKEN || !ADMIN_TELEGRAM_CHAT_IDS) return;
-  const chatIds = ADMIN_TELEGRAM_CHAT_IDS.split(",").map(s => s.trim()).filter(Boolean);
-  await Promise.all(chatIds.map(chatId =>
-    fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
-    }).catch(() => {})
-  ));
-}
-const minutesToLabel = (mins) => `${String(Math.floor(mins/60)).padStart(2,"0")}:${String(mins%60).padStart(2,"0")}`;
-
-async function sb(path, options = {}) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: SERVICE_KEY,
-      Authorization: `Bearer ${SERVICE_KEY}`,
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
+async function callBookingAction(action, payload) {
+  const res = await fetch("/api/booking-actions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, session: loadLineSession()?.token, ...payload }),
   });
-  const ct = res.headers.get("content-type") || "";
-  const body = ct.includes("application/json") ? await res.json() : null;
-  return { ok: res.ok, status: res.status, body };
+  return res.json();
 }
 
-// ─── ราคา (ต้องตรงกับฝั่ง frontend เป๊ะ — เซิร์ฟเวอร์เป็นคนตัดสินราคาสุดท้ายเสมอ) ──
+const db = {
+  // ดึงเวลาที่ถูกจองแล้ว ผ่านเซิร์ฟเวอร์ (ไม่เปิดตารางให้เบราว์เซอร์อ่านตรง)
+  async getBookings(date, courtId) {
+    const { bookings } = await callBookingAction("checkAvailability", { date, courtId });
+    return bookings || [];
+  },
+  async getBookingById(id) {
+    const { booking, group } = await callBookingAction("getBooking", { id });
+    if (!booking) return null;
+    return group && group.length > 1 ? { ...booking, _group: group } : booking;
+  },
+  // สร้างการจอง — เซิร์ฟเวอร์เป็นคนคำนวณราคาสุดท้ายเองทั้งหมด (กันการแก้ไขราคาจากฝั่ง client)
+  async createBooking({ courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId }) {
+    const { booking, error } = await callBookingAction("createBooking", {
+      courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId,
+    });
+    if (error) return { error };
+    return { booking };
+  },
+  async createBookingMulti({ courtIds, customerId, customerName, bookingDate, hour, startMinute, durationMinutes }) {
+    const { bookings, error } = await callBookingAction("createBookingMulti", {
+      courtIds, customerId, customerName, bookingDate, hour, startMinute, durationMinutes,
+    });
+    if (error || !bookings?.length) return { error: error || "insert_failed" };
+    return { booking: bookings[0], bookings }; // booking = แถวแรก (ใช้ id นี้ส่งสลิป เซิร์ฟเวอร์จะครอบคลุมทั้งกลุ่มให้เอง)
+  },
+  async createBookingWithPackage({ courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, packageId }) {
+    const { booking, error, available, needed, expiry_date, start_date } = await callBookingAction("createBooking", {
+      courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, packageId,
+    });
+    if (error) return { error, available, needed, expiry_date, start_date };
+    return { booking };
+  },
+  async createPackage({ tier, credits, promo, customerId, customerName }) {
+    const { package: pkg, error } = await callBookingAction("createPackage", { tier, credits, ...(promo ? { promo } : {}), customerId, customerName });
+    if (error) return { error };
+    return { package: pkg };
+  },
+  // ─── เรียนกับโค้ช (สนาม+โค้ช) ───
+  async coachCatalog() { const r = await callBookingAction("coachCatalog", {}); return Array.isArray(r?.items) ? r.items : null; },
+  async createCoachOrder({ audience, type, sessions, learnerNote }) {
+    const r = await callBookingAction("createCoachOrder", { audience, type, sessions, learnerNote });
+    if (r?.error || !r?.order) return { error: r?.error || "failed" };
+    return { order: r.order, linePushed: !!r.linePushed };
+  },
+  async updateCoachSlip(orderId, slipUrl) { const r = await callBookingAction("updateCoachSlip", { orderId, slipUrl }); return r?.order || null; },
+  async cancelCoachOrder(orderId) { const r = await callBookingAction("cancelCoachOrder", { orderId }); return !!r?.ok; },
+  async myCoachOrders() { const r = await callBookingAction("myCoachOrders", {}); return Array.isArray(r?.orders) ? r.orders : []; },
+  async updatePackageSlip(id, slipUrl) {
+    const result = await callBookingAction("updatePackageSlip", { packageId: id, slipUrl });
+    return result?.package || null;
+  },
+  async cancelPendingPackage(id) {
+    await callBookingAction("cancelPendingPackage", { packageId: id });
+  },
+  async myPackages(phone) {
+    const { packages } = await callBookingAction("myPackages", { phone });
+    return packages || [];
+  },
+  async lineLogin(code) { return callBookingAction("lineLogin", { code }); },
+  async lineMe(session) { return callBookingAction("lineMe", { session }); },
+  async lineLinkPhone(session, name, phone) { return callBookingAction("lineLinkPhone", { session, name, phone }); },
+  async recordSource(kind, id, utm) { await callBookingAction("recordSource", { kind, id, utm }); },
+  async checkFirstTime(phone, bookingDate) {
+    const result = await callBookingAction("checkFirstTime", { phone, bookingDate });
+    return result?.eligible ? result.price : null; // null = ไม่เข้าเงื่อนไข
+  },
+  async updateSlip(id, slipUrl) {
+    const result = await callBookingAction("updateSlip", { bookingId: id, slipUrl });
+    if (result?.error === "slot_taken_late") return { _error: "slot_taken_late" }; // หมดเวลาชำระ และช่วงเวลานี้ถูกคนอื่นจองไปแล้ว
+    return result?.booking || null; // null = อัปเดตไม่สำเร็จ (ไม่เจอแถวที่ตรงเงื่อนไข)
+  },
+  async cancelPending(id) {
+    await callBookingAction("cancelPending", { bookingId: id });
+  },
+  async checkDiscount(code) {
+    const result = await callBookingAction("checkDiscount", { code });
+    if (!result.valid) return { error: result.reason || "invalid", expires_at: result.expires_at };
+    return result; // { id, code, discount_amount, discount_percent, expires_at }
+  },
+  async myBookings(phone) {
+    const { bookings } = await callBookingAction("myBookings", { phone });
+    return bookings || [];
+  },
+  // อัปโหลดไฟล์สลิปขึ้น Supabase Storage โดยตรง (คนละระบบสิทธิ์กับตารางข้อมูล ไม่กระทบความปลอดภัยของข้อมูลลูกค้า)
+  // คืนค่า: ลิงก์ (สำเร็จ) / { error: "bad_type" | "too_big" } (ไฟล์ไม่ผ่านเงื่อนไข) / null (อัปโหลดไม่สำเร็จ)
+  async uploadSlip(file, bookingId) {
+    const EXT_BY_TYPE = { "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/webp": "webp", "image/heic": "heic", "image/heif": "heif", "image/gif": "gif" };
+    const mime = String(file?.type || "").toLowerCase();
+    // เครื่องบางรุ่นไม่ส่งชนิดไฟล์มา (ค่าว่าง) → ดูนามสกุลชื่อไฟล์แทน แต่ยอมรับเฉพาะนามสกุลรูปภาพ
+    const nameExt = String(file?.name || "").split(".").pop().toLowerCase().replace("jpeg", "jpg");
+    const ext = EXT_BY_TYPE[mime] || (mime === "" && ["jpg", "png", "webp", "heic", "heif", "gif"].includes(nameExt) ? nameExt : undefined);
+    if (!ext) return { error: "bad_type" };
+    const contentType = mime || `image/${ext === "jpg" ? "jpeg" : ext}`;
+    if (file.size > 8 * 1024 * 1024) return { error: "too_big" };
+    const path = `slips/${bookingId}_${Date.now()}.${ext}`;
+    try {
+      const res = await fetch(`${SUPABASE_URL}/storage/v1/object/slips/${path}`, {
+        method: "POST",
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": contentType },
+        body: file,
+      });
+      if (!res.ok) return null;
+    } catch { return null; }
+    return `${SUPABASE_URL}/storage/v1/object/public/slips/${path}`;
+  },
+};
+
+const uploadFailMsg = (up, lang) => (up?.error === "bad_type" ? (lang==="th" ? "กรุณาแนบรูปภาพสลิป (JPG, PNG, WEBP, HEIC)" : "Please attach an image of your slip (JPG, PNG, WEBP, HEIC).")
+  : up?.error === "too_big" ? (lang==="th" ? "ไฟล์ใหญ่เกิน 8 MB กรุณาเลือกรูปที่เล็กกว่านี้" : "The file is larger than 8 MB. Please choose a smaller image.")
+  : (lang==="th" ? "อัปโหลดสลิปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Slip upload failed. Please try again."));
+
+// ─── Admin API helper ───────────────────────────────────────────────────────────
+async function callAdminAction(action, token, payload) {
+  const res = await fetch("/api/admin-actions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, token, ...payload }),
+  });
+  // token หมดอายุ/ไม่ถูกต้อง — ล้างค่าที่ค้างอยู่แล้วบังคับกลับไปหน้าใส่รหัสผ่านใหม่ทันที
+  // กันปัญหาหน้า Admin ค้างโชว์อยู่แบบไม่มีข้อมูล เพราะเข้าใจผิดว่ายัง login อยู่ทั้งที่ session หมดอายุแล้ว
+  if (res.status === 401) {
+    try { sessionStorage.removeItem("nova_admin_token"); } catch { /* no-op */ }
+    window.location.reload();
+    return new Promise(() => {}); // ค้างไว้เฉยๆ ระหว่างรอ reload ไม่ต้องส่งค่าอะไรกลับไปต่อ
+  }
+  return res.json();
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const COURTS = [
+  { courtId: 1, courtName: "Court 1", photo: "/court-1.png", descTh: "สนามในร่ม • ปรับอากาศ", descEn: "Indoor • Air-conditioned" },
+  { courtId: 2, courtName: "Court 2", photo: "/court-2.png", descTh: "สนามในร่ม • ปรับอากาศ", descEn: "Indoor • Air-conditioned" },
+];
+
+// ─── ระยะเวลาการจอง ─────────────────────────────────────────────────────────────
+const DURATION_OPTIONS = [30, 60, 90, 120]; // นาที
+const DAY_START_MIN = 6 * 60;   // 06:00
+const DAY_END_MIN = 23 * 60;    // 23:00 (เล่นได้ถึง 23:00 พอดี)
+const START_STEP = 30;          // เลือกเวลาเริ่มได้ทุกครึ่งชั่วโมง
+
+const minutesToLabel = (mins) => `${String(Math.floor(mins/60)).padStart(2,"0")}:${String(mins%60).padStart(2,"0")}`;
+// Supabase/Postgres มักส่ง timestamp กลับมาแบบไม่มี "Z"/offset ต่อท้าย (เช่น "2026-09-24T10:15:23.456")
+// ซึ่ง JS จะตีความว่าเป็นเวลาท้องถิ่นของเบราว์เซอร์แทนที่จะเป็น UTC ทำให้เวลานับถอยหลังคลาดเคลื่อนได้มาก
+// (ประเทศไทย +7 ชม. ทำให้ดูเหมือนเวลาผ่านไปเยอะกว่าความจริง จนขึ้นว่า "หมดเวลา" ทันที) ฟังก์ชันนี้บังคับตีความเป็น UTC เสมอ
+const parseUtc = (str) => {
+  if (!str) return new Date(NaN);
+  const hasTz = /Z$|[+-]\d{2}:?\d{2}$/.test(str);
+  return new Date(hasTz ? str : `${str}Z`);
+};
+
+function getCandidateStarts(durationMinutes) {
+  const starts = [];
+  for (let m = DAY_START_MIN; m + durationMinutes <= DAY_END_MIN; m += START_STEP) starts.push(m);
+  return starts;
+}
+
+// ─── โครงสร้างราคา ─────────────────────────────────────────────────────────────
+// ราคาแยกตามระยะเวลาจริง ไม่ใช่การคูณ/หารเท่ากันทุกช่วง (30 นาทีตั้งราคาเองต่างหาก)
+// 90 นาที = ราคา 60 นาที + ราคา 30 นาที, 120 นาที = ราคา 60 นาที x 2
 const RATE_TABLE = {
   promo:  { offpeak: { 30: 300, 60: 450 }, peak: { 30: 325, 60: 490 } },
   normal: { offpeak: { 30: 350, 60: 490 }, peak: { 30: 375, 60: 590 } },
 };
-const PROMO_START = new Date(2026, 8, 1, 0, 0, 0);
-const PROMO_END = new Date(2026, 8, 30, 23, 59, 59);
-
-// ─── ราคาแพ็คเกจสมาชิก (ตายตัว เซิร์ฟเวอร์เป็นคนตัดสินเสมอ ไม่เชื่อราคาจาก client) ──
-const PACKAGE_PRICES = {
-  offpeak: { 2: { price: 950, days: 7 }, 5: { price: 2350, days: 60 }, 10: { price: 4600, days: 90 } },
-  peak:    { 2: { price: 1150, days: 7 }, 5: { price: 2750, days: 60 }, 10: { price: 5000, days: 90 } },
-};
-
-// ─── โปรพิเศษ 11.11 (แพ็คเกจระยะสั้น) — เซิร์ฟเวอร์เป็นคนตัดสินราคา/จำนวนครั้ง/วันใช้งานเสมอ ไม่เชื่อค่าจาก client ───
-// ขายตั้งแต่ startsAt (10 พ.ย. 00:00) ถึง endsAt (13 พ.ย. สิ้นนาที 23:59) เวลาไทย / ไม่จำกัดจำนวนแพ็คเกจต่อคน / ไม่มีกำหนดเริ่มใช้ — อายุแพ็คเกจเริ่มนับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ (กติกาเดียวกับแพ็คเกจปกติ)
-// "ALL" = ใช้ได้ทุกเวลา (tier peak) / "DAY" = จันทร์–ศุกร์ ก่อน 16:00 (tier offpeak) — ต้องตรงกับ PROMO_1111 ใน admin-actions.js และ nova-tennis.jsx (มีเทสต์เทียบไฟล์ไว้)
-const PROMO_1111 = {
-  startsAt: "2026-11-10T00:00:00+07:00",
-  endsAt: "2026-11-13T23:59:59.999+07:00",
-  items: {
-    "ALL-3":  { name: "Starter",           tier: "peak",    credits: 3,  price: 1590, days: 30 },
-    "ALL-6":  { name: "Plus",              tier: "peak",    credits: 6,  price: 2990, days: 60 },
-    "ALL-11": { name: "11.11 Special",     tier: "peak",    credits: 11, price: 4999, days: 111 },
-    "DAY-3":  { name: "Day Starter",       tier: "offpeak", credits: 3,  price: 1290, days: 30 },
-    "DAY-6":  { name: "Day Plus",          tier: "offpeak", credits: 6,  price: 2490, days: 60 },
-    "DAY-11": { name: "Day 11.11 Special", tier: "offpeak", credits: 11, price: 4399, days: 111 },
-  },
-};
-const PROMO_TAG = "1111:";
-const promoOpen = () => Date.now() >= Date.parse(PROMO_1111.startsAt) && Date.now() <= Date.parse(PROMO_1111.endsAt);
-const promoNotStarted = () => Date.now() < Date.parse(PROMO_1111.startsAt);
+const PROMO_START = new Date(2026, 8, 1, 0, 0, 0);   // 1 ก.ย. 2569
+const PROMO_END = new Date(2026, 8, 30, 23, 59, 59); // 30 ก.ย. 2569
 
 function getDurationPrice(startHour, dateObj, durationMinutes) {
-  const inPromo = dateObj >= PROMO_START && dateObj <= PROMO_END;
-  const day = dateObj.getDay();
+  const d = dateObj || new Date();
+  const inPromo = d >= PROMO_START && d <= PROMO_END;
+  const day = d.getDay(); // 0 = อาทิตย์, 6 = เสาร์
   const isWeekend = day === 0 || day === 6;
+  // ระดับราคา (off-peak/peak) ตัดสินจาก "เวลาเริ่ม" ของการจอง — Peak = เสาร์-อาทิตย์ทั้งวัน หรือ จ.-ศ. ตั้งแต่ 16:00
   const isPeak = isWeekend || startHour >= 16;
   const tier = inPromo ? RATE_TABLE.promo : RATE_TABLE.normal;
   const rate = isPeak ? tier.peak : tier.offpeak;
   const numHours = Math.floor(durationMinutes / 60);
-  const rem = durationMinutes % 60;
-  return numHours * rate[60] + (rem === 30 ? rate[30] : 0);
+  const remainder = durationMinutes % 60; // 0 หรือ 30 เท่านั้นตามตัวเลือกที่มี
+  const price = numHours * rate[60] + (remainder === 30 ? rate[30] : 0);
+  return { price, peak: isPeak };
+}
+// สำหรับจุดที่ต้องการราคาอ้างอิงต่อชั่วโมง (เช่น สรุปราคาหน้าแรก)
+function getSlotPrice(hour, dateObj) { return getDurationPrice(hour, dateObj, 60); }
+
+// โปรโมชั่นจองครั้งแรก (แสดงผลเท่านั้น — เซิร์ฟเวอร์เป็นคนตัดสินราคาจริง ต้องแก้ให้ตรงกับ FIRST_TIME_PROMO ใน booking-actions.js ถ้าเปลี่ยน)
+// ถาวร ไม่มีวันสิ้นสุด — ใช้ได้กับการจอง 60 นาที 1 สนาม ครั้งแรกของลูกค้าใหม่
+const FIRST_TIME_PROMO = { weekday: 450, weekend: 490 }; // ถาวร: ไม่มีวันสิ้นสุด
+
+// โปรพิเศษ 11.11 (แพ็คเกจระยะสั้น) — แสดงผลเท่านั้น เซิร์ฟเวอร์ตัดสินราคา/จำนวนครั้ง/กติกาจริง (ต้องตรงกับ PROMO_1111 ใน booking-actions.js และ admin-actions.js)
+// "all" = ใช้ได้ทุกเวลา (เทียบ Peak ฿590/ชม.) / "day" = จ.–ศ. ก่อน 16:00 (เทียบ Off Peak ฿490/ชม.) — ขายตั้งแต่ startsAtMs (10 พ.ย. 00:00) ถึง endsAtMs (17 พ.ย. 23:59), ไม่จำกัดจำนวนต่อคน, ไม่มีกำหนดเริ่มใช้ (อายุเริ่มนับจากวันเล่นครั้งแรก)
+const PROMO_1111 = {
+  startsAtMs: Date.parse("2026-11-10T00:00:00+07:00"), endsAtMs: Date.parse("2026-11-17T23:59:59.999+07:00"), endTh: "17 พ.ย. 69 เวลา 23:59", endEn: "17 Nov 2026, 23:59",
+  items: [
+    { code: "ALL-3",  group: "all", name: "Starter",           tier: "peak",    credits: 3,  price: 1590, days: 30 },
+    { code: "ALL-6",  group: "all", name: "Plus",              tier: "peak",    credits: 6,  price: 2990, days: 60 },
+    { code: "ALL-11", group: "all", name: "11.11 Special",     tier: "peak",    credits: 11, price: 4999, days: 111 },
+    { code: "DAY-3",  group: "day", name: "Day Starter",       tier: "offpeak", credits: 3,  price: 1290, days: 30 },
+    { code: "DAY-6",  group: "day", name: "Day Plus",          tier: "offpeak", credits: 6,  price: 2490, days: 60 },
+    { code: "DAY-11", group: "day", name: "Day 11.11 Special", tier: "offpeak", credits: 11, price: 4399, days: 111 },
+  ],
+};
+const promoOf = (code) => PROMO_1111.items.find(i => code === "1111:" + i.code) || null;
+const promoNormal = (it) => it.credits * (it.tier === "peak" ? 590 : 490);      // ราคาปกติถ้าจ่ายรายชั่วโมง
+const promoAvg = (it) => Math.round(it.price / it.credits);
+const promoLabel = (it, th = true) => `🔥 11.11 ${it.name} • ${it.credits} ${th ? "ครั้ง" : "sessions"} (${it.tier === "peak" ? (th ? "ทุกเวลา" : "all times") : (th ? "จ.–ศ. ก่อน 16:00" : "Mon–Fri before 16:00")})`;
+function usePromo1111() { // โปรเปิดเฉพาะช่วงเริ่มขาย–ปิดขาย (เวลาไทย) แล้วเปิด/ปิดเอง — ตรวจเวลาทุก 30 วินาทีเท่านั้น (ไม่วาดหน้าใหม่ทุกวินาที) หยุดตรวจเมื่อจบโปรแล้ว
+  const [now, setNow] = useState(() => Date.now());
+  const finished = now > PROMO_1111.endsAtMs;
+  useEffect(() => { if (finished) return; const id = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(id); }, [finished]);
+  return { active: now >= PROMO_1111.startsAtMs && now <= PROMO_1111.endsAtMs, msLeft: Math.max(0, PROMO_1111.endsAtMs - now) };
 }
 
-// โปรโมชั่นจองครั้งแรก (ต่อชั่วโมง) — จันทร์-ศุกร์ ฿450 / เสาร์-อาทิตย์ ฿490 ไม่ว่าช่วง Off Peak/Peak
-// นับตาม "วันที่เล่น" (booking_date) ใช้ได้ถึงวันที่เล่น 31 ต.ค. 2569 (รวมวันนั้น) — ต้องแก้ให้ตรงกับ FIRST_TIME_PROMO ใน nova-tennis.jsx ด้วยถ้าเปลี่ยน
-// การจอง/ซื้อแพ็คเกจต้องมาจากบัญชี LINE ที่ผูกเบอร์แล้วเท่านั้น — เซิร์ฟเวอร์ใช้ "เบอร์ที่ผูกไว้" เสมอ ไม่เชื่อเบอร์ที่ส่งมาจากหน้าเว็บ
-// ผลคือลูกค้าเปลี่ยนเบอร์เองไม่ได้ (ล็อกจริงที่เซิร์ฟเวอร์ ไม่ใช่แค่ซ่อนช่องในหน้าจอ)
-// ชื่อที่ใช้ในการจอง = ชื่อ LINE (ตัดไม่เกิน 16 ตัวอักษรตามกติกาเดิม โดยไม่ตัดกลาง emoji)
-const NAME_MAX = 20; // ข้อกำหนดชื่อ LINE: ไม่เกิน 20 ตัวอักษร
-// นับเป็น "ตัวอักษรที่ตามองเห็น" (ไม่ใช่จำนวนรหัสตัวอักษร) — ชื่อไทยที่มีสระ/วรรณยุกต์ หรือ emoji จึงไม่ถูกตัดผิดตำแหน่ง/ผิดจำนวน
-const graphemes = (s) => {
+// ราคาแพ็คเกจสำหรับแสดงผลเท่านั้น — เซิร์ฟเวอร์เป็นคนตัดสินราคาจริงเสมอ (ต้องแก้ให้ตรงกับ PACKAGE_PRICES ใน booking-actions.js ถ้าเปลี่ยนราคา)
+const PACKAGE_TIERS = {
+  offpeak: [ { credits: 2, price: 950, fullPrice: 980, days: 7 }, { credits: 5, price: 2350, fullPrice: 2450, days: 60 }, { credits: 10, price: 4600, fullPrice: 4900, days: 90 } ],
+  peak:    [ { credits: 2, price: 1150, fullPrice: 1180, days: 7 }, { credits: 5, price: 2750, fullPrice: 2950, days: 60 }, { credits: 10, price: 5000, fullPrice: 5900, days: 90 } ],
+};
+
+// วันแรกที่เปิดให้จองได้ (ก่อนหน้านี้จองไม่ได้ แม้ปฏิทินจะเปิดดูได้)
+const BOOKING_OPEN_DATE = new Date(2026, 8, 1, 0, 0, 0); // 1 ก.ย. 2569
+// ช่วงที่ Court 2 ยังไม่เปิดให้บริการ (1–4 ก.ย. 2569 เปิดเฉพาะ Court 1)
+const COURT2_OPEN_DATE = new Date(2026, 8, 5, 0, 0, 0); // Court 2 เริ่มเปิด 5 ก.ย. 2569
+const isCourt2Restricted = (d) => d && d < COURT2_OPEN_DATE;
+
+// ปิดสนามเฉพาะบางช่วงเวลาแบบกำหนดเอง (ไม่ได้มาจากยอดจองจริง เช่น ปิดซ่อมบำรุง)
+// court: "both" = ปิดทั้ง 2 สนาม, หรือใส่ 1/2 เพื่อปิดเฉพาะสนามนั้น
+// เพิ่ม/ลบรายการในลิสต์นี้ได้ตามต้องการ (บอกวันที่/เวลา/สนามมาได้เลย แล้วผมจะเพิ่มให้)
+const MANUAL_CLOSURES = [
+  { date: "2026-09-10", startMin: 10*60, endMin: 22*60, court: "both" }, // 10 ก.ย. 69, 10:00–22:00, ทั้ง 2 สนาม
+  { date: "2026-09-11", startMin: DAY_START_MIN, endMin: DAY_END_MIN, court: "2" }, // 11 ก.ย. 69, Court 2 ปิดทั้งวัน
+  { date: "2026-09-11", startMin: 11*60, endMin: DAY_END_MIN, court: "1" }, // 11 ก.ย. 69, Court 1 ปิดหลัง 11:00
+  { date: "2026-09-12", startMin: 6*60, endMin: 16*60, court: "both" }, // 12 ก.ย. 69, 06:00–16:00, ทั้ง 2 สนาม
+];
+const isManuallyClosed = (dateObj, courtId, startMin, endMin) => {
+  const iso = toIso(dateObj);
+  return MANUAL_CLOSURES.some(c =>
+    c.date === iso &&
+    (c.court === "both" || Number(c.court) === Number(courtId)) &&
+    startMin < c.endMin && endMin > c.startMin
+  );
+};
+
+// วันที่เต็มทั้ง 2 สนามแบบกำหนดเอง — คำนวณอัตโนมัติจาก MANUAL_CLOSURES (เช็คว่าทั้งวันของทั้ง 2 สนามถูกปิดหมดหรือยัง)
+// บวกกับลิสต์ FULLY_BOOKED_DATES เดิมไว้เผื่อใช้ระบุตรงๆ ก็ได้
+const FULLY_BOOKED_DATES = ["2026-09-03"];
+function isCourtFullyClosedForDate(dateObj, courtId) {
+  const iso = toIso(dateObj);
+  const intervals = MANUAL_CLOSURES
+    .filter(c => c.date === iso && (c.court === "both" || Number(c.court) === Number(courtId)))
+    .map(c => [c.startMin, c.endMin])
+    .sort((a, b) => a[0] - b[0]);
+  let cursor = DAY_START_MIN;
+  for (const [s, e] of intervals) {
+    if (s > cursor) return false; // มีช่วงที่ยังไม่ถูกปิด เหลือให้จองได้
+    cursor = Math.max(cursor, e);
+  }
+  return cursor >= DAY_END_MIN;
+}
+const isFullyBookedDate = (d) => {
+  if (!d) return false;
+  if (FULLY_BOOKED_DATES.includes(toIso(d))) return true;
+  return isCourtFullyClosedForDate(d, 1) && isCourtFullyClosedForDate(d, 2);
+};
+
+// ใช้วันที่ตามเวลาท้องถิ่น (ไม่ใช่ UTC) เพื่อไม่ให้วันที่คลาดเคลื่อนตอนใกล้เที่ยงคืน
+// ─── ติดตามโฆษณา: UTM (แหล่งที่มา) + Meta Pixel ───────────────────────────────────
+// ใส่ Pixel ID จาก Meta Events Manager ตรงนี้เพื่อเปิดใช้ (เว้นว่าง "" = ปิด ไม่โหลดสคริปต์ใดๆ ของ Meta)
+const META_PIXEL_ID = "";
+const UTM_KEY = "nova_utm";
+const UTM_KEYS = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"];
+
+// เก็บ UTM จาก URL ตอนลูกค้าเข้าเว็บจากโฆษณา (ล่าสุดทับของเก่า) เก็บไว้ 30 วัน
+function captureUtm() {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const found = {};
+    UTM_KEYS.forEach(k => { const v = q.get(k); if (v) found[k] = v.slice(0, 80); });
+    if (Object.keys(found).length) localStorage.setItem(UTM_KEY, JSON.stringify({ ...found, _ts: Date.now() }));
+  } catch { /* no-op */ }
+}
+function getStoredUtm() {
+  try {
+    const u = JSON.parse(localStorage.getItem(UTM_KEY) || "null");
+    if (!u || Date.now() - (u._ts || 0) > 30 * 24 * 60 * 60 * 1000) return null;
+    const { _ts, ...rest } = u; // eslint-disable-line no-unused-vars
+    return Object.keys(rest).length ? rest : null;
+  } catch { return null; }
+}
+function initMetaPixel() {
+  if (!META_PIXEL_ID || typeof window === "undefined" || window.fbq) return;
+  /* eslint-disable */
+  !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,document,'script','https://connect.facebook.net/en_US/fbevents.js');
+  /* eslint-enable */
+  window.fbq("init", META_PIXEL_ID);
+  window.fbq("track", "PageView");
+}
+const trackFb = (event, params) => { try { if (window.fbq) window.fbq("track", event, params || {}); } catch { /* no-op */ } };
+
+// ─── LINE Login (ช่วยกรอกชื่อ/เบอร์อัตโนมัติ) ───────────────────────────────────────
+// Channel ID เป็นข้อมูลสาธารณะ (โผล่ใน URL ตอนล็อกอินอยู่แล้ว) — ส่วน secret อยู่ฝั่งเซิร์ฟเวอร์เท่านั้น
+const LINE_LOGIN_CHANNEL_ID = "2011856443";
+const LINE_REDIRECT_URI = "https://nova-tennis.vercel.app/line-callback"; // ต้องตรงกับ Callback URL ใน LINE Developers
+const LINE_SESSION_KEY = "nova_line_session";
+// ชวนลูกค้าเพิ่มเพื่อน LINE OA ตอนล็อกอิน (ต้องผูก OA กับ LINE Login Channel ในหน้า LINE Developers ก่อน)
+// "aggressive" = ขึ้นหน้าชวนเพิ่มเพื่อนแยกต่างหากหลังกดยอมรับ / "normal" = เป็นตัวเลือกเล็กๆ ในหน้ายอมรับ / "" = ไม่ชวน
+const LINE_BOT_PROMPT = "aggressive";
+
+// โหมดบังคับล็อกอิน LINE — เปลี่ยนแค่ค่านี้ค่าเดียวเพื่อสลับพฤติกรรม:
+//   "gate"    = ต้องล็อกอินตั้งแต่เข้าเว็บ (ยังไม่ล็อกอิน = เห็นแต่หน้าล็อกอิน)
+//   "booking" = ดูหน้าแรก/ราคาได้อิสระ แต่ต้องล็อกอินตอนจะเข้าหน้าจองสนาม/แพ็คเกจ
+//   "off"     = ไม่บังคับ (มีปุ่มให้ล็อกอินเฉยๆ)
+const LINE_GATE_MODE = "booking";
+// เบอร์โทรแอดมิน — โชว์ให้ลูกค้าที่ไม่มี LINE / ล็อกอินไม่ได้ / ต้องการเปลี่ยนเบอร์ที่ผูกไว้ (แก้เบอร์ตรงนี้ถ้าเปลี่ยน)
+const ADMIN_CONTACT_PHONE = "063-146-5997";
+const adminTel = () => `tel:${ADMIN_CONTACT_PHONE.replace(/\D/g, "")}`;
+// ข้อความผิดพลาดที่เซิร์ฟเวอร์ส่งกลับ (เรื่องบัญชี LINE / เบอร์)
+const accountErrMsg = (code, lang = "th") => ({
+  line_required: lang==="th" ? "กรุณาเข้าสู่ระบบด้วย LINE ใหม่อีกครั้ง" : "Please sign in with LINE again.",
+  invalid_session: lang==="th" ? "เซสชัน LINE หมดอายุ กรุณาเข้าสู่ระบบใหม่" : "Your LINE session expired. Please sign in again.",
+  phone_not_linked: lang==="th" ? "ยังไม่ได้ผูกเบอร์โทรกับบัญชี LINE กรุณากรอกเบอร์ก่อน" : "No phone number is linked to your LINE account yet.",
+  phone_linked_elsewhere: lang==="th" ? `เบอร์นี้ถูกผูกกับบัญชี LINE อื่นแล้ว กรุณาติดต่อแอดมิน ${ADMIN_CONTACT_PHONE}` : `This number is linked to another LINE account. Please contact the admin: ${ADMIN_CONTACT_PHONE}`,
+  phone_locked: lang==="th" ? `บัญชีนี้ผูกเบอร์ไว้แล้ว เปลี่ยนเบอร์ไม่ได้ กรุณาติดต่อแอดมิน ${ADMIN_CONTACT_PHONE}` : `This account's phone number is locked. Contact the admin: ${ADMIN_CONTACT_PHONE}`,
+}[code] || null);
+// true = ในโหมด "booking" พอลูกค้ากด "จองสนาม"/"แพ็คเกจ" ตอนยังไม่ล็อกอิน ให้พาไปหน้า LINE Login ทันที (ข้ามหน้าแจ้งของเรา)
+// false = แสดงหน้าแจ้ง "เข้าสู่ระบบด้วย LINE" ของเราก่อน แล้วค่อยกดไปล็อกอิน
+const LINE_SKIP_INTRO = true;
+
+const loadLineSession = () => {
+  try { return JSON.parse(localStorage.getItem(LINE_SESSION_KEY) || "null"); } catch { return null; }
+};
+const saveLineSession = (s) => { try { localStorage.setItem(LINE_SESSION_KEY, JSON.stringify(s)); } catch { /* no-op */ } };
+const clearLineSession = () => { try { localStorage.removeItem(LINE_SESSION_KEY); } catch { /* no-op */ } };
+
+// ตัดชื่อให้ไม่เกิน 16 ตัวอักษร (ตามกฎของฟอร์ม) โดยไม่ตัดกลาง emoji
+// ชื่อจาก LINE ไม่เกิน 20 ตัวอักษร (ข้อกำหนดของ LINE) — นับเป็น "ตัวอักษรที่ตามองเห็น" ชื่อไทยที่มีสระ/วรรณยุกต์และ emoji จึงไม่ถูกตัดผิด
+const graphemeList = (s) => {
   const str = String(s ?? "");
-  try { return Array.from(new Intl.Segmenter("th", { granularity: "grapheme" }).segment(str), (x) => x.segment); }
+  try { return Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(str), (x) => x.segment); }
   catch { return Array.from(str); }
 };
-const toBookingName = (s) => graphemes(String(s || "").trim()).slice(0, NAME_MAX).join("").trim();
-// ชื่อจาก LINE อาจมีอักขระ < > & ซึ่งทำให้ข้อความ Telegram (โหมด HTML) ส่งไม่ผ่าน — escape ก่อนใส่ในข้อความ
-const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const toFormName = (s) => graphemeList(String(s || "").trim()).slice(0, 20).join("").trim();
 
-// ─── โค้ดส่วนลด: วันหมดอายุ / ล็อกการใช้ / คืนโค้ด ───
-const todayBangkok = () => new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
-// หมดอายุ = วันที่ปัจจุบัน (เวลาไทย) เลยวันที่ในคอลัมน์ expires_at ไปแล้ว — ใช้ได้ถึงสิ้นวันที่ระบุ / ไม่ใส่ = ไม่หมดอายุ
-// ─── อายุแพ็คเกจ: เริ่มนับจาก "วันเล่นครั้งแรก" ที่จองด้วยแพ็คเกจนั้น (ไม่ใช่วันที่ซื้อ/ยืนยัน) ──────────────────────
-// ซื้อ/ยืนยัน = ยังไม่เริ่มนับ (expiry_date ว่าง) → จองด้วยแพ็คเกจครั้งแรก วันเล่นของการจองนั้นเป็นวันที่ 1 → ใช้เล่นได้ตามจำนวนวันของแพ็คเกจ
-// เช่น แพ็ค 7 วัน จองเล่นครั้งแรก 2 พ.ย. ใช้เล่นได้ 2–8 พ.ย. (ถ้าต้องการนับ "7 วันนับจากวันถัดไป" เปลี่ยน COUNT_FIRST_PLAY_DAY เป็น false)
-// แพ็คเกจเก่าที่เริ่มนับไปแล้ว (มี expiry_date แต่ไม่มี first_use_date) ใช้วันหมดอายุเดิม ไม่ถูกแก้ ฟังก์ชันชุดนี้ต้องเหมือนกันใน booking-actions.js และ admin-actions.js
-const COUNT_FIRST_PLAY_DAY = true;
-const addDaysIso = (iso, n) => { const [y, m, d] = iso.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10); };
-const packageWindowEnd = (firstPlayDate, days) => addDaysIso(firstPlayDate, Math.max(1, Number(days) || 1) - (COUNT_FIRST_PLAY_DAY ? 1 : 0));
-// ตรวจวันเล่นกับอายุแพ็คเกจ (ไม่แก้ข้อมูล): คืน { error, ... } หรือ { unstarted: true/false }
-function checkPackageWindow(pkg, bookingDate) {
-  const exp = pkg.expiry_date ? String(pkg.expiry_date).slice(0, 10) : null;
-  if (!exp) return { unstarted: true };
-  if (exp < todayBangkok()) return { error: "package_expired", expiry_date: exp };
-  const start = pkg.first_use_date ? String(pkg.first_use_date).slice(0, 10) : null;
-  if (start && bookingDate < start) return { error: "package_date_before_start", start_date: start, expiry_date: exp };
-  if (bookingDate > exp) return { error: "package_date_out_of_range", expiry_date: exp };
-  return { unstarted: false };
-}
-// เริ่มนับอายุแพ็คเกจ (ถ้ายังไม่เริ่ม) แบบ atomic — ถ้ามีคนเริ่มนับตัดหน้าพร้อมกัน จะอ่านช่วงใหม่แล้วตรวจวันเล่นของเรากับช่วงนั้น
-async function startPackageIfNeeded(pkg, bookingDate) {
-  if (pkg.expiry_date) return { ok: true, started: false };
-  const end = packageWindowEnd(bookingDate, pkg.expiry_days);
-  const upd = await sb(`packages?id=eq.${pkg.id}&expiry_date=is.null`, { method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ first_use_date: bookingDate, expiry_date: end }) });
-  if (!upd.ok) return /first_use_date/.test(JSON.stringify(upd.body || "")) ? { error: "package_columns_missing" } : { error: "package_busy" }; // ยังไม่ได้รัน add-package-first-use-date.sql
-  if (Array.isArray(upd.body) && upd.body.length > 0) return { ok: true, started: true, expiry_date: end };
-  const { body } = await sb(`packages?id=eq.${pkg.id}&select=*`);
-  const fresh = Array.isArray(body) ? body[0] : null;
-  if (!fresh) return { error: "package_not_active" };
-  const chk = checkPackageWindow(fresh, bookingDate);
-  if (chk.error) return chk;
-  return chk.unstarted ? { error: "package_busy" } : { ok: true, started: false };
-}
-// ถ้าแพ็คเกจนี้ไม่เหลือการจองที่ใช้งานอยู่เลย (ยกเลิกหมด/บันทึกไม่สำเร็จ) → ถอยกลับเป็น "ยังไม่เริ่มนับ" ไม่ให้เสียวันฟรี (ไม่แตะแพ็คเกจเก่าที่ไม่มี first_use_date)
-async function releasePackageStartIfUnused(packageId) {
-  const { body } = await sb(`bookings?package_id=eq.${packageId}&status=neq.cancelled&select=id&limit=1`);
-  if (Array.isArray(body) && body.length === 0) await sb(`packages?id=eq.${packageId}&first_use_date=not.is.null`, { method: "PATCH", body: JSON.stringify({ first_use_date: null, expiry_date: null }) });
-}
-
-const isDiscountExpired = (d) => !!d.expires_at && String(d.expires_at).slice(0, 10) < todayBangkok();
-
-// ล็อกการใช้โค้ด "ก่อน" สร้างการจอง ด้วยการอัปเดตแบบมีเงื่อนไข (used_count ต้องยังเท่าค่าที่เพิ่งอ่าน)
-// ถ้ามีคนใช้ตัดหน้าไปพร้อมกัน เงื่อนไขจะไม่ตรง → อ่านใหม่แล้วตรวจอีกรอบ จึงไม่มีทางที่โค้ดใช้ได้ครั้งเดียวถูกใช้ซ้ำสองครั้ง
-async function claimDiscount(discountId, basePrice) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const { body } = await sb(`discount_codes?id=eq.${encodeURIComponent(discountId)}&select=*`);
-    const d = (body || [])[0];
-    if (!d || !d.active) return { error: "invalid" };
-    if (isDiscountExpired(d)) return { error: "expired" };
-    if (d.used_count >= d.max_uses) return { error: "used" };
-    const { ok, body: upd } = await sb(`discount_codes?id=eq.${d.id}&used_count=eq.${d.used_count}`, {
-      method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ used_count: d.used_count + 1 }),
-    });
-    if (ok && upd && upd.length > 0) {
-      const amount = d.discount_amount > 0 ? d.discount_amount : Math.round(basePrice * d.discount_percent / 100);
-      return { row: upd[0], amount };
-    }
-  }
-  return { error: "used" };
-}
-// คืนสิทธิ์การใช้โค้ด 1 ครั้ง (ใช้ตอนสร้างการจองไม่สำเร็จ หรือยกเลิกรายการที่ยังไม่ได้ชำระ/ยังไม่ได้ยืนยัน)
-async function releaseDiscountById(id) {
-  const { body } = await sb(`discount_codes?id=eq.${encodeURIComponent(id)}&select=id,used_count`);
-  const d = (body || [])[0];
-  if (d && d.used_count > 0) await sb(`discount_codes?id=eq.${d.id}`, { method: "PATCH", body: JSON.stringify({ used_count: d.used_count - 1 }) });
-}
-async function releaseDiscountByCode(code) {
-  if (!code) return;
-  const { body } = await sb(`discount_codes?code=eq.${encodeURIComponent(code)}&select=id`);
-  if ((body || [])[0]) await releaseDiscountById(body[0].id);
-}
-
-// สิทธิ์แพ็คเกจที่ถูกจองค้างไว้ (การจองสถานะ "รอการยืนยัน" ที่ยังไม่ถูกหัก) — 60 นาที = 1 ครั้ง, 120 นาที = 2 ครั้ง
-async function getReservedCredits(packageId) {
-  const { body } = await sb(`bookings?package_id=eq.${packageId}&status=eq.reviewing&select=duration_minutes`);
-  return (Array.isArray(body) ? body : []).reduce((s, b) => s + Math.max(1, Math.round((b.duration_minutes || 60) / 60)), 0);
-}
-
-// ล็อกอิน LINE อยู่หรือไม่ (ผูกเบอร์แล้วหรือยังก็ได้) — ใช้กับคำสั่งที่ต้องรู้ว่า "เป็นลูกค้าที่ล็อกอิน" แต่ยังไม่ต้องเป็นเจ้าของรายการ
-async function getSessionUser(sessionToken) {
-  const userId = verifyLineSession(sessionToken);
-  if (!userId) return { error: "line_required" };
-  const { body } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}&select=phone`);
-  const row = Array.isArray(body) ? body[0] : null;
-  if (!row) return { error: "line_required" };
-  return { userId, phone: row.phone || null };
-}
-
-// ลิงก์สลิปต้องเป็นไฟล์ที่อัปโหลดเข้า bucket ของเราเองและตั้งชื่อตามรายการนี้เท่านั้น (กันแนบลิงก์ภายนอก/ใช้สลิปของรายการอื่น)
-// รูปแบบที่หน้าเว็บสร้าง: <SUPABASE_URL>/storage/v1/object/public/slips/slips/<key>_<timestamp>.<นามสกุลรูปภาพ>
-function isOwnSlipUrl(url, key) {
-  const prefix = `${SUPABASE_URL}/storage/v1/object/public/slips/slips/${key}_`;
-  const u = String(url || "");
-  return u.startsWith(prefix) && /^\d{10,16}\.(jpe?g|png|webp|heic|heif|gif)$/i.test(u.slice(prefix.length));
-}
-
-// แจ้งเตือน Telegram จากเซิร์ฟเวอร์เอง โดยดึงข้อมูลจากฐานข้อมูล (เดิมหน้าเว็บเป็นคนส่งข้อมูลมาให้ ซึ่งใครก็ยิงข้อความปลอมเข้า Telegram แอดมินได้)
-async function notifySlipBooking(row) {
+// pendingCheckout = ข้อมูลที่ลูกค้าเลือกไว้ (วัน/สนาม/เวลา) เก็บไว้ก่อนเด้งไปหน้า LINE แล้วคืนให้ตอนกลับมา
+function startLineLogin(returnTarget = "home", pendingCheckout = null) {
+  const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  try { localStorage.setItem("nova_line_nonce", nonce); } catch { /* no-op */ }
   try {
-    let all = [row];
-    if (row.group_id) {
-      const { body } = await sb(`bookings?group_id=eq.${encodeURIComponent(row.group_id)}&select=*&order=court_id.asc`);
-      if (Array.isArray(body) && body.length) all = body;
-    }
-    const startMin = (row.hour || 0) * 60 + (row.start_minute || 0);
-    const dur = row.duration_minutes || 60;
-    const sentAt = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().substr(11, 5);
-    await notifyTelegram(
-      `🔔 <b>มีลูกค้าส่งสลิปใหม่</b>\n\n` +
-      `🎾 สนาม: ${all.map((r) => `Court ${r.court_id}`).join(" + ")}\n` +
-      `📅 วันที่: ${row.booking_date}\n` +
-      `🕐 เวลา: ${minutesToLabel(startMin)}–${minutesToLabel(startMin + dur)}\n` +
-      `💰 ยอด: ฿${all.reduce((s, r) => s + (r.price || 0), 0).toLocaleString()}\n` +
-      `👤 ชื่อ: ${esc(row.customer_name || "-")}\n` +
-      `📞 เบอร์: ${row.customer_id}\n` +
-      `🕓 ส่งสลิปเมื่อเวลา: ${sentAt} น. (ไทย)\n\n` +
-      `สถานะ: รอการตรวจสอบ\nกรุณาเข้าไปตรวจสอบและยืนยันที่หน้า Admin Dashboard`
-    );
-  } catch (e) { console.error("notifySlipBooking failed:", e); }
-}
-async function notifySlipPackage(row) {
-  try {
-    const sentAt = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().substr(11, 5);
-    await notifyTelegram(
-      `🔔 <b>มีลูกค้าส่งสลิปซื้อแพ็คเกจ</b>\n\n` +
-      `🎟 ${row.promo_code && PROMO_1111.items[String(row.promo_code).slice(PROMO_TAG.length)] ? `โปร 11.11 ${PROMO_1111.items[String(row.promo_code).slice(PROMO_TAG.length)].name} (${row.tier === "peak" ? "ทุกเวลา" : "จ.–ศ. ก่อน 16:00"})` : `แพ็คเกจ ${row.tier === "peak" ? "Peak" : "Off Peak"}`} × ${row.total_credits} ครั้ง\n` +
-      `💰 ยอด: ฿${(row.price || 0).toLocaleString()}\n` +
-      `👤 ชื่อ: ${esc(row.customer_name || "-")}\n` +
-      `📞 เบอร์: ${row.customer_id}\n` +
-      `🕓 ส่งสลิปเมื่อเวลา: ${sentAt} น. (ไทย)\n\n` +
-      `สถานะ: รอการตรวจสอบ\nกรุณาเข้าไปตรวจสอบและยืนยันที่แท็บ "🎟 แพ็คเกจ" ใน Admin Dashboard`
-    );
-  } catch (e) { console.error("notifySlipPackage failed:", e); }
+    if (pendingCheckout) localStorage.setItem("nova_pending_checkout", JSON.stringify(pendingCheckout));
+    else localStorage.removeItem("nova_pending_checkout");
+  } catch { /* no-op */ }
+  const state = `${returnTarget}.${nonce}`;
+  const url = "https://access.line.me/oauth2/v2.1/authorize?response_type=code"
+    + `&client_id=${LINE_LOGIN_CHANNEL_ID}`
+    + `&redirect_uri=${encodeURIComponent(LINE_REDIRECT_URI)}`
+    + `&state=${encodeURIComponent(state)}`
+    + `&scope=${encodeURIComponent("profile")}`
+    + (LINE_BOT_PROMPT ? `&bot_prompt=${LINE_BOT_PROMPT}` : "");
+  window.location.href = url;
 }
 
-// บันทึกการจองผ่านฟังก์ชัน SQL ที่ "ล็อกต่อสนาม/วัน → เช็คว่าง → บันทึก" ในธุรกรรมเดียว กัน 2 คนกดจองช่วงเดียวกันพร้อมกันแล้วผ่านทั้งคู่
-// ถ้ายังไม่ได้รัน SQL (ไม่มีฟังก์ชัน) หรือฟังก์ชันผิดพลาดแบบอื่น → ถอยกลับไปใช้วิธีเดิม (เช็คไว้แล้วก่อนหน้า แล้วบันทึกตรงๆ) การจองจึงไม่หยุดทำงาน
-async function insertBookingsAtomic(rows) {
-  const r = await sb(`rpc/create_bookings_if_free`, { method: "POST", body: JSON.stringify({ rows }) });
-  if (r.ok && Array.isArray(r.body) && r.body.length === rows.length) return { rows: r.body };
-  const msg = String(r.body?.message || "");
-  if (msg.includes("slot_taken")) return { error: "slot_taken", court: Number(msg.split(":")[1]) || null };
-  if (r.body?.code !== "PGRST202") console.error("create_bookings_if_free failed — fallback to plain insert:", r.body);
-  const ins = await sb(`bookings`, { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify(rows) });
-  if (!ins.ok || !Array.isArray(ins.body) || ins.body.length !== rows.length) return { error: "insert_failed" };
-  return { rows: ins.body };
-}
-
-// ─── เรียนกับโค้ช (สนาม+โค้ช) ─────────────────────────────────────────────────────────
-// ซื้อคอร์สแล้วแอดมินนัดวัน-เวลากับลูกค้าทาง LINE OA เอง ไม่มีการเลือกวัน/เวลา/โค้ชในระบบ — ราคาที่นี่เป็นตัวตัดสินเสมอ หน้าเว็บดึงไปแสดง
-// ราคาตามป้ายของร้านเป็น "ต่อคน" (Duo = 2 คน : 1 โค้ช) ระบบคิดยอดรวมเป็น ต่อคน × จำนวนคน — ถ้าร้านต้องการขาย Duo ต่อคน ให้เปลี่ยน people ของ duo เป็น 1
-const COACH_PRICES = {
-  adult: { private: { people: 1, 1: 1190, 5: 5750, 10: 11000 }, duo: { people: 2, 1: 750, 5: 3500, 10: 6500 } },
-  kid:   { private: { people: 1, 1: 1190, 5: 5750, 10: 11000 }, duo: { people: 2, 1: 699, 5: 3295, 10: 6290 } },
+// บวก/ลบวันกับวันที่รูปแบบ YYYY-MM-DD (คิดแบบ UTC ไม่ผูกเขตเวลาของเครื่อง) + แสดงวันที่อ่านง่าย — ใช้แสดงอายุแพ็คเกจ (ต้องตรงกับเซิร์ฟเวอร์: วันเล่นวันแรกนับเป็นวันที่ 1)
+const addDaysIsoClient = (iso, n) => { const [y, m, d] = String(iso).slice(0, 10).split("-").map(Number); return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10); };
+const niceDate = (iso, lang = "th") => new Date(String(iso).slice(0, 10) + "T00:00:00").toLocaleDateString(lang === "th" ? "th-TH" : "en-GB", { day: "numeric", month: "short", year: "numeric" });
+// ประวัติการเลื่อนเวลา: moved_from = "YYYY-MM-DD HH:MM|สนาม" (เวลาเดิมครั้งแรก) → { date, time, courts }
+const parseMovedFrom = (mf) => { const [dt, courts] = String(mf || "").split("|"); const [date, time] = (dt || "").split(" "); return { date, time, courts: courts || "" }; };
+const toIso = (d) => {
+  if (!d) return "";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 };
-const COACH_SESSIONS = [1, 5, 10];
-function coachQuote(audience, type, sessions) {
-  const row = COACH_PRICES[audience]?.[type];
-  const n = Number(sessions);
-  if (!row || !COACH_SESSIONS.includes(n)) return null;
-  const perPerson = row[n];
-  return { audience, type, sessions: n, people: row.people, perPerson, perSessionPerPerson: Math.round(perPerson / n), total: perPerson * row.people };
-}
-const coachLabel = (o) => `${o.type === "duo" ? "Private Duo (2 คน : 1 โค้ช)" : "Private (1 คน : 1 โค้ช)"} • ${o.audience === "kid" ? "เด็ก" : "ผู้ใหญ่"} • ${Number(o.sessions) === 1 ? "ครั้งเดียว" : `แพ็ค ${o.sessions} ครั้ง`}`;
-const publicCoachOrder = (r) => ({ id: r.id, customer_name: r.customer_name, customer_id: r.customer_id, audience: r.audience, type: r.type, sessions: r.sessions, people: r.people, price: r.price, learner_note: r.learner_note, status: r.status, sessions_used: r.sessions_used || 0, line_pushed: !!r.line_pushed, created_time: r.created_time });
+const fmtDate = (d, lang="th") => d ? d.toLocaleDateString(lang==="th"?"th-TH":"en-GB", { weekday: "short", year: "numeric", month: "short", day: "numeric" }) : "";
 
-// สวิตช์ส่งข้อความอัตโนมัติจาก OA ไปหาลูกค้า — ปิดไว้เป็นค่าตั้งต้น (ตอนนี้ใช้แบบ "ให้ลูกค้ากดปุ่มทักไลน์ OA เอง")
-// เปิดโดยตั้ง Environment Variable  COACH_LINE_PUSH=on  ที่ Vercel (ต้องมี LINE_CHANNEL_ACCESS_TOKEN ด้วย) แล้ว Redeploy — ไม่ต้องแก้โค้ด
-const coachPushOn = () => process.env.COACH_LINE_PUSH === "on";
+// ─── Payment info (ใช้ QR จริงของร้าน) ─────────────────────────────────────────
+const PAYMENT_ACCOUNT_NAME = "นาง อภิระมณ เฉลิมวงศาเวช";
+const PAYMENT_PHONE = "063-146-5997";
+const LINE_OA_URL = "https://line.me/R/ti/p/@347mlhra";
+const MAP_URL = "https://maps.app.goo.gl/wbDULbGf8VtaLbiW7";
 
-// ส่งข้อความจาก LINE OA ไปหาลูกค้า (ต้องเป็นเพื่อน OA และยังไม่ได้บล็อก; นับโควตาข้อความของแผน OA) — ล้มเหลวแล้วไม่ทำให้การสั่งซื้อพัง คืน false ให้หน้าเว็บโชว์ปุ่มทักไลน์แทน
-async function pushLine(to, text) {
-  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-  if (!token || !to) return false;
-  try {
-    const r = await fetch("https://api.line.me/v2/bot/message/push", {
-      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ to, messages: [{ type: "text", text }] }),
-    });
-    if (!r.ok) { console.error("LINE push failed:", r.status, await r.text().catch(() => "")); return false; }
-    return true;
-  } catch (e) { console.error("LINE push error:", e?.message); return false; }
-}
-const coachCreatedText = (o) =>
-  `👤 NOVA Tennis — รับคำขอเรียนกับโค้ชแล้วค่ะ\n\n` +
-  `คอร์ส: ${coachLabel(o)}\n` +
-  `ยอดชำระ: ฿${Number(o.price).toLocaleString()}${o.people > 1 ? ` (฿${(o.price / o.people).toLocaleString()} × ${o.people} คน)` : ""}\n` +
-  `รหัสคำสั่งซื้อ: C-${o.id}\n\n` +
-  `👉 ชำระเงินและส่งสลิปในหน้าเว็บให้เรียบร้อย แล้วแอดมินจะนัดวัน-เวลาเรียนกับโค้ชในแชทนี้ค่ะ\n` +
-  `ตอบกลับแชทนี้ได้เลย เช่น วัน-เวลาที่สะดวกเรียนค่ะ 🙏`;
+// ─── Membership package (โครงไว้สำหรับอนาคต — ยังไม่เปิดใช้งาน) ────────────────
+// eslint-disable-next-line no-unused-vars
+const MEMBERSHIP_PACKAGE = { sessions: 10, price: null, active: false };
 
-async function getLinkedCustomer(sessionToken) {
-  const userId = verifyLineSession(sessionToken);
-  if (!userId) return { error: "line_required" };
-  const { body } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}&select=*`);
-  const row = (body || [])[0];
-  if (!row) return { error: "line_required" };
-  if (!row.phone) return { error: "phone_not_linked" };
-  // ชื่อในการจองมาจาก LINE เสมอ (ไม่เชื่อชื่อที่ส่งมาจากหน้าเว็บ) — ชื่อ LINE ล่าสุดที่บันทึกตอนล็อกอิน
-  return { userId, phone: row.phone, name: toBookingName(row.display_name) || toBookingName(row.customer_name) || "ลูกค้า LINE" };
-}
-
-const FIRST_TIME_PROMO = { weekday: 450, weekend: 490, lastPlayDate: "2026-10-31" };
-function getFirstTimePrice(bookingDate) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(bookingDate || "")) return null;
-  if (bookingDate > FIRST_TIME_PROMO.lastPlayDate) return null; // เลยช่วงโปรโมชั่นแล้ว
-  const day = new Date(bookingDate + "T00:00:00").getDay();
-  return (day === 0 || day === 6) ? FIRST_TIME_PROMO.weekend : FIRST_TIME_PROMO.weekday;
-}
-
-// "เคยจองแล้ว" นับเฉพาะ: ยืนยันแล้ว / ส่งสลิปแล้ว (รอตรวจ) / รอชำระที่ยังไม่เกิน 5 นาที (กันเปิดจองซ้อนหลายรายการพร้อมกันแล้วได้โปรทุกรายการ)
-// รายการที่กดจองแล้วทิ้งไว้จนหมดเวลา หรือถูกยกเลิก ไม่นับ — ลูกค้าจะไม่เสียสิทธิ์โปรไปโดยไม่เคยได้ใช้จริง
-async function isFirstTimeCustomer(customerId) {
-  const freshCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-  const { ok, body } = await sb(
-    `bookings?customer_id=eq.${customerId}&or=(status.in.(confirmed,reviewing),and(status.eq.pending,created_time.gte.${freshCutoff}))&select=id&limit=1`
-  );
-  if (!ok) { console.error("isFirstTimeCustomer query failed"); return false; } // เช็คไม่ได้ → ไม่ให้โปร (ปลอดภัยฝั่งร้านไว้ก่อน)
-  return !(body && body.length > 0);
-}
-
-async function getActiveIntervals(bookingDate, courtId) {
-  const { body } = await sb(
-    `bookings?booking_date=eq.${bookingDate}&court_id=eq.${courtId}&status=neq.cancelled&select=hour,start_minute,duration_minutes,status,created_time`
-  );
-  const now = Date.now();
-  return (body || [])
-    .filter((b) => {
-      if (b.status === "pending") {
-        const created = new Date(b.created_time).getTime();
-        return now - created < 5 * 60 * 1000; // รอชำระเกิน 5 นาที ไม่นับว่าบล็อกอีกต่อไป
-      }
-      return true;
-    })
-    .map((b) => {
-      const s = (b.hour || 0) * 60 + (b.start_minute || 0);
-      const dur = b.duration_minutes || 60;
-      return [s, s + dur];
-    });
-}
-
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    res.status(405).json({ error: "Method not allowed" });
-    return;
+// ─── CSS ──────────────────────────────────────────────────────────────────────
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Noto+Sans+Thai:wght@300;400;500;600;700&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --cr: #F9E8D4; --cr2: #EDD5B8; --or: #F47E1F; --or2: #FAA05A;
+    --or-bg: rgba(244,126,31,0.10); --br: #663924; --bl: #8DB6C7;
+    --bl-bg: rgba(141,182,199,0.13); --tx: #2e1a0e; --mu: #8a7060;
+    --dv: rgba(102,57,36,0.14); --sh: 0 2px 16px rgba(102,57,36,0.09); --r: 14px;
   }
-  if (!SUPABASE_URL || !SERVICE_KEY) {
-    res.status(500).json({ error: "Server not configured" });
-    return;
+  html, body { background: var(--cr); font-family: 'Noto Sans Thai', sans-serif; color: var(--tx); }
+  button, input { font-family: 'Noto Sans Thai', sans-serif; }
+  a { color: inherit; }
+  .bb { font-family: 'Bebas Neue', sans-serif; letter-spacing: .05em; }
+  .btn-primary { width:100%; padding:15px; border-radius:var(--r); border:none; background:linear-gradient(90deg,var(--or),var(--or2)); color:#fff; font-weight:700; font-size:16px; cursor:pointer; box-shadow:0 4px 18px rgba(244,126,31,.30); font-family:'Noto Sans Thai',sans-serif; }
+  .btn-primary:disabled { background:var(--cr2); color:var(--mu); box-shadow:none; cursor:not-allowed; }
+  .card { background:#fff; border-radius:var(--r); border:1px solid var(--dv); box-shadow:var(--sh); overflow:hidden; }
+  .card-header { background:var(--br); padding:11px 18px; }
+  .card-header p { color:var(--or); font-size:13px; font-weight:600; }
+  .card-body { padding:16px 18px; }
+  @keyframes fu { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+  .fu { animation:fu .3s ease backwards; } /* backwards = จบแอนิเมชันแล้วไม่ค้าง transform ไม่งั้น position:fixed ของลูกหลาน (เช่นป๊อปอัปเงื่อนไข) จะเพี้ยนไปอิงกล่องนี้แทนหน้าจอ */
+  @keyframes fireGlow { 0%,100% { box-shadow:0 6px 22px rgba(232,66,15,.45), 0 0 0 rgba(255,154,31,0); } 50% { box-shadow:0 8px 30px rgba(255,90,20,.75), 0 0 26px rgba(255,170,40,.65); } }
+  @keyframes flicker { 0%,100% { transform:translateY(0) scale(1) rotate(-3deg); opacity:.95; } 25% { transform:translateY(-3px) scale(1.12) rotate(3deg); opacity:1; } 50% { transform:translateY(-1px) scale(.95) rotate(-2deg); opacity:.85; } 75% { transform:translateY(-4px) scale(1.08) rotate(4deg); opacity:1; } }
+  @keyframes shine { 0% { transform:translateX(-120%) skewX(-20deg); } 60%,100% { transform:translateX(220%) skewX(-20deg); } }
+  @keyframes twinkle { 0%,100% { opacity:.25; transform:scale(.7) rotate(0deg); } 50% { opacity:1; transform:scale(1.15) rotate(20deg); } }
+  @keyframes popPrice { 0%,100% { transform:scale(1); } 50% { transform:scale(1.06); } }
+  @keyframes tagWiggle { 0%,100% { transform:rotate(-2deg); } 50% { transform:rotate(2deg); } }
+  .promo-spark { position:absolute; animation:twinkle 1.8s ease-in-out infinite; pointer-events:none; }
+  .promo-price { animation:popPrice 2s ease-in-out infinite; }
+  .promo-tag { animation:tagWiggle 2.4s ease-in-out infinite; }
+  .pkg-fire { animation:fireGlow 1.8s ease-in-out infinite; }
+  .pkg-flame { position:absolute; animation:flicker 1.2s ease-in-out infinite; pointer-events:none; }
+.nav-fire { display:inline-block; animation:flicker 1.2s ease-in-out infinite; transform-origin:50% 90%; }
+  .pkg-shine { position:absolute; top:0; bottom:0; width:60px; background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent); animation:shine 3.2s ease-in-out infinite; pointer-events:none; }
+  @media (prefers-reduced-motion: reduce) { .pkg-fire, .pkg-flame, .pkg-shine, .promo-spark, .promo-price, .promo-tag, .nav-fire { animation:none; } }
+`;
+
+// ─── Translations ─────────────────────────────────────────────────────────────
+const T = {
+  th: {
+    bookNow: "จองสนามเลย →", home: "หน้าแรก", book: "จองสนาม", myBookings: "การจองของฉัน",
+    selectDate: "เลือกวันที่", selectCourt: "เลือกสนาม", selectDuration: "เลือกระยะเวลา", selectTime: "เลือกช่วงเวลา",
+    proceed: "ดำเนินการต่อ →", confirm: "ยืนยันการจอง", cancel: "ยกเลิก",
+    name: "ชื่อ (ไม่เกิน 16 ตัว)", phone: "เบอร์โทรศัพท์",
+    discount: "🏷 รหัสส่วนลด (ถ้ามี)", useCode: "ใช้โค้ด",
+    payment: "ชำระเงิน", scanQR: "สแกน QR Code ชำระผ่าน PromptPay",
+    transfer: "โอนให้ถูกต้อง", bookingDetail: "รายละเอียดการจอง",
+    court: "สนาม", date: "วันที่", time: "เวลา", duration: "ระยะเวลา", price: "ยอดชำระ",
+    total: "ยอดชำระ", payDone: "ชำระเงินแล้ว / กลับหน้าหลัก",
+    uploadSlip: "📎 แนบสลิปการโอนเงิน", selectSlip: "📷 เลือกรูปสลิป",
+    changeSlip: "🔄 เปลี่ยนรูปสลิป", sendSlip: "✅ ส่งสลิป",
+    sending: "⏳ กำลังส่ง...", slipSent: "✅ ส่งสลิปเรียบร้อยแล้ว",
+    slipSentDesc: "สถานะ: รอการยืนยัน — ทีมงานกำลังตรวจสอบสลิปของท่าน",
+    noSlot: "😔 ไม่มีช่วงเวลาว่างในวันนี้",
+    selectDateFirst: "กรุณาเลือกวันที่และสนามก่อน",
+    selectDurationFirst: "กรุณาเลือกระยะเวลาก่อน",
+    confirmBooking: "ยืนยัน ✓", morningPrice: "ช่วงเช้า", eveningPrice: "ช่วงบ่าย-เย็น",
+    steps: "ขั้นตอนการชำระเงิน", contactUs: "ติดต่อเรา",
+    rules: "กฎระเบียบสนาม", cancelPolicy: "นโยบายการยกเลิก",
+    bookingCondition: "เงื่อนไขการจอง", priceTitle: "💰 ราคาค่าสนาม",
+    indoor: "สนามในร่ม • ปรับอากาศ", saveDiscount: "ประหยัดไป",
+    timeExpired: "หมดเวลา", payWithin: "กรุณาชำระภายใน",
+    invalidCode: "❌ รหัสส่วนลดไม่ถูกต้องหรือหมดอายุแล้ว",
+    contactLine: "กรุณาติดต่อยกเลิกผ่าน Line หรือโทรศัพท์",
+    noWindow: "ไม่ติดหน้าต่าง", hasWindow: "ติดหน้าต่าง",
+    summaryTitle: "สรุปรายการจอง", accountName: "ชื่อบัญชี", loading: "⏳ กำลังโหลด...",
+    backHome: "กลับหน้าหลัก", checkMyBooking: "การจองของฉัน",
+    searchPlaceholder: "กรอกเบอร์โทรของคุณ", searchBtn: "ค้นหา",
+    notFound: "ไม่พบการจองสำหรับเบอร์นี้",
+    statusPending: "รอชำระเงิน", statusReviewing: "รอการยืนยัน",
+    statusConfirmed: "การจองสำเร็จ", statusCancelled: "การจองถูกยกเลิกแล้ว",
+    rowPrice: "💰 ราคา",
+    stepsList: ["โอนเงินผ่าน QR Code ด้านบน","ถ่ายภาพสลิปการโอนเงิน","กด 'เลือกรูปสลิป' แล้วอัพโหลดสลิป","กด 'ส่งสลิป' เพื่อยืนยัน","รอทีมงานตรวจสอบและยืนยันการจอง"],
+    lineLabel: "Line", mapLabel: "แผนที่ / Map",
+    minutesLabel: "นาที",
+  },
+  en: {
+    bookNow: "Book Now →", home: "Home", book: "Book", myBookings: "My Bookings",
+    selectDate: "Select Date", selectCourt: "Select Court", selectDuration: "Select Duration", selectTime: "Select Time Slot",
+    proceed: "Continue →", confirm: "Confirm Booking", cancel: "Cancel",
+    name: "Name (max 16 chars)", phone: "Phone Number",
+    discount: "🏷 Discount Code (optional)", useCode: "Apply",
+    payment: "Payment", scanQR: "Scan QR Code via PromptPay",
+    transfer: "Transfer exact amount", bookingDetail: "Booking Details",
+    court: "Court", date: "Date", time: "Time", duration: "Duration", price: "Total",
+    total: "Total", payDone: "Payment Done / Back to Home",
+    uploadSlip: "📎 Upload Payment Slip", selectSlip: "📷 Select Slip Image",
+    changeSlip: "🔄 Change Slip", sendSlip: "✅ Send Slip",
+    sending: "⏳ Sending...", slipSent: "✅ Slip Submitted Successfully",
+    slipSentDesc: "Status: Awaiting confirmation — our team is verifying your slip",
+    noSlot: "😔 No available slots today",
+    selectDateFirst: "Please select a date and court first",
+    selectDurationFirst: "Please select a duration first",
+    confirmBooking: "Confirm ✓", morningPrice: "Morning", eveningPrice: "Afternoon-Evening",
+    steps: "Payment Steps", contactUs: "Contact Us",
+    rules: "Court Rules", cancelPolicy: "Cancellation Policy",
+    bookingCondition: "Booking Conditions", priceTitle: "💰 Court Rates",
+    indoor: "Indoor Court • Air-conditioned", saveDiscount: "You save",
+    timeExpired: "Time Expired", payWithin: "Please pay within",
+    invalidCode: "❌ Invalid or expired discount code",
+    contactLine: "Please contact us via Line or Phone to cancel",
+    noWindow: "No window", hasWindow: "Has window",
+    summaryTitle: "Booking Summary", accountName: "Account Name", loading: "⏳ Loading...",
+    backHome: "Back to Home", checkMyBooking: "My Bookings",
+    searchPlaceholder: "Enter your phone number", searchBtn: "Search",
+    notFound: "No bookings found for this number",
+    statusPending: "Awaiting Payment", statusReviewing: "Awaiting Confirmation",
+    statusConfirmed: "Booking Confirmed", statusCancelled: "Booking Cancelled",
+    rowPrice: "💰 Price",
+    stepsList: ["Transfer via the QR Code above","Take a photo of the transfer slip","Tap 'Select Slip Image' and upload it","Tap 'Send Slip' to confirm","Wait for our team to verify and confirm your booking"],
+    lineLabel: "Line", mapLabel: "Map",
+    minutesLabel: "min",
   }
+};
 
-  const { action, ...p } = req.body || {};
+function NovaLogo({ width }) {
+  return <img src="/nova-logo.png" alt="NOVA Tennis" style={{ width, height: "auto", display: "block", margin: "0 auto" }} />;
+}
 
-  try {
-    switch (action) {
-      case "coachCatalog": {
-        // ราคาคอร์สเรียนกับโค้ชทั้งหมด (ข้อมูลสาธารณะ ไม่มีข้อมูลลูกค้า) — หน้าเว็บดึงจากที่นี่ จึงแก้ราคาที่เดียว
-        const items = [];
-        for (const audience of ["adult", "kid"]) for (const type of ["duo", "private"]) for (const s of COACH_SESSIONS) items.push(coachQuote(audience, type, s));
-        res.status(200).json({ items });
-        return;
-      }
+// หน้า/การ์ดบอกให้ล็อกอินด้วย LINE — fullscreen (โหมด gate) หรือแทรกในหน้า (compact)
+function LineLoginGate({ lang="th", setLang, onLogin, compact=false }) {
+  const body = (
+    <div style={{width:"100%",maxWidth:380,background:"#fff",borderRadius:18,padding:"26px 22px",boxShadow:"0 10px 40px rgba(102,57,36,.15)",border:"1px solid var(--dv)",textAlign:"center"}}>
+      {!compact && <NovaLogo width={130} />}
+      <p style={{fontSize:18,fontWeight:800,color:"var(--br)",marginTop:compact?0:18}}>{lang==="th" ? "เข้าสู่ระบบด้วย LINE" : "Sign in with LINE"}</p>
+      <p style={{fontSize:13,color:"var(--mu)",lineHeight:1.7,marginTop:8}}>
+        {lang==="th"
+          ? "เพื่อเริ่มใช้งานระบบจอง NOVA Tennis กรุณาเข้าสู่ระบบด้วยบัญชี LINE ของคุณ ระบบจะกรอกชื่อ-เบอร์ให้อัตโนมัติ และดูการจอง/แพ็คเกจของคุณได้ทันที"
+          : "Please sign in with your LINE account to use NOVA Tennis booking. Your name and phone will be filled in automatically, and you can see your bookings and packages instantly."}
+      </p>
+      <button onClick={onLogin} style={{width:"100%",marginTop:18,padding:"14px",borderRadius:12,border:"none",background:"#06C755",color:"#fff",fontWeight:800,fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:10,fontFamily:"'Noto Sans Thai',sans-serif",boxShadow:"0 4px 14px rgba(6,199,85,.35)"}}>
+        <span style={{background:"#fff",color:"#06C755",fontWeight:900,fontSize:11,padding:"3px 7px",borderRadius:6}}>LINE</span>
+        {lang==="th" ? "เข้าสู่ระบบด้วย LINE" : "Sign in with LINE"}
+      </button>
+      {(LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && (
+        <p style={{fontSize:12,color:"var(--br)",marginTop:14,lineHeight:1.6,background:"var(--or-bg)",borderRadius:10,padding:"8px 10px"}}>
+          {lang==="th" ? "ระหว่างล็อกอิน LINE จะชวนให้เพิ่มเพื่อน LINE OA ของร้าน — ต้องเพิ่มเพื่อนด้วยจึงจะจองได้" : "During sign-in, LINE will ask you to add our LINE OA — adding it is required to book."}
+        </p>
+      )}
+      <a href={adminTel()} style={{display:"block",marginTop:14,fontSize:12.5,fontWeight:700,color:"var(--br)",textDecoration:"underline"}}>
+        {lang==="th" ? `ไม่มี LINE? โทรจองกับแอดมิน ${ADMIN_CONTACT_PHONE}` : `No LINE? Call the admin to book: ${ADMIN_CONTACT_PHONE}`}
+      </a>
+      <p style={{fontSize:11,color:"var(--mu)",marginTop:14,lineHeight:1.6}}>
+        {lang==="th"
+          ? "ระบบเก็บเฉพาะชื่อและรหัสผู้ใช้ LINE ของคุณ ไม่เห็นรหัสผ่านหรือข้อความแชทใดๆ"
+          : "We only store your LINE display name and user ID. We cannot see your password or any chats."}
+      </p>
+    </div>
+  );
+  if (compact) return <div style={{padding:"28px 16px 100px",display:"flex",justifyContent:"center"}} className="fu">{body}</div>;
+  return (
+    <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:20,gap:14}}>
+      {setLang && (
+        <div style={{display:"flex",gap:4}}>
+          {["th","en"].map(l => (
+            <button key={l} onClick={() => setLang(l)} style={{padding:"5px 10px",borderRadius:8,border:"1.5px solid var(--dv)",background:lang===l?"var(--br)":"#fff",color:lang===l?"var(--or)":"var(--mu)",fontWeight:lang===l?700:400,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+              {l==="th"?"🇹🇭 TH":"🇬🇧 EN"}
+            </button>
+          ))}
+        </div>
+      )}
+      {body}
+    </div>
+  );
+}
 
-      case "createCoachOrder": {
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        const q = coachQuote(p.audience, p.type, p.sessions);
-        if (!q) { res.status(400).json({ error: "invalid_product" }); return; }
-        const note = Array.from(String(p.learnerNote || "").trim()).slice(0, 120).join("");
+// ล็อกอิน LINE แล้ว แต่ยังไม่ได้เป็นเพื่อนกับ LINE OA ของร้าน → ต้องเพิ่มเพื่อนก่อนถึงจะจอง/ซื้อแพ็คเกจได้
+function LineFriendGate({ lang="th", compact=false, onRecheck, name }) {
+  const body = (
+    <div style={{width:"100%",maxWidth:380,background:"#fff",borderRadius:18,padding:"26px 22px",boxShadow:"0 10px 40px rgba(102,57,36,.15)",border:"1px solid var(--dv)",textAlign:"center"}}>
+      {!compact && <NovaLogo width={130} />}
+      <p style={{fontSize:30,marginTop:compact?0:14}}>🎾</p>
+      <p style={{fontSize:18,fontWeight:800,color:"var(--br)",marginTop:6}}>
+        {lang==="th" ? "เพิ่มเพื่อน LINE OA ก่อนดำเนินการต่อ" : "Add our LINE OA to continue"}
+      </p>
+      <p style={{fontSize:13,color:"var(--mu)",lineHeight:1.7,marginTop:8}}>
+        {lang==="th"
+          ? `${name ? `สวัสดีคุณ ${name} ` : ""}ก่อนจองหรือซื้อแพ็คเกจ กรุณาเพิ่มเพื่อน LINE OA ของ NOVA Tennis เพื่อให้ทางร้านติดต่อคุณได้สะดวก และรับข่าวสาร/โปรโมชั่นของร้าน`
+          : `${name ? `Hi ${name}. ` : ""}Before booking or buying a package, please add NOVA Tennis on LINE so we can reach you easily and share news and promotions.`}
+      </p>
+      <a href={LINE_OA_URL} target="_blank" rel="noreferrer"
+        style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,width:"100%",marginTop:18,padding:"14px",borderRadius:12,background:"#06C755",color:"#fff",fontWeight:800,fontSize:16,textDecoration:"none",boxShadow:"0 4px 14px rgba(6,199,85,.35)",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+        <span style={{background:"#fff",color:"#06C755",fontWeight:900,fontSize:11,padding:"3px 7px",borderRadius:6}}>LINE</span>
+        {lang==="th" ? "เพิ่มเพื่อน LINE OA" : "Add LINE OA"}
+      </a>
+      <button onClick={onRecheck} style={{width:"100%",marginTop:10,padding:"12px",borderRadius:12,border:"1.5px solid #06C755",background:"#fff",color:"#06A04A",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+        {lang==="th" ? "✓ เพิ่มเพื่อนแล้ว — ตรวจสอบอีกครั้ง" : "✓ I've added — check again"}
+      </button>
+      <a href={adminTel()} style={{display:"block",marginTop:12,fontSize:12.5,fontWeight:700,color:"var(--br)",textDecoration:"underline"}}>
+        {lang==="th" ? `ไม่สะดวกเพิ่มเพื่อน? โทรจองกับแอดมิน ${ADMIN_CONTACT_PHONE}` : `Prefer not to add us? Call the admin: ${ADMIN_CONTACT_PHONE}`}
+      </a>
+      <p style={{fontSize:11,color:"var(--mu)",marginTop:12,lineHeight:1.6}}>
+        {lang==="th" ? "หากเพิ่มเพื่อนแล้วแต่ยังขึ้นหน้านี้ กด \"ตรวจสอบอีกครั้ง\" ระบบจะพาไปยืนยันกับ LINE อีกรอบ" : "If you've already added us and still see this, tap \"check again\" to re-verify with LINE."}
+      </p>
+    </div>
+  );
+  if (compact) return <div style={{padding:"28px 16px 100px",display:"flex",justifyContent:"center"}} className="fu">{body}</div>;
+  return (
+    <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      {body}
+    </div>
+  );
+}
 
-        // กันซ้ำ/กันยิงรัว: คำสั่งซื้อเดิมที่ยังรอชำระของคอร์สเดียวกัน (ภายใน 1 ชม.) ใช้ใบเดิมต่อ ไม่สร้างใหม่/ไม่ส่งข้อความซ้ำ — และไม่เกิน 6 ใบต่อชั่วโมง
-        const since = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-        const { body: recent } = await sb(`coach_orders?customer_id=eq.${who.phone}&created_time=gte.${since}&select=*`);
-        const recentRows = Array.isArray(recent) ? recent : [];
-        const same = recentRows.find((r) => r.status === "pending" && r.audience === q.audience && r.type === q.type && Number(r.sessions) === q.sessions);
-        if (same) { res.status(200).json({ order: publicCoachOrder(same), linePushed: !!same.line_pushed, reused: true }); return; }
-        if (recentRows.length >= 6) { res.status(429).json({ error: "too_many_orders" }); return; }
+function TabBar({ tab, setTab, lang="th" }) {
+  const t = T[lang];
+  const promo = usePromo1111(); // ระหว่างโปร 11.11: เมนูแพ็คเกจเป็นไอคอนไฟ + ป้าย 11.11
+  return (
+    <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:200,backgroundColor:"#fff",borderTop:"1px solid var(--dv)",display:"flex",boxShadow:"0 -3px 16px rgba(102,57,36,0.07)"}}>
+      {[["home","🏠",t.home],["book","📅",t.book],["package","🎟",lang==="th"?"แพ็คเกจ":"Packages"],["coach","👤",lang==="th"?"เรียนโค้ช":"Coaching"],["cancel","🔍",t.myBookings]].map(([id,icon,label]) => (
+        <button key={id} onClick={() => setTab(id)} style={{flex:1,padding:"11px 0 8px",background:"none",border:"none",borderTop:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+          {id === "package" && promo.active ? (
+            <span style={{position:"relative",fontSize:19,lineHeight:"23px"}} data-testid="nav-fire">
+              <span className="nav-fire">🔥</span>
+              <span style={{position:"absolute",top:-5,left:"58%",background:"#E8420F",color:"#fff",fontSize:8,fontWeight:900,lineHeight:1,padding:"2px 4px",borderRadius:7,whiteSpace:"nowrap",boxShadow:"0 1px 4px rgba(0,0,0,.35)"}}>11.11</span>
+            </span>
+          ) : <span style={{fontSize:19}}>{icon}</span>}
+          <span style={{fontSize:10,fontWeight:tab===id || (id === "package" && promo.active) ? 700 : 400,color:id === "package" && promo.active && tab !== id ? "#E8420F" : undefined}}>{label}</span>
+        </button>
+      ))}
+    </nav>
+  );
+}
 
-        const ins = await sb(`coach_orders`, {
-          method: "POST", headers: { Prefer: "return=representation" },
-          body: JSON.stringify({
-            customer_id: who.phone, customer_name: who.name, line_user_id: who.userId,
-            audience: q.audience, type: q.type, sessions: q.sessions, people: q.people, price: q.total,
-            learner_note: note || null, status: "pending",
-          }),
-        });
-        const order = Array.isArray(ins.body) ? ins.body[0] : null;
-        if (!ins.ok || !order) { console.error("createCoachOrder insert failed:", ins.body); res.status(500).json({ error: "insert_failed" }); return; }
+// แถบลอยแจ้งว่ายังมีการจองที่รอชำระเงินค้างอยู่ (เผื่อเผลอกดแท็บอื่นออกมา) พร้อมปุ่มกลับไปหน้าชำระเงินทันที
+function PendingPaymentBanner({ createdAt, onResume, lang="th" }) {
+  const [secs, setSecs] = useState(() => Math.max(0, 300 - Math.floor((Date.now() - parseUtc(createdAt).getTime())/1000)));
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setSecs(Math.max(0, 300 - Math.floor((Date.now() - parseUtc(createdAt).getTime())/1000)));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [createdAt]);
+  const expired = secs <= 0;
+  const mm = String(Math.floor(secs/60)).padStart(2,"0");
+  const ss = String(secs%60).padStart(2,"0");
+  return (
+    <div onClick={onResume} style={{position:"fixed",top:0,left:0,right:0,zIndex:250,maxWidth:480,margin:"0 auto",background:expired?"#c0392b":"var(--or)",color:"#fff",padding:"9px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer",boxShadow:"0 3px 10px rgba(0,0,0,.15)"}}>
+      <span style={{fontSize:12.5,fontWeight:600}}>
+        {expired
+          ? (lang==="th" ? "⏰ มีการจองที่ค้างอยู่ (หมดเวลาแล้ว)" : "⏰ You have a pending booking (expired)")
+          : (lang==="th" ? `⏰ รอชำระเงินอยู่ — เหลือ ${mm}:${ss}` : `⏰ Payment pending — ${mm}:${ss} left`)}
+      </span>
+      <span style={{fontSize:12.5,fontWeight:700,textDecoration:"underline",whiteSpace:"nowrap",marginLeft:10}}>
+        {lang==="th" ? "กลับไปชำระเงิน →" : "Resume →"}
+      </span>
+    </div>
+  );
+}
 
-        // ส่งข้อความเข้า LINE OA ของลูกค้าทันที (ให้เกิดห้องแชทใน OA และแอดมินรู้ว่าลูกค้าคือใคร ทักกลับได้ แม้ลูกค้ายังไม่จ่ายเงิน)
-        const pushed = coachPushOn() ? await pushLine(who.userId, coachCreatedText(order)) : false;
-        if (pushed) await sb(`coach_orders?id=eq.${order.id}`, { method: "PATCH", body: JSON.stringify({ line_pushed: true }) });
-        await notifyTelegram(
-          `👤 <b>มีคำขอเรียนกับโค้ชใหม่ (ยังไม่ชำระ)</b>\n\n` +
-          `👤 ${esc(who.name)} (LINE)\n📞 ${who.phone}\n` +
-          `📚 ${esc(coachLabel(order))}\n💰 ฿${Number(order.price).toLocaleString()}\n` +
-          (note ? `📝 ผู้เรียน: ${esc(note)}\n` : "") +
-          (coachPushOn()
-            ? `💬 ส่งข้อความเข้า LINE OA ของลูกค้า: ${pushed ? "สำเร็จ ✅" : "ไม่สำเร็จ ❌ (ลูกค้าอาจบล็อก OA / โควตาหมด / ยังไม่ได้ตั้งค่า token) — กรุณาติดต่อลูกค้าเอง"}`
-            : `💬 รอลูกค้ากดปุ่ม "ทักไลน์ OA" เอง — ข้อความจะมีรหัส C-${order.id} (ถ้ายังไม่ทักมา ติดต่อที่เบอร์ ${who.phone})`)
+function Promo1111Countdown({ msLeft, lang = "th" }) {
+  const m = Math.floor(msLeft / 60000), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mi = m % 60;
+  const th = lang === "th";
+  const box = (v, label) => (
+    <div style={{minWidth:58,background:"rgba(0,0,0,.28)",border:"1px solid rgba(255,255,255,.22)",borderRadius:10,padding:"6px 4px 5px",textAlign:"center"}}>
+      <div style={{fontSize:22,fontWeight:900,lineHeight:1}}>{String(v).padStart(2, "0")}</div>
+      <div style={{fontSize:9.5,opacity:.85,marginTop:2}}>{label}</div>
+    </div>
+  );
+  return <div role="timer" data-testid="promo-countdown" style={{display:"flex",gap:8,justifyContent:"center"}}>{box(d, th ? "วัน" : "days")}{box(h, th ? "ชม." : "hrs")}{box(mi, th ? "นาที" : "min")}</div>;
+}
+
+// แบนเนอร์หน้าแรก 11.11 แบบ "ไฟลุก" — ชูราคาเฉลี่ยต่อครั้งที่ถูกที่สุด (฿400 จากแพ็ค DAY 11 ครั้ง) กดแล้วไปหน้าแพ็คเกจและเลื่อนลงไปที่รายการโปร / หายเองหลังปิดขาย
+// ใช้สไตล์ไฟที่มีอยู่แล้วในแอป (pkg-fire / pkg-flame / promo-price) ไม่เพิ่มแอนิเมชันใหม่ — เปลวไฟขยับด้วย transform ล้วนๆ จึงเบา
+function Promo1111Banner({ onClick, lang = "th", msLeft }) {
+  const th = lang === "th";
+  const day = PROMO_1111.items.find(i => i.code === "DAY-11"), all = PROMO_1111.items.find(i => i.code === "ALL-11");
+  const hook = promoAvg(day);                                                           // ฿400
+  const off = Math.round((1 - day.price / promoNormal(day)) * 100);                    // ถูกกว่าปกติ 18%
+  const flames = [[2, 40, 0], [15, 30, .3], [29, 46, .6], [45, 34, .15], [60, 48, .45], [75, 32, .75], [88, 42, .25]];
+  const pill = { display: "inline-block", borderRadius: 20, padding: "4px 12px", fontSize: 12.5, fontWeight: 800 };
+  return (
+    <div style={{padding:"14px 16px 0"}} data-testid="promo-banner">
+      <button onClick={onClick} className="pkg-fire" aria-label={th ? `โปร 11.11 เล่นเทนนิสเริ่มต้นเพียง ${hook} บาทต่อครั้ง กดเพื่อดูแพ็คเกจทั้งหมด` : `11.11 offer: tennis from just ${hook} baht per session. Tap to see all packages`}
+        style={{position:"relative",overflow:"hidden",width:"100%",border:"none",borderRadius:22,padding:"16px 14px 64px",cursor:"pointer",textAlign:"center",color:"#fff",fontFamily:"'Noto Sans Thai',sans-serif",
+          background:"radial-gradient(ellipse at 50% 108%,#FFE27A 0%,rgba(255,154,31,.95) 24%,rgba(232,66,15,0) 62%),linear-gradient(175deg,#3d0a02 0%,#8a1606 34%,#E8420F 78%,#FF9A1F 100%)"}}>
+        <span className="pkg-shine" />
+        {flames.map(([left, size, delay], i) => <span key={i} className="pkg-flame" aria-hidden="true" style={{bottom:-10,left:`${left}%`,fontSize:size,animationDelay:`${delay}s`}}>🔥</span>)}
+        <div style={{position:"relative"}}>
+          <span style={{...pill,background:"#FFD54A",color:"#5A2A00",letterSpacing:1.5}}>🔥 11.11 SPECIAL OFFER 🔥</span>
+          <p style={{fontSize:15,fontWeight:800,marginTop:10,textShadow:"0 2px 6px rgba(0,0,0,.45)"}}>{th ? "เล่นเทนนิส เริ่มต้นเพียง" : "Play tennis from just"}</p>
+          <div className="promo-price" style={{display:"flex",alignItems:"baseline",justifyContent:"center",gap:6,lineHeight:1}}>
+            <span style={{fontSize:92,fontWeight:900,lineHeight:.95,background:"linear-gradient(180deg,#FFF6C2 0%,#FFD54A 55%,#FF9A1F 100%)",WebkitBackgroundClip:"text",backgroundClip:"text",color:"transparent",filter:"drop-shadow(0 4px 0 #9E1B0A) drop-shadow(0 0 14px rgba(255,200,60,.8))"}} data-testid="promo-hook-price">฿{hook}</span>
+            <span style={{fontSize:24,fontWeight:900,color:"#FFE27A",textShadow:"0 2px 6px rgba(0,0,0,.5)"}}>{th ? "/ครั้ง*" : "/session*"}</span>
+          </div>
+          <p style={{marginTop:6,fontSize:13.5,fontWeight:800}}>
+            <span style={{textDecoration:"line-through",opacity:.8}}>{th ? "ปกติ" : "Regular"} ฿{promoNormal(day) / day.credits}</span>
+            <span style={{...pill,background:"#fff",color:"#B5200A",marginLeft:8,padding:"2px 10px"}}>{th ? `ถูกลง ${off}%` : `${off}% off`}</span>
+          </p>
+          <div style={{marginTop:10,display:"flex",flexDirection:"column",gap:6,alignItems:"center"}}>
+            <span style={{...pill,background:"rgba(0,0,0,.35)",border:"1px solid rgba(255,213,74,.55)"}}>☀️ DAY {day.credits} {th ? "ครั้ง" : "sessions"} <b style={{color:"#FFE27A"}}>฿{day.price.toLocaleString()}</b> <span style={{fontWeight:600}}>• {th ? "จ.–ศ. ก่อน 16:00" : "Mon–Fri before 16:00"}</span></span>
+            <span style={{...pill,background:"rgba(0,0,0,.35)",border:"1px solid rgba(255,255,255,.3)"}}>🕒 ALL TIME {all.credits} {th ? "ครั้ง" : "sessions"} <b style={{color:"#FFE27A"}}>฿{all.price.toLocaleString()}</b> <span style={{fontWeight:600}}>• {th ? "ใช้ได้ทุกเวลา" : "any time"} ฿{promoAvg(all)}/{th ? "ครั้ง" : "session"}</span></span>
+          </div>
+          <p style={{marginTop:10,fontSize:12,fontWeight:800}}>⏰ {th ? `ซื้อได้ถึง ${PROMO_1111.endTh}` : `Buy until ${PROMO_1111.endEn}`}</p>
+          <div style={{marginTop:6}}><Promo1111Countdown msLeft={msLeft} lang={lang} /></div>
+          <span className="promo-price" style={{display:"block",marginTop:12,background:"#fff",color:"#B5200A",fontWeight:900,fontSize:16,padding:"12px 8px",borderRadius:30,boxShadow:"0 6px 18px rgba(0,0,0,.4)"}}>🔥 {th ? "ดูแพ็คเกจ 11.11 ทั้ง 6 แบบ →" : "See all 6 packages →"}</span>
+          <p style={{marginTop:8,fontSize:10.5,opacity:.9,lineHeight:1.5,textShadow:"0 1px 3px rgba(0,0,0,.5)"}}>{th ? `* ฿${hook}/ครั้ง = แพ็ค DAY ${day.credits} ครั้ง (จ.–ศ. ก่อน 16:00) • 1 ครั้ง = 1 ชั่วโมง • ใช้ได้ ${all.days} วันนับจากวันเล่นครั้งแรก • ซื้อได้ไม่จำกัดจำนวน • แพ็คเล็กเริ่ม ฿${Math.min(...PROMO_1111.items.map(i => i.price)).toLocaleString()}` : `* ฿${hook}/session = DAY pack of ${day.credits} (Mon–Fri before 16:00) • 1 session = 1 hour • valid ${all.days} days from your first play date • buy as many as you like`}</p>
+        </div>
+      </button>
+    </div>
+  );
+}
+
+// ส่วนเลือกซื้อโปร 11.11 ในหน้าแพ็คเกจ (แทนรายการแพ็คเกจปกติระหว่างโปร)
+function Promo1111Section({ lang = "th", selected, onSelect, msLeft }) {
+  const th = lang === "th";
+  const groups = [
+    { id: "all", title: th ? "⏱ ALL TIME — ใช้ได้ทุกเวลา" : "⏱ ALL TIME — any time", sub: th ? "เทียบค่าสนาม Peak ฿590/ชม." : "vs. Peak ฿590/hr", color: "#B84F00" },
+    { id: "day", title: th ? "☀️ DAY — จันทร์–ศุกร์ ก่อน 16:00" : "☀️ DAY — Mon–Fri before 16:00", sub: th ? "เทียบค่าสนาม Off Peak ฿490/ชม." : "vs. Off Peak ฿490/hr", color: "#2d5f8a" },
+  ];
+  return (
+    <section id="promo-1111" data-testid="promo-section" style={{scrollMarginTop:96}}>
+      <div style={{background:"linear-gradient(165deg,#7a4529,#4a2a1a)",color:"#fff",borderRadius:16,padding:"14px 14px 12px",marginBottom:14,textAlign:"center",boxShadow:"0 6px 18px rgba(102,57,36,.35)"}}>
+        <p style={{fontSize:12,fontWeight:800,letterSpacing:2.5,color:"#FAA05A"}}>11.11 SPECIAL OFFER</p>
+        <p style={{fontSize:15,fontWeight:800,marginTop:3}}>⏰ {th ? `ซื้อได้ถึง ${PROMO_1111.endTh}` : `Buy until ${PROMO_1111.endEn}`}</p>
+        <div style={{marginTop:8}}><Promo1111Countdown msLeft={msLeft} lang={lang} /></div>
+      </div>
+      {groups.map(g => (
+        <div key={g.id} style={{marginBottom:16}}>
+          <p style={{fontSize:14,fontWeight:800,color:g.color}}>{g.title}</p>
+          <p style={{fontSize:11.5,color:"var(--mu)",marginBottom:8}}>{g.sub}</p>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {PROMO_1111.items.filter(i => i.group === g.id).sort((a, b) => b.credits - a.credits).map(it => { // เรียงจากแพ็คใหญ่สุดไว้บนสุด: 11 → 6 → 3 ครั้ง
+              const sel = selected?.promo === it.code, save = promoNormal(it) - it.price, best = it.credits === 11;
+              return (
+                <button key={it.code} onClick={() => onSelect({ promo: it.code, tier: it.tier, credits: it.credits, price: it.price, days: it.days, name: it.name })} aria-pressed={sel} data-testid={`promo-${it.code}`}
+                  style={{position:"relative",textAlign:"left",padding:"12px 14px",borderRadius:12,border:`2px solid ${sel ? "var(--or)" : best ? g.color : "var(--dv)"}`,background:sel ? "var(--or-bg)" : "#fff",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                  {best && <span style={{position:"absolute",top:-9,left:12,background:g.color,color:"#fff",fontSize:10.5,fontWeight:900,padding:"2px 9px",borderRadius:10,letterSpacing:.6}}>{th ? "คุ้มที่สุด" : "BEST VALUE"}</span>}
+                  <span>
+                    <span style={{display:"block",fontSize:15,fontWeight:800,color:"var(--br)"}}>{it.credits} {th ? "ครั้ง" : "sessions"} <span style={{fontSize:12,fontWeight:700,color:"var(--mu)"}}>• {it.name}</span></span>
+                    <span style={{display:"block",fontSize:12,color:"var(--tx)",marginTop:3}}>{th ? "เฉลี่ย" : "avg."} <b>฿{promoAvg(it)}</b>/{th ? "ครั้ง" : "session"} • {th ? `ใช้ได้ ${it.days} วัน` : `valid ${it.days} days`}</span>
+                  </span>
+                  <span style={{textAlign:"right",flexShrink:0}}>
+                    <span style={{display:"block",fontSize:11,color:"var(--mu)",textDecoration:"line-through"}}>฿{promoNormal(it).toLocaleString()}</span>
+                    <span style={{display:"block",fontSize:20,fontWeight:900,color:sel ? "var(--or)" : "var(--br)",lineHeight:1.1}}>฿{it.price.toLocaleString()}</span>
+                    <span style={{display:"block",fontSize:10.5,fontWeight:800,color:"#2d7a4f"}}>{th ? "ประหยัด" : "save"} ฿{save.toLocaleString()}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+      <div style={{background:"var(--bl-bg)",border:"1px solid rgba(141,182,199,.4)",borderRadius:12,padding:"12px 14px"}}>
+        <p style={{fontSize:12.5,fontWeight:800,color:"var(--br)",marginBottom:6}}>{th ? "📌 เงื่อนไขโปร 11.11" : "📌 11.11 terms"}</p>
+        {(th ? [
+          "1 ครั้ง = 1 ชั่วโมง (จอง 2 ชั่วโมง ตัด 2 ครั้ง)",
+          `อายุแพ็คเกจเริ่มนับจาก "วันเล่นครั้งแรก" ที่จองด้วยแพ็คเกจ (วันนั้นนับเป็นวันที่ 1) — 11 ครั้ง ใช้ได้ 111 วัน`,
+          "ซื้อได้ไม่จำกัดจำนวนแพ็คเกจต่อบัญชี • ไม่ใช้ร่วมกับโค้ดส่วนลด • ไม่คืนเงิน",
+          "แพ็ค DAY จองได้เฉพาะ จันทร์–ศุกร์ ที่เริ่มก่อน 16:00",
+          "แพ็คเกจปกติ (2 / 5 / 10 ครั้ง) กลับมาให้ซื้อหลังจบโปร",
+        ] : [
+          "1 session = 1 hour (a 2-hour booking uses 2 sessions)",
+          `Validity starts on the first play date booked with the package (that day counts as day 1) — 11 sessions: 111 days`,
+          "Buy as many packages as you like • cannot be combined with discount codes • non-refundable",
+          "DAY packages: Mon–Fri bookings starting before 16:00 only",
+          "Regular packages (2 / 5 / 10 sessions) return after the promo ends",
+        ]).map((x, i) => <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:3}}><span style={{fontSize:11.5,fontWeight:800,color:"var(--br)",flexShrink:0}}>{i + 1}.</span><p style={{fontSize:12,color:"var(--tx)",lineHeight:1.6}}>{x}</p></div>)}
+      </div>
+    </section>
+  );
+}
+
+function HomePage({ goBook, goPackage, goCoach, lang="th" }) {
+  const promo = usePromo1111();
+  const t = T[lang];
+  const now = new Date();
+  const inPromo = now <= PROMO_END;
+  const promoSampleWeekday = new Date(2026, 8, 2);
+  const normalSampleWeekday = new Date(now);
+  while (normalSampleWeekday.getDay() === 0 || normalSampleWeekday.getDay() === 6) normalSampleWeekday.setDate(normalSampleWeekday.getDate()+1);
+  const priceSampleDate = inPromo ? promoSampleWeekday : normalSampleWeekday;
+  const offPeak = getSlotPrice(10, priceSampleDate);
+  const peak = getSlotPrice(18, priceSampleDate);
+
+  // เงื่อนไขการจองอย่างเป็นทางการของร้าน (แสดงเป็นข้อ 1–7)
+  const termsTitle = lang==="th" ? "เงื่อนไขการจองคอร์ท NOVA Tennis" : "NOVA Tennis Court Booking Conditions";
+  const termsItems = lang==="th" ? [
+    "ทางห้องซ้อมขออนุญาติสงวนสิทธิ์การเลื่อนจองทุกกรณี",
+    "กรณีไม่สะดวกมาใช้บริการ ทางสนามขอสงวนสิทธิ์ ไม่คืนค่าบริการทุกกรณี",
+    "กรุณามาถึงสนามก่อนเวลาใช้งานอย่างน้อย 10 นาที",
+    "ห้องซ้อมเป็นระบบไร้พนักงาน เมื่อถึงเวลาที่จองไว้สามารถเข้าใช้บริการได้เลย หากถึงก่อนเวลาสามารถนั่งรอที่โซฟาได้เลยค่ะ",
+    "สามารถดูวิธีการใช้เครื่องได้ที่ Manual ใน Line OA หรือภายในห้องซ้อม",
+    "กรุณาตรวจสอบทรัพย์สินของท่านก่อนออกจากห้องซ้อม",
+    "หากเกิดความเสียหายจากการใช้งานที่ไม่เหมาะสม ผู้ใช้บริการจะต้องรับผิดชอบค่าเสียหายตามมูลค่าความเสียหายที่เกิดขึ้นจริง",
+  ] : [
+    "The studio reserves the right not to reschedule bookings under any circumstances.",
+    "If you are unable to attend, the studio reserves the right not to refund the service fee under any circumstances.",
+    "Please arrive at least 10 minutes before your booking time.",
+    "This is a staff-free (self-service) practice room. You may enter as soon as your booked time begins. If you arrive early, you are welcome to wait on the sofa.",
+    "Instructions for using the machine are available in the Manual on our LINE OA or inside the practice room.",
+    "Please check your belongings before leaving the practice room.",
+    "If damage occurs from improper use, the user is responsible for the actual cost of the damage.",
+  ];
+  const termsFooter = lang==="th" ? "กรุณาปฏิบัติตามกฎและระเบียบของห้องซ้อมอย่างเคร่งครัด" : "Please strictly follow the rules and regulations of the practice room.";
+  const termsAccept = lang==="th"
+    ? "การกดยืนยันการจอง ถือว่าท่านรับทราบและยอมรับเงื่อนไขการใช้บริการทั้งหมดเรียบร้อยแล้ว"
+    : "By confirming your booking, you acknowledge and accept all of the terms of service.";
+  // ข้อมูลการจองออนไลน์ (ของเดิม เก็บไว้เป็นหมายเหตุเล็กๆ)
+  const bookingConditionItems = lang==="th"
+    ? ["จองล่วงหน้าได้สูงสุด 1 เดือน", "ชำระเงินภายใน 5 นาทีหลังยืนยัน", "เลือกระยะเวลาเล่นได้ 30 / 60 / 90 / 120 นาที"]
+    : ["Book up to 1 month in advance", "Pay within 5 minutes after confirming", "Choose 30 / 60 / 90 / 120 minute sessions"];
+
+  const ruleItems = lang==="th" ? [
+    { icon:"⏰", text:"โปรดตรงต่อเวลา และเก็บลูกเทนนิสให้เรียบร้อยก่อนหมดเวลาการจองของท่านและออกจากห้องตรงเวลา เพื่อให้ลูกค้าในชั่วโมงถัดไปเข้ามาใช้บริการได้ทันที" },
+    { icon:"👟", text:"กรุณาสวมรองเท้าเทนนิส รองเท้าวิ่งหรือรองเท้ายิมเท่านั้น ไม่อนุญาตรองเท้าแตะและรองเท้าที่ทำให้คอร์ตเสียหาย โปรดดูแลพื้นรองเท้าให้สะอาดก่อนเข้าใช้บริการ" },
+    { icon:"🎾", text:"งดใช้กริ๊ปเสื่อมสภาพ เพื่อป้องกันเศษยางและคราบกาวร่วงติดพื้นสนาม" },
+    { icon:"🚭", text:"งดสูบบุหรี่ และบุหรี่ไฟฟ้าทุกชนิด" },
+    { icon:"🐾", text:"งดนำสัตว์เลี้ยงเข้ามาใช้บริการ" },
+    { icon:"🍽️", text:"งดนำอาหารเข้ามาทานในคอร์ต (อนุญาตเฉพาะน้ำดื่มและเครื่องดื่มเท่านั้น)" },
+    { icon:"👥", text:"เข้าใช้สนามได้สูงสุด 4 คน ต่อห้องเท่านั้น" },
+  ] : [
+    { icon:"⏰", text:"Please be punctual. Clear the court of all balls before your session ends and leave the room on time so the next customer can enter immediately." },
+    { icon:"👟", text:"Please wear tennis, running, or gym shoes only. Sandals and shoes that may damage the court are not allowed. Please make sure your soles are clean before entering." },
+    { icon:"🎾", text:"No deteriorated overgrip — prevent rubber debris and stains on the court." },
+    { icon:"🚭", text:"No smoking or vaping allowed." },
+    { icon:"🐾", text:"No pets allowed." },
+    { icon:"🍽️", text:"No food allowed on the court. Water and beverages only." },
+    { icon:"👥", text:"A maximum of 4 people per room." },
+  ];
+
+  return (
+    <div style={{paddingBottom:90}}>
+      <div style={{background:"linear-gradient(160deg,#fff 0%,var(--cr) 55%,var(--cr2) 100%)",padding:"36px 24px 0",textAlign:"center"}}>
+        <NovaLogo width={180} />
+        <p style={{color:"var(--mu)",fontSize:13.5,margin:"8px 0 16px"}}>{lang==="th"?"สนามออโต้เทนนิสในร่ม • ระบบปรับอากาศ • พร้อมรองรับทุกระดับ":"Indoor auto Tennis • Air Conditioned • All Levels Welcome"}</p>
+        <img src="/court-photo.png" alt="NOVA Tennis Court" style={{width:"100%",maxWidth:520,borderRadius:16,boxShadow:"0 8px 30px rgba(102,57,36,.18)",display:"block",margin:"0 auto"}} />
+        <div style={{height:16}} />
+      </div>
+
+      <div style={{padding:"18px 16px 0"}}>
+        {inPromo && (
+          <div style={{position:"relative",borderRadius:18,padding:"22px 20px",marginBottom:14,background:"linear-gradient(135deg,#663924 0%,#8a4a2a 55%,#F47E1F 130%)",boxShadow:"0 10px 34px rgba(102,57,36,.35)",overflow:"hidden",color:"#fff"}}>
+            <div style={{position:"absolute",top:-30,right:-30,width:120,height:120,borderRadius:"50%",background:"rgba(255,255,255,.08)"}} />
+            <div style={{position:"absolute",bottom:-40,left:-20,width:140,height:140,borderRadius:"50%",background:"rgba(255,255,255,.06)"}} />
+            <div style={{display:"inline-flex",alignItems:"center",gap:6,background:"rgba(255,255,255,.18)",borderRadius:20,padding:"5px 12px",marginBottom:12}}>
+              <span style={{fontSize:13}}>🔥</span>
+              <span style={{fontSize:11.5,fontWeight:700,letterSpacing:.3}}>{lang==="th"?"โปรโมชั่นเปิดตัว · เดือนแรก":"Launch Promo · First Month"}</span>
+            </div>
+            <p style={{lineHeight:1.15,marginBottom:6}}>
+              <span className="bb" style={{fontSize:30,letterSpacing:.3}}>Promotion Soft Opening</span>
+              {lang==="th" && <span style={{fontSize:22,fontWeight:700,fontFamily:"'Noto Sans Thai',sans-serif",marginLeft:8}}>ราคาพิเศษ</span>}
+              {lang!=="th" && <span className="bb" style={{fontSize:30,letterSpacing:.3}}> — Special Price</span>}
+            </p>
+            <p style={{fontSize:12.5,opacity:.85,marginBottom:16}}>{lang==="th"?"Soft Opening · 1 ก.ย. 2569 – 30 ก.ย. 2569 เท่านั้น":"Soft Opening · 1 Sep 2026 – 30 Sep 2026 only"}</p>
+            <div style={{display:"flex",gap:10}}>
+              <div style={{flex:1,background:"rgba(255,255,255,.14)",borderRadius:12,padding:"12px 10px",textAlign:"center"}}>
+                <p style={{fontSize:10.5,opacity:.8,marginBottom:4}}>Off Peak</p>
+                <p style={{fontSize:12,opacity:.65,textDecoration:"line-through"}}>฿490</p>
+                <p className="bb" style={{fontSize:26,lineHeight:1}}>฿450</p>
+              </div>
+              <div style={{flex:1,background:"rgba(255,255,255,.14)",borderRadius:12,padding:"12px 10px",textAlign:"center"}}>
+                <p style={{fontSize:10.5,opacity:.8,marginBottom:4}}>Peak</p>
+                <p style={{fontSize:12,opacity:.65,textDecoration:"line-through"}}>฿590</p>
+                <p className="bb" style={{fontSize:26,lineHeight:1}}>฿490</p>
+              </div>
+            </div>
+            <p style={{fontSize:10.5,opacity:.7,marginTop:10}}>{lang==="th"?"ราคาต่อ 60 นาที — เลือกระยะเวลาอื่นได้ในหน้าจอง":"Price per 60 min — other durations available when booking"}</p>
+          </div>
+        )}
+        <button className="btn-primary" onClick={goBook}>{t.bookNow}</button>
+      </div>
+
+      {/* โปรจองครั้งแรก (ถาวร ไม่มีวันหมดอายุ) + แพ็คเกจ: ปกติวางคู่กัน / ช่วงโปร 11.11 แบนเนอร์ไฟอยู่บนสุด แล้วตามด้วยแถบโปรจองครั้งแรก */}
+      {(() => {
+        const th = lang === "th";
+        const pill = (bg, color) => ({ display:"inline-block", alignSelf:"flex-start", background:bg, color, borderRadius:20, padding:"3px 10px", fontSize:11, fontWeight:800 });
+        const cardBase = { position:"relative", overflow:"hidden", width:"100%", minHeight:232, padding:"14px 13px 13px", borderRadius:"var(--r)", border:"none", cursor:"pointer", textAlign:"left", color:"#fff", display:"flex", flexDirection:"column", justifyContent:"space-between", gap:6 };
+        const cta = (color) => ({ display:"block", textAlign:"center", background:"#fff", color, fontWeight:800, fontSize:14, padding:"9px 6px", borderRadius:22, boxShadow:"0 3px 10px rgba(0,0,0,.22)" });
+        const note = (
+          <p data-testid="first-time-note" style={{fontSize:10.5,color:"var(--mu)",marginTop:8,lineHeight:1.5}}>
+            {th ? "* โปรจองครั้งแรก: ลูกค้าใหม่ • จอง 60 นาที • 1 สนาม • 1 สิทธิ์ต่อ 1 คน • ไม่ร่วมกับโค้ดส่วนลดหรือแพ็คเกจ" : "* First-booking offer: new customers • 60 min • 1 court • one per customer • cannot combine with discount codes or packages"}
+          </p>
         );
-        res.status(200).json({ order: publicCoachOrder({ ...order, line_pushed: pushed }), linePushed: pushed, pushEnabled: coachPushOn() });
-        return;
-      }
-
-      case "updateCoachSlip": {
-        const { orderId, slipUrl } = p;
-        if (!orderId || !slipUrl) { res.status(400).json({ error: "missing params" }); return; }
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        if (!isOwnSlipUrl(slipUrl, `coach_${orderId}`)) { res.status(400).json({ error: "invalid_slip_url" }); return; }
-        const { ok, body } = await sb(`coach_orders?id=eq.${encodeURIComponent(orderId)}&customer_id=eq.${who.phone}&status=in.(pending,reviewing)`, {
-          method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
-        });
-        const row = Array.isArray(body) ? body[0] : null;
-        if (!ok || !row) { res.status(409).json({ error: "update_failed" }); return; }
-        const sentAt = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().substr(11, 5);
-        await notifyTelegram(
-          `🔔 <b>มีลูกค้าส่งสลิปคอร์สเรียนกับโค้ช</b>\n\n` +
-          `📚 ${esc(coachLabel(row))}\n💰 ฿${Number(row.price).toLocaleString()}\n` +
-          `👤 ${esc(row.customer_name || "-")}\n📞 ${row.customer_id}\n` +
-          (row.learner_note ? `📝 ผู้เรียน: ${esc(row.learner_note)}\n` : "") +
-          `🕓 ส่งสลิปเมื่อเวลา: ${sentAt} น. (ไทย)\n\nกรุณาตรวจสอบและกดยืนยันที่แท็บ "👤 โค้ช" ใน Admin Dashboard แล้วนัดวัน-เวลากับลูกค้าทาง LINE OA`
+        if (promo.active) return (
+          <>
+            <Promo1111Banner onClick={() => { window.__promoScroll = true; goPackage(); }} lang={lang} msLeft={promo.msLeft} />
+            <div style={{padding:"10px 16px 0"}}>
+              <button onClick={goBook} data-testid="first-time-strip" style={{position:"relative",overflow:"hidden",display:"block",width:"100%",border:"none",borderRadius:"var(--r)",padding:"13px 14px",cursor:"pointer",textAlign:"left",color:"#fff",background:"linear-gradient(160deg,#1E4E66 0%,#2F7A94 60%,#4BA3B8 100%)",boxShadow:"0 6px 20px rgba(47,122,148,.4)",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                <span className="promo-spark" style={{top:8,right:84,fontSize:15}}>✨</span>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                  <span className="promo-tag" style={pill("#FFD54A","#5A3A00")}>🎁 {th ? "ลูกค้าใหม่ • จองครั้งแรก" : "NEW CUSTOMER • FIRST BOOKING"}</span>
+                  <span style={{...cta("#1E4E66"),padding:"6px 14px",fontSize:13,whiteSpace:"nowrap"}}>{th ? "จองเลย →" : "Book →"}</span>
+                </div>
+                <div style={{display:"flex",gap:10,marginTop:10}}>
+                  {[[FIRST_TIME_PROMO.weekday, th ? "จันทร์–ศุกร์" : "Mon–Fri"], [FIRST_TIME_PROMO.weekend, th ? "เสาร์–อาทิตย์" : "Sat–Sun"]].map(([price, label]) => (
+                    <div key={label} style={{flex:1,background:"rgba(255,255,255,.15)",borderRadius:12,padding:"7px 10px"}}>
+                      <p style={{fontSize:11.5,fontWeight:700}}>{label}</p>
+                      <p style={{fontSize:30,fontWeight:900,color:"#FFD54A",lineHeight:1.05,textShadow:"0 2px 8px rgba(0,0,0,.3)"}}>฿{price}<span style={{fontSize:12,fontWeight:700,color:"#fff"}}>/{th ? "ชม." : "hr"}</span></p>
+                    </div>
+                  ))}
+                </div>
+                <p style={{fontSize:11,fontWeight:700,opacity:.95,marginTop:8}}>{th ? "จอง 60 นาที • 1 สนาม • 1 สิทธิ์ต่อ 1 คน" : "60 min • 1 court • one per customer"}</p>
+              </button>
+              {note}
+            </div>
+          </>
         );
-        res.status(200).json({ order: publicCoachOrder(row) });
-        return;
-      }
+        return (
+          <div style={{padding:"14px 16px 0"}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,alignItems:"stretch"}}>
+                <button onClick={goBook} style={{...cardBase,background:"linear-gradient(160deg,#1E4E66 0%,#2F7A94 60%,#4BA3B8 100%)",boxShadow:"0 6px 20px rgba(47,122,148,.4)"}}>
+                  <span className="promo-spark" style={{top:8,right:10,fontSize:18}}>✨</span>
+                  <span className="promo-spark" style={{top:46,right:30,fontSize:12,animationDelay:".7s"}}>✨</span>
+                  <span className="promo-tag" style={pill("#FFD54A","#5A3A00")}>🎁 {th?"ลูกค้าใหม่":"NEW CUSTOMER"}</span>
+                  <div>
+                    <p style={{fontSize:17,fontWeight:800,lineHeight:1.2}}>{th?"จองครั้งแรก":"First booking"}</p>
+                    <p className="promo-price" style={{fontSize:40,fontWeight:900,lineHeight:1.05,color:"#FFD54A",marginTop:4,textShadow:"0 2px 8px rgba(0,0,0,.3)"}}>฿{FIRST_TIME_PROMO.weekday}<span style={{fontSize:13,fontWeight:700,color:"#fff"}}>/{th?"ชม.":"hr"}</span></p>
+                    <p style={{fontSize:12.5,fontWeight:700,marginTop:1}}>{th?"จันทร์–ศุกร์":"Mon–Fri"}</p>
+                    <p style={{fontSize:13,fontWeight:800,marginTop:6,background:"rgba(255,255,255,.2)",borderRadius:10,padding:"4px 8px",display:"inline-block"}}>฿{FIRST_TIME_PROMO.weekend} {th?"เสาร์–อาทิตย์":"Sat–Sun"}</p>
+                    <p style={{fontSize:11.5,fontWeight:700,marginTop:7,opacity:.95}}>{th?"60 นาที • 1 สิทธิ์ต่อ 1 คน":"60 min • one per customer"}</p>
+                  </div>
+                  <span style={cta("#1E4E66")}>{th?"จองเลย →":"Book now →"}</span>
+                </button>
 
-      case "cancelCoachOrder": {
-        // ลูกค้ายกเลิกได้เฉพาะคำสั่งซื้อที่ "ยังไม่ชำระ" ของตัวเอง
-        const { orderId } = p;
-        if (!orderId) { res.status(400).json({ error: "missing orderId" }); return; }
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        const { ok, body } = await sb(`coach_orders?id=eq.${encodeURIComponent(orderId)}&customer_id=eq.${who.phone}&status=eq.pending`, {
-          method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ status: "cancelled" }),
-        });
-        const row = Array.isArray(body) ? body[0] : null;
-        if (ok && row) await notifyTelegram(`❌ <b>ลูกค้ายกเลิกคำสั่งซื้อคอร์สโค้ช (ยังไม่ชำระ)</b>\n\n📚 ${esc(coachLabel(row))}\n👤 ${esc(row.customer_name || "-")}\n📞 ${row.customer_id}`);
-        res.status(200).json({ ok: !!(ok && row) });
-        return;
-      }
-
-      case "myCoachOrders": {
-        const who = await getLinkedCustomer(p.session);
-        if (who.error === "phone_not_linked") { res.status(200).json({ orders: [] }); return; }
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        const { body } = await sb(`coach_orders?customer_id=eq.${who.phone}&status=neq.cancelled&select=*&order=created_time.desc&limit=30`);
-        res.status(200).json({ orders: (Array.isArray(body) ? body : []).map(publicCoachOrder) });
-        return;
-      }
-
-      case "checkAvailability": {
-        const { date, courtId } = p;
-        if (!date || !courtId) { res.status(400).json({ error: "missing params" }); return; }
-        const { body } = await sb(
-          `bookings?booking_date=eq.${date}&court_id=eq.${courtId}&status=neq.cancelled&select=hour,start_minute,duration_minutes,status,created_time`
+              <button onClick={goPackage} className="pkg-fire" style={{...cardBase,background:"linear-gradient(160deg,#9E1B0A 0%,#E8420F 55%,#FF9A1F 100%)"}}>
+                <span className="pkg-shine" />
+                <span className="pkg-flame" style={{top:6,right:8,fontSize:26}}>🔥</span>
+                <span className="pkg-flame" style={{top:40,right:30,fontSize:16,animationDelay:".5s"}}>🔥</span>
+                <span style={{...pill("rgba(255,255,255,.22)","#fff"),border:"1px solid rgba(255,255,255,.5)",position:"relative"}}>🔥 {th?"แพ็คเกจ":"PACKAGES"}</span>
+                <div style={{position:"relative"}}>
+                  <p style={{fontSize:17,fontWeight:800,lineHeight:1.2}}>{th?"ซื้อล่วงหน้า คุ้มกว่า":"Pre-pay, save more"}</p>
+                  <p style={{fontSize:12.5,fontWeight:700,marginTop:6}}>{th?"ประหยัดสูงสุด":"Save up to"}</p>
+                  <p style={{fontSize:40,fontWeight:900,lineHeight:1.05,color:"#FFE27A",textShadow:"0 2px 8px rgba(0,0,0,.3)"}}>฿900</p>
+                  <p style={{fontSize:13,fontWeight:800,marginTop:6,background:"rgba(255,255,255,.2)",borderRadius:10,padding:"4px 8px",display:"inline-block"}}>{th?"10 ครั้ง เริ่ม ฿460/ชม.":"10 sessions from ฿460/hr"}</p>
+                  <p style={{fontSize:11.5,fontWeight:700,marginTop:7,opacity:.95}}>{th?"แพ็ค 2 • 5 • 10 ครั้ง":"2 • 5 • 10 sessions"}</p>
+                </div>
+                <span style={{...cta("#C2330C"),position:"relative"}}>{th?"ดูแพ็คเกจ →":"View packages →"}</span>
+              </button>
+            </div>
+            {note}
+          </div>
         );
-        res.status(200).json({ bookings: body || [] });
-        return;
-      }
+      })()}
 
-      case "getBooking": {
-        const { id } = p;
-        if (!id) { res.status(400).json({ error: "missing id" }); return; }
-        const who = await getLinkedCustomer(p.session); // ดูได้เฉพาะการจองของตัวเอง (บัญชี LINE ที่ผูกเบอร์นั้น)
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        const { body } = await sb(`bookings?id=eq.${encodeURIComponent(id)}&customer_id=eq.${who.phone}&select=*`);
-        const booking = (Array.isArray(body) ? body[0] : null) || null;
-        let group = null;
-        if (booking?.group_id) {
-          const { body: gRows } = await sb(`bookings?group_id=eq.${encodeURIComponent(booking.group_id)}&select=*&order=court_id.asc`);
-          group = gRows || null;
-        }
-        res.status(200).json({ booking, group });
-        return;
-      }
+      {goCoach && (
+        <div style={{padding:"10px 16px 0"}}>
+          <button onClick={goCoach} style={{width:"100%",display:"flex",alignItems:"center",gap:12,textAlign:"left",padding:"13px 16px",borderRadius:"var(--r)",border:"none",cursor:"pointer",color:"#fff",background:"linear-gradient(100deg,#663924 0%,#8a5433 100%)",boxShadow:"0 4px 16px rgba(102,57,36,.3)",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            <span style={{fontSize:30}}>👤</span>
+            <span style={{flex:1}}>
+              <span style={{display:"block",fontWeight:800,fontSize:15}}>{lang==="th" ? "เรียนกับโค้ช — สนาม + โค้ช + อุปกรณ์" : "Train with a coach — court + coach + equipment"}</span>
+              <span style={{display:"block",fontSize:11.5,opacity:.9,marginTop:2}}>{lang==="th" ? "ผู้ใหญ่ & เด็ก • Private / Duo • แพ็ค 5–10 ครั้งคุ้มกว่า" : "Adults & kids • Private / Duo • 5–10 session packages save more"}</span>
+            </span>
+            <span style={{fontSize:18,fontWeight:800}}>→</span>
+          </button>
+        </div>
+      )}
 
-      case "myBookings": {
-        const { phone } = p;
-        if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
-        const me = await getSessionUser(p.session);
-        if (me.error) { res.status(403).json({ error: me.error }); return; }
-        if (!me.phone) { res.status(200).json({ bookings: [] }); return; } // ยังไม่ผูกเบอร์ = ยังไม่มีการจองของตัวเอง
-        if (me.phone !== phone) { res.status(403).json({ error: "not_owner" }); return; } // ดูได้เฉพาะเบอร์ที่ผูกกับบัญชี LINE ของตัวเอง
-        const { body } = await sb(`bookings?customer_id=eq.${phone}&select=*&order=booking_date.desc`);
-        res.status(200).json({ bookings: body || [] });
-        return;
-      }
+      <div style={{padding:"18px 16px 0",display:"flex",flexDirection:"column",gap:14}}>
 
-      case "checkDiscount": {
-        const me = await getSessionUser(p.session);
-        if (me.error) { res.status(403).json({ error: me.error }); return; }
-        const { code } = p;
-        if (!code) { res.status(200).json({ valid: false }); return; }
-        const { body } = await sb(`discount_codes?code=eq.${encodeURIComponent(String(code).trim().toUpperCase())}&select=*`);
-        const d = (body || [])[0];
-        if (!d || !d.active) { res.status(200).json({ valid: false, reason: "invalid" }); return; }
-        if (isDiscountExpired(d)) { res.status(200).json({ valid: false, reason: "expired", expires_at: d.expires_at }); return; }
-        if (d.used_count >= d.max_uses) { res.status(200).json({ valid: false, reason: "used" }); return; }
-        res.status(200).json({
-          valid: true, id: d.id, code: d.code,
-          discount_amount: d.discount_amount, discount_percent: d.discount_percent, expires_at: d.expires_at || null,
-        });
-        return;
-      }
+        <div className="card">
+          <div className="card-header"><p>{t.priceTitle}{lang==="th"?" (60 นาที)":" (60 min)"}</p></div>
+          {inPromo && (
+            <div style={{padding:"10px 18px",background:"var(--or-bg)",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
+              <span style={{fontSize:14}}>🔥</span>
+              <p style={{fontSize:12,color:"var(--br)",fontWeight:600}}>
+                {lang==="th" ? "โปรโมชั่น Soft Opening 1 เดือน · 1 ก.ย. 2569 – 30 ก.ย. 2569" : "Soft Opening Promo (1 Month) · 1 Sep 2026 – 30 Sep 2026"}
+              </p>
+            </div>
+          )}
+          <div style={{display:"flex",padding:"16px 18px",gap:12}}>
+            <div style={{flex:1,textAlign:"center"}}>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>Off Peak</p>
+              {inPromo && <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿490</p>}
+              <p style={{fontSize:28,fontWeight:800,color:"var(--or)",lineHeight:1}}>฿{offPeak.price}</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>{lang==="th"?"จ.-ศ. 06:00–15:00":"Mon-Fri 06:00–15:00"}</p>
+            </div>
+            <div style={{width:1,background:"var(--dv)"}} />
+            <div style={{flex:1,textAlign:"center"}}>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginBottom:5}}>Peak</p>
+              {inPromo && <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿590</p>}
+              <p style={{fontSize:28,fontWeight:800,color:"var(--bl)",lineHeight:1}}>฿{peak.price}</p>
+              <p style={{fontSize:10.5,color:"var(--mu)",marginTop:5}}>{lang==="th"?"จ.-ศ. 16:00–22:00 / ส.-อา. ทั้งวัน":"Mon-Fri 16:00–22:00 / Sat-Sun all day"}</p>
+            </div>
+          </div>
+        </div>
 
-      case "createBooking": {
-        const { courtId, bookingDate, hour, startMinute, durationMinutes, discountCodeId, packageId } = p;
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        const customerId = who.phone; // เบอร์ที่ผูกกับบัญชี LINE เท่านั้น
-        const customerName = who.name; // ชื่อจากบัญชี LINE เท่านั้น
-        if (!courtId || !customerName || !bookingDate || hour == null || !durationMinutes) {
-          res.status(400).json({ error: "missing params" }); return;
-        }
-        if (!/^[0-9]{10}$/.test(customerId)) { res.status(400).json({ error: "invalid phone" }); return; }
-        if (String(customerName).trim().length < 1) {
-          res.status(400).json({ error: "invalid name" }); return;
-        }
+        <div className="card">
+          <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:17}}>📋</span>
+            <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{t.bookingCondition}</span>
+          </div>
+          <div style={{padding:"14px 18px",display:"flex",flexDirection:"column",gap:12}}>
+            <p style={{fontSize:14,fontWeight:700,color:"var(--br)"}}>{termsTitle}</p>
+            {termsItems.map((txt,i) => (
+              <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+                <div style={{width:22,height:22,borderRadius:"50%",flexShrink:0,background:"var(--or-bg)",color:"var(--or)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800}}>{i+1}</div>
+                <p style={{fontSize:13.5,color:"var(--tx)",lineHeight:1.6}}>{txt}</p>
+              </div>
+            ))}
+            <p style={{fontSize:13,color:"var(--mu)",lineHeight:1.6,marginTop:2}}>{termsFooter}</p>
+            <div style={{background:"var(--or-bg)",border:"1px solid rgba(244,126,31,.25)",borderRadius:10,padding:"10px 12px"}}>
+              <p style={{fontSize:13,fontWeight:700,color:"var(--br)",lineHeight:1.6}}>{termsAccept}</p>
+            </div>
+            <div style={{borderTop:"1px solid var(--dv)",paddingTop:10,display:"flex",flexDirection:"column",gap:4}}>
+              {bookingConditionItems.map((txt,i) => (
+                <p key={i} style={{fontSize:12,color:"var(--mu)",lineHeight:1.5}}>• {txt}</p>
+              ))}
+            </div>
+          </div>
+        </div>
 
-        const startMin = hour * 60 + (startMinute || 0);
-        const endMin = startMin + durationMinutes;
+        <div className="card">
+          <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:17}}>🎾</span>
+            <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{t.rules}</span>
+          </div>
+          <div style={{display:"flex",flexDirection:"column"}}>
+            {ruleItems.map((r,i) => (
+              <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start",padding:"12px 18px",background:i%2===1?"rgba(102,57,36,.03)":"transparent",borderTop:i===0?"none":"1px solid rgba(102,57,36,.06)"}}>
+                <span style={{fontSize:18,flexShrink:0,marginTop:1}}>{r.icon}</span>
+                <p style={{fontSize:13,color:"var(--mu)",lineHeight:1.65}}>{r.text}</p>
+              </div>
+            ))}
+          </div>
+        </div>
 
-        // เช็คชนกับรายการที่ยัง active จริงอีกครั้งฝั่งเซิร์ฟเวอร์ (กัน race condition / กันแก้ไขจาก client)
-        const activeIntervals = await getActiveIntervals(bookingDate, courtId);
-        const overlap = activeIntervals.some(([s, e]) => startMin < e && endMin > s);
-        if (overlap) { res.status(409).json({ error: "slot_taken" }); return; }
+        <div className="card">
+          <div style={{padding:"12px 18px",borderBottom:"1px solid var(--dv)",display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:17}}>📞</span>
+            <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{t.contactUs}</span>
+          </div>
+          <div style={{padding:"12px 18px",display:"flex",flexDirection:"column",gap:10}}>
+            <div style={{display:"flex",gap:10,alignItems:"center"}}>
+              <span style={{color:"var(--or)",fontSize:14}}>›</span>
+              <a href="tel:0631465997" style={{fontSize:13.5,color:"var(--mu)",textDecoration:"none"}}>{lang==="th"?"โทร: 063-146-5997":"Call: 063-146-5997"}</a>
+            </div>
+            <div style={{display:"flex",gap:10,alignItems:"center"}}>
+              <span style={{color:"var(--or)",fontSize:14}}>›</span>
+              <a href={LINE_OA_URL} target="_blank" rel="noreferrer" style={{fontSize:13.5,color:"var(--mu)",textDecoration:"none",fontWeight:600}}>💬 {t.lineLabel}: @347mlhra</a>
+            </div>
+            <div style={{display:"flex",gap:10,alignItems:"center"}}>
+              <span style={{color:"var(--or)",fontSize:14}}>›</span>
+              <a href={MAP_URL} target="_blank" rel="noreferrer" style={{fontSize:13.5,color:"var(--mu)",textDecoration:"none",fontWeight:600}}>📍 {t.mapLabel}</a>
+            </div>
+            <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+              <span style={{color:"var(--or)",fontSize:14,lineHeight:1.5}}>›</span>
+              <span style={{fontSize:13.5,color:"var(--mu)",lineHeight:1.65}}>{lang==="th"?"เปิดทำการ 06:00–23:00 น. ทุกวัน":"Open daily 06:00–23:00"}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
-        const dateObj = new Date(bookingDate + "T00:00:00");
-        const day = dateObj.getDay();
-        const isWeekend = day === 0 || day === 6;
-        const isPeak = isWeekend || hour >= 16;
-
-        // ─── จองด้วยสิทธิ์แพ็คเกจ ──────────────────────────────────────────────────
-        // ไม่ตัดสิทธิ์ทันที — สร้างเป็นสถานะ "รอการยืนยัน" ก่อน แจ้งเตือนแอดมินทันที
-        // สิทธิ์จะถูกหักจริงก็ต่อเมื่อแอดมินกดยืนยัน (ป้องกันลูกค้ากดจองมั่ว/พลาด แล้วเสียสิทธิ์ฟรี)
-        if (packageId) {
-          // จองด้วยแพ็คเกจได้ 60 นาที (ตัด 1 ครั้ง) หรือ 120 นาที (ตัด 2 ครั้ง) เท่านั้น
-          if (![60, 120].includes(durationMinutes)) { res.status(400).json({ error: "package_duration" }); return; }
-          const units = durationMinutes / 60;
-          const { body: pkgRows } = await sb(`packages?id=eq.${packageId}&customer_id=eq.${customerId}&select=*`);
-          const pkg = (pkgRows || [])[0];
-          if (!pkg || pkg.status !== "active") { res.status(400).json({ error: "package_not_active" }); return; }
-          // อายุแพ็คเกจเริ่มนับจาก "วันเล่นครั้งแรก" ที่จองด้วยแพ็คเกจนี้ — วันเล่นต้องอยู่ในช่วงนั้น (ถ้ายังไม่เริ่มนับ การจองนี้คือวันแรก)
-          const win = checkPackageWindow(pkg, bookingDate);
-          if (win.error) { res.status(400).json(win); return; }
-          // สิทธิ์ที่ใช้ได้จริง = คงเหลือ − สิทธิ์ที่จองค้างรอแอดมินยืนยันอยู่ (ยังไม่ถูกหัก) กันส่งหลายออเดอร์ซ้อนจนเล่นเกินสิทธิ์
-          const reserved = await getReservedCredits(packageId);
-          if (pkg.remaining_credits - reserved < units) { res.status(400).json({ error: "package_no_credits", available: Math.max(0, pkg.remaining_credits - reserved), needed: units }); return; }
-          // แต่ละชั่วโมงที่จองต้องอยู่ในช่วงที่แพ็คครอบคลุม: แพ็ค Peak ใช้ได้ทุกชั่วโมง / แพ็ค Off Peak ใช้ได้เฉพาะชั่วโมงที่เป็น Off Peak (จ.–ศ. ก่อน 16:00)
-          // เช่น แพ็ค Off Peak จอง 15:00–17:00 ไม่ได้ เพราะชั่วโมงหลังเป็น Peak
-          const hourIsPeak = (h) => isWeekend || h >= 16;
-          const allHoursOk = Array.from({ length: units }, (_, i) => hour + i).every((h) => pkg.tier === "peak" || !hourIsPeak(h));
-          if (!allHoursOk) { res.status(400).json({ error: "package_wrong_tier" }); return; }
-
-          await sb(`customers`, {
-            method: "POST",
-            headers: { Prefer: "resolution=ignore-duplicates" },
-            body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
-          });
-
-          // เริ่มนับอายุแพ็คเกจ (ถ้าเป็นการจองครั้งแรกด้วยแพ็คเกจนี้) — ถ้าบันทึกการจองไม่สำเร็จด้านล่าง จะถอยกลับให้
-          const st = await startPackageIfNeeded(pkg, bookingDate);
-          if (st.error) { res.status(st.error === "package_columns_missing" ? 500 : 400).json(st); return; }
-
-          const pins = await insertBookingsAtomic([{
-            court_id: courtId, customer_id: customerId, customer_name: customerName,
-            booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
-            price: 0, package_id: packageId, status: "reviewing", // รอแอดมินกดยืนยันก่อนถึงจะหักสิทธิ์จริง
-          }]);
-          if (pins.error === "slot_taken") { if (st.started) await releasePackageStartIfUnused(pkg.id); res.status(409).json({ error: "slot_taken" }); return; }
-          const bookingRow = (pins.rows || [])[0];
-          if (!bookingRow) { if (st.started) await releasePackageStartIfUnused(pkg.id); res.status(500).json({ error: "insert_failed" }); return; }
-
-          const nowBangkok = new Date(Date.now() + 7 * 60 * 60 * 1000);
-          const timeStr = nowBangkok.toISOString().substr(11, 5);
-          const text =
-            `🎟 <b>มีการจองด้วยสิทธิ์แพ็คเกจ</b>\n` +
-            `รอการยืนยันจากแอดมิน (จะหักสิทธิ์ก็ต่อเมื่อกดยืนยันแล้วเท่านั้น)\n\n` +
-            `👤 ${esc(customerName)}\n` +
-            `📞 ${customerId}\n` +
-            `🎾 Court ${courtId}\n` +
-            `📅 ${bookingDate}\n` +
-            `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n` +
-            `🎫 จองครั้งนี้ใช้ ${units} ครั้ง • สิทธิ์เหลือก่อนจอง: ${pkg.remaining_credits} / ${pkg.total_credits} ครั้ง\n` +
-            (st.started ? `🗓 เป็นการจองครั้งแรกของแพ็คเกจนี้ → เริ่มนับอายุวันที่ ${bookingDate} ใช้เล่นได้ถึง ${st.expiry_date}\n` : "") +
-            `🕓 กดจองเมื่อเวลา ${timeStr} น. (ไทย)`;
-          await notifyTelegram(text);
-
-          res.status(200).json({ booking: bookingRow });
-          return;
-        }
-
-        // ─── จองจ่ายเงินสดตามปกติ ────────────────────────────────────────────────
-        let basePrice = getDurationPrice(hour, dateObj, durationMinutes);
-
-        // โปรโมชั่นจองครั้งแรก — เฉพาะจอง 60 นาที และยังไม่เคยมีการจอง (ที่ไม่ถูกยกเลิก) มาก่อนเลยในระบบ
-        // เช็คที่เซิร์ฟเวอร์เสมอ ไม่เชื่อ flag จาก client — ถ้าราคาปกติถูกกว่าอยู่แล้วก็ใช้ราคาปกติ (ลูกค้าได้ราคาที่ถูกที่สุดเสมอ)
-        let isFirstTimePromo = false;
-        const promoPrice = durationMinutes === 60 ? getFirstTimePrice(bookingDate) : null;
-        if (promoPrice != null && basePrice > promoPrice) {
-          const firstTime = await isFirstTimeCustomer(customerId);
-          if (firstTime) { basePrice = promoPrice; isFirstTimePromo = true; }
-        }
-
-        let discountAmount = 0;
-        let discountRow = null;
-        if (discountCodeId && !isFirstTimePromo) { // โปรจองครั้งแรกไม่ร่วมกับโค้ดส่วนลด (โค้ดที่ส่งมาจะไม่ถูกใช้/ไม่ถูกตัดสิทธิ์)
-          const claim = await claimDiscount(discountCodeId, basePrice);
-          if (claim.error) { res.status(400).json({ error: "discount_invalid", reason: claim.error }); return; } // โค้ดหมดอายุ/ถูกใช้แล้ว/ใช้ไม่ได้ — ไม่แอบคิดราคาเต็มโดยลูกค้าไม่รู้
-          discountAmount = claim.amount;
-          discountRow = claim.row;
-        }
-        const finalPrice = Math.max(0, basePrice - discountAmount);
-        // โค้ดครอบคลุมทั้งยอด (เหลือ 0 บาท) = ไม่มีอะไรให้โอน/แนบสลิป → ส่งเป็น "รอแอดมินยืนยัน" ตรงๆ เหมือนการจองด้วยแพ็คเกจ
-        const isFree = finalPrice === 0 && !!discountRow;
-
-        await sb(`customers`, {
-          method: "POST",
-          headers: { Prefer: "resolution=ignore-duplicates" },
-          body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
-        });
-
-        const cins = await insertBookingsAtomic([{
-          court_id: courtId, customer_id: customerId, customer_name: customerName,
-          booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
-          price: finalPrice, discount_code: discountRow?.code || null, discount_amount: discountAmount,
-          status: isFree ? "reviewing" : "pending",
-        }]);
-        const bookingRow = (cins.rows || [])[0];
-        if (!bookingRow) {
-          if (discountRow) await releaseDiscountById(discountRow.id); // สร้างการจองไม่สำเร็จ (หรือมีคนจองตัดหน้าพอดี) → คืนสิทธิ์โค้ด
-          if (cins.error === "slot_taken") { res.status(409).json({ error: "slot_taken" }); return; }
-          res.status(500).json({ error: "insert_failed" }); return;
-        }
-
-        if (isFree) {
-          await notifyTelegram(
-            `🎁 <b>มีการจองด้วยโค้ดส่วนลดเต็มจำนวน</b>\n` +
-            `ไม่มียอดที่ต้องโอน — รอแอดมินยืนยัน\n\n` +
-            `👤 ${esc(customerName)}\n📞 ${customerId}\n🎾 Court ${courtId}\n📅 ${bookingDate}\n` +
-            `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(endMin)}\n🏷 โค้ด ${esc(discountRow.code)} (฿${discountAmount})`
+function Calendar({ selected, onSelect, lang="th" }) {
+  const today = new Date(); today.setHours(0,0,0,0);
+  const minDate = today > BOOKING_OPEN_DATE ? today : BOOKING_OPEN_DATE;
+  const maxDate = new Date(minDate); maxDate.setDate(maxDate.getDate()+30);
+  const [view, setView] = useState(new Date(minDate.getFullYear(), minDate.getMonth(), 1));
+  const y = view.getFullYear(), m = view.getMonth();
+  const firstDay = new Date(y, m, 1).getDay();
+  const daysInMonth = new Date(y, m+1, 0).getDate();
+  const selIso = toIso(selected);
+  const cells = [];
+  for (let i = 0; i < firstDay; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(y, m, d));
+  const dowLabels = lang==="th" ? ["อา","จ","อ","พ","พฤ","ศ","ส"] : ["Su","Mo","Tu","We","Th","Fr","Sa"];
+  return (
+    <div className="card">
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 16px",background:"var(--br)"}}>
+        <button onClick={() => setView(new Date(y,m-1,1))} style={{background:"none",border:"none",color:"rgba(255,255,255,.75)",fontSize:22,cursor:"pointer"}}>‹</button>
+        <span style={{fontWeight:700,color:"#fff",fontSize:15}}>{view.toLocaleDateString(lang==="th"?"th-TH":"en-GB",{month:"long",year:"numeric"})}</span>
+        <button onClick={() => setView(new Date(y,m+1,1))} style={{background:"none",border:"none",color:"rgba(255,255,255,.75)",fontSize:22,cursor:"pointer"}}>›</button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",padding:"10px 10px 0",gap:2}}>
+        {dowLabels.map(d => (
+          <div key={d} style={{textAlign:"center",fontSize:11,color:"var(--mu)",fontWeight:600,paddingBottom:6}}>{d}</div>
+        ))}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",padding:"2px 10px 12px",gap:3}}>
+        {cells.map((d,i) => {
+          if (!d) return <div key={i} />;
+          const iso = toIso(d);
+          const isToday = iso === toIso(today);
+          const isSel = iso === selIso;
+          const full = isFullyBookedDate(d);
+          const disabled = d < minDate || d > maxDate || full;
+          return (
+            <button key={i} disabled={disabled} onClick={() => onSelect(new Date(d))} style={{position:"relative",aspectRatio:"1",borderRadius:8,border:"none",cursor:disabled?"default":"pointer",background:isSel?"var(--or)":isToday?"var(--or-bg)":full?"rgba(192,57,43,.07)":"transparent",color:disabled?"#ccc":isSel?"#fff":isToday?"var(--or)":"var(--tx)",fontWeight:(isSel||isToday)?700:400,fontSize:13,outline:(isToday&&!isSel)?"1.5px solid var(--or)":"none",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1}}>
+              <span>{d.getDate()}</span>
+              {full && <span style={{fontSize:8,fontWeight:700,color:"#c0392b",lineHeight:1}}>{lang==="th"?"เต็ม":"Full"}</span>}
+            </button>
           );
-        }
-        res.status(200).json({ booking: bookingRow, isFirstTimePromo, free: isFree });
-        return;
-      }
+        })}
+      </div>
+    </div>
+  );
+}
 
-      case "createBookingMulti": {
-        // จอง 2 สนามช่วงเวลาเดียวกันในครั้งเดียว — สร้าง 2 แถวพร้อมกัน (all-or-nothing) ใช้ group_id เดียวกัน โอนทีเดียว
-        // ข้อจำกัดโดยตั้งใจ: ราคาปกติเท่านั้น (ไม่ร่วมกับแพ็คเกจ/โค้ดส่วนลด/โปรจองครั้งแรก) เพื่อให้ยอดรวมชัดเจน ไม่สับสน
-        const { courtIds, bookingDate, hour, startMinute, durationMinutes } = p;
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        const customerId = who.phone;
-        const customerName = who.name;
-        const ids = Array.isArray(courtIds) ? [...new Set(courtIds.map(Number))].sort() : [];
-        if (ids.length !== 2 || ids[0] !== 1 || ids[1] !== 2) { res.status(400).json({ error: "invalid courts" }); return; }
-        if (!customerName || !bookingDate || hour == null || ![30, 60, 90, 120].includes(durationMinutes)) {
-          res.status(400).json({ error: "missing params" }); return;
-        }
-        if (!/^[0-9]{10}$/.test(customerId)) { res.status(400).json({ error: "invalid phone" }); return; }
-        if (String(customerName).trim().length < 1) { res.status(400).json({ error: "invalid name" }); return; }
+function BookingPage({ onProceed, lang="th" }) {
+  const t = T[lang];
+  const [date, setDate] = useState(null);
+  const [courts, setCourts] = useState([]); // เลือกได้ 1 หรือ 2 สนาม (2 สนาม = จองพร้อมกัน โอนครั้งเดียว)
+  const [duration, setDuration] = useState(null);
+  const [slot, setSlot] = useState(null);
+  const [bookedByCourt, setBookedByCourt] = useState({}); // { courtId: [[start,end],...] }
+  const [loading, setLoading] = useState(false);
+  const isGroup = courts.length > 1;
+  const ready = date && courts.length > 0 && duration && slot;
+  const selKey = courts.map(c => c.courtId).sort().join(",");
 
-        const startMin = hour * 60 + (startMinute || 0);
-        const endMin = startMin + durationMinutes;
-        for (const cid of ids) {
-          const activeIntervals = await getActiveIntervals(bookingDate, cid);
-          if (activeIntervals.some(([s, e]) => startMin < e && endMin > s)) { res.status(409).json({ error: "slot_taken" }); return; }
-        }
+  const toggleCourt = (c) => {
+    setCourts(prev => prev.some(x => x.courtId === c.courtId) ? prev.filter(x => x.courtId !== c.courtId) : [...prev, c]);
+    setSlot(null);
+  };
 
-        const dateObj = new Date(bookingDate + "T00:00:00");
-        const unitPrice = getDurationPrice(hour, dateObj, durationMinutes);
-        const groupId = crypto.randomUUID();
-
-        await sb(`customers`, {
-          method: "POST",
-          headers: { Prefer: "resolution=ignore-duplicates" },
-          body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
+  useEffect(() => {
+    if (!date || courts.length === 0) return;
+    let cancelled = false;
+    setLoading(true);
+    const toIntervals = (data) => {
+      const now = Date.now();
+      return (data || [])
+        .filter(b => {
+          // "รอชำระ" ที่ค้างเกิน 5 นาทีแล้ว ไม่นับว่าบล็อกช่วงเวลาอีกต่อไป (ปล่อยให้จองใหม่ได้)
+          if (b.status === "pending") return (now - parseUtc(b.created_time).getTime()) < 5 * 60 * 1000;
+          return true;
+        })
+        .map(b => {
+          const startMin = (b.hour || 0) * 60 + (b.start_minute || 0);
+          return [startMin, startMin + (b.duration_minutes || 60)];
         });
+    };
+    Promise.all(courts.map(c => db.getBookings(toIso(date), c.courtId).then(data => [c.courtId, toIntervals(data)])))
+      .then(entries => { if (!cancelled) { setBookedByCourt(Object.fromEntries(entries)); setLoading(false); } })
+      .catch(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [date, selKey]);
 
-        const rowsToInsert = ids.map(cid => ({
-          court_id: cid, customer_id: customerId, customer_name: customerName,
-          booking_date: bookingDate, hour, start_minute: startMinute || 0, duration_minutes: durationMinutes,
-          price: unitPrice, discount_amount: 0, status: "pending", group_id: groupId,
-        }));
-        const mins = await insertBookingsAtomic(rowsToInsert);
-        if (mins.error === "slot_taken") { res.status(409).json({ error: "slot_taken" }); return; }
-        if (!mins.rows) { console.error("createBookingMulti insert failed"); res.status(500).json({ error: "insert_failed" }); return; }
-        res.status(200).json({ bookings: mins.rows, groupId });
-        return;
-      }
+  const isToday = date && toIso(date) === toIso(new Date());
+  const nowMinutes = new Date().getHours()*60 + new Date().getMinutes();
+  const court2NotYetOpen = courts.some(c => c.courtId === 2) && isCourt2Restricted(date);
+  const forcedFull = court2NotYetOpen || isFullyBookedDate(date);
 
-      case "updateSlip": {
-        const { bookingId, slipUrl } = p;
-        if (!bookingId || !slipUrl) { res.status(400).json({ error: "missing params" }); return; }
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        if (!isOwnSlipUrl(slipUrl, bookingId)) { res.status(400).json({ error: "invalid_slip_url" }); return; }
+  // ช่วงเวลาที่เลือกได้ = ว่างครบ "ทุกสนามที่เลือก" พร้อมกัน
+  const availableSlots = (!duration || forcedFull || courts.length === 0) ? [] : getCandidateStarts(duration)
+    .filter(startMin => {
+      if (isToday && startMin <= nowMinutes) return false;
+      const endMin = startMin + duration;
+      return courts.every(c =>
+        !isManuallyClosed(date, c.courtId, startMin, endMin) &&
+        !(bookedByCourt[c.courtId] || []).some(([s,e]) => startMin < e && endMin > s)
+      );
+    })
+    .map(startMin => {
+      const startHour = Math.floor(startMin/60);
+      const { price: unit, peak } = getDurationPrice(startHour, date || new Date(), duration);
+      return {
+        startMin, durationMinutes: duration,
+        hour: startHour, startMinute: startMin % 60,
+        label: `${minutesToLabel(startMin)} – ${minutesToLabel(startMin+duration)}`,
+        price: unit * Math.max(1, courts.length), // ราคารวมทุกสนามที่เลือก
+        unitPrice: unit, peak,
+      };
+    });
 
-        // สลิปที่ส่ง "ช้า": รายการรอชำระที่หมดเวลา 5 นาทีไปแล้ว ช่วงเวลานั้นถูกปล่อยให้คนอื่นจองได้ จึงอาจมีคนจองต่อไปแล้ว
-        // → รับสลิปได้ก็ต่อเมื่อช่วงเวลายังว่างอยู่จริง ถ้าไม่ว่าง: ไม่รับเป็นการจอง (กันจองซ้อน) แต่ลูกค้าอาจโอนเงินไปแล้ว
-        //   จึงเก็บสลิปไว้ที่รายการ + แจ้ง Telegram แอดมินพร้อมลิงก์สลิป ให้ติดต่อคืนเงินหรือจัดเวลาใหม่ (ไม่ปล่อยให้เงียบ)
-        const { body: curRows } = await sb(`bookings?id=eq.${encodeURIComponent(bookingId)}&customer_id=eq.${who.phone}&select=*`);
-        const cur = Array.isArray(curRows) ? curRows[0] : null;
-        if (cur && cur.status === "pending" && Date.now() - new Date(cur.created_time).getTime() >= 5 * 60 * 1000) {
-          let mineRows = [cur];
-          if (cur.group_id) {
-            const { body: g } = await sb(`bookings?group_id=eq.${encodeURIComponent(cur.group_id)}&select=*&order=court_id.asc`);
-            if (Array.isArray(g) && g.length) mineRows = g;
-          }
-          let clash = false;
-          for (const r of mineRows) {
-            const s0 = (r.hour || 0) * 60 + (r.start_minute || 0);
-            const e0 = s0 + (r.duration_minutes || 60);
-            const taken = await getActiveIntervals(r.booking_date, r.court_id); // รายการของเราเองหมดเวลาแล้วจึงไม่ถูกนับรวม
-            if (taken.some(([a, b]) => s0 < b && e0 > a)) { clash = true; break; }
-          }
-          if (clash) {
-            await sb(cur.group_id ? `bookings?group_id=eq.${encodeURIComponent(cur.group_id)}&status=eq.pending` : `bookings?id=eq.${encodeURIComponent(bookingId)}&status=eq.pending`, {
-              method: "PATCH", body: JSON.stringify({ status: "cancelled", slip_url: slipUrl }),
-            });
-            if (cur.discount_code) await releaseDiscountByCode(cur.discount_code);
-            const s1 = (cur.hour || 0) * 60 + (cur.start_minute || 0);
-            await notifyTelegram(
-              `⚠️ <b>ลูกค้าส่งสลิปช้า แต่ช่วงเวลานี้ถูกจองไปแล้ว</b>\n` +
-              `ไม่ได้รับเป็นการจอง (ยกเลิกรายการแล้ว) — ลูกค้าอาจโอนเงินมาแล้ว กรุณาติดต่อเพื่อคืนเงินหรือจัดเวลาใหม่\n\n` +
-              `👤 ${esc(cur.customer_name || "-")}\n📞 ${cur.customer_id}\n` +
-              `🎾 ${mineRows.map((r) => `Court ${r.court_id}`).join(" + ")}\n📅 ${cur.booking_date}\n` +
-              `🕐 ${minutesToLabel(s1)}–${minutesToLabel(s1 + (cur.duration_minutes || 60))}\n` +
-              `💰 ฿${mineRows.reduce((t, r) => t + (r.price || 0), 0).toLocaleString()}\n` +
-              `🧾 สลิป: ${esc(slipUrl)}`
+  return (
+    <div style={{padding:"20px 16px 100px",display:"flex",flexDirection:"column",gap:22}} className="fu">
+      <section>
+        <StepHead n="1" label={t.selectDate} />
+        <Calendar selected={date} onSelect={d => { setDate(d); setSlot(null); }} lang={lang} />
+        {date && (
+          <div style={{marginTop:10,background:"var(--or-bg)",borderRadius:10,padding:"9px 14px",border:"1px solid rgba(244,126,31,.2)"}}>
+            <p style={{fontSize:13,color:"var(--br)",fontWeight:600}}>📅 {fmtDate(date, lang)}</p>
+          </div>
+        )}
+      </section>
+      <section>
+        <StepHead n="2" label={t.selectCourt} />
+        <p style={{fontSize:12,color:"var(--mu)",marginBottom:10}}>
+          {lang==="th" ? "แตะเลือกได้ทั้ง 2 สนาม เพื่อจองช่วงเวลาเดียวกันพร้อมกัน โอนเงินครั้งเดียว" : "Tap both courts to book the same time slot on both — one payment."}
+        </p>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+          {COURTS.map(c => {
+            const sel = courts.some(x => x.courtId === c.courtId);
+            return (
+              <button key={c.courtId} onClick={() => toggleCourt(c)} style={{position:"relative",padding:0,borderRadius:"var(--r)",border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:"#fff",cursor:"pointer",textAlign:"center",boxShadow:sel?"0 2px 12px rgba(244,126,31,.18)":"var(--sh)",overflow:"hidden"}}>
+                {sel && <span style={{position:"absolute",top:6,right:6,zIndex:1,width:22,height:22,borderRadius:"50%",background:"var(--or)",color:"#fff",fontSize:13,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center"}}>✓</span>}
+                <img src={c.photo} alt={c.courtName} style={{width:"100%",height:90,objectFit:"cover",display:"block"}} />
+                <div style={{padding:"10px 8px 12px"}}>
+                  <p style={{fontWeight:700,color:sel?"var(--or)":"var(--br)",fontSize:15}}>{c.courtName}</p>
+                  <p style={{fontSize:11,color:"var(--mu)",marginTop:4}}>{lang==="th"?c.descTh:c.descEn}</p>
+                </div>
+              </button>
             );
-            res.status(409).json({ error: "slot_taken_late" });
+          })}
+        </div>
+        <button onClick={() => { setCourts(isGroup ? [] : [...COURTS]); setSlot(null); }}
+          style={{width:"100%",marginTop:10,padding:"10px",borderRadius:10,border:`1.5px dashed ${isGroup?"var(--or)":"var(--dv)"}`,background:isGroup?"var(--or-bg)":"#fff",color:isGroup?"var(--or)":"var(--br)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+          {isGroup ? (lang==="th"?"✓ จองทั้ง 2 สนามพร้อมกัน (แตะเพื่อยกเลิก)":"✓ Booking both courts (tap to undo)") : (lang==="th"?"+ จองทั้ง 2 สนามพร้อมกัน":"+ Book both courts at once")}
+        </button>
+        {isGroup && (
+          <p style={{fontSize:11.5,color:"var(--mu)",marginTop:8,lineHeight:1.6}}>
+            {lang==="th" ? "* การจอง 2 สนามพร้อมกันใช้ราคาปกติ (ราคาต่อสนาม × 2) ไม่ร่วมกับแพ็คเกจ โค้ดส่วนลด หรือโปรจองครั้งแรก" : "* Booking both courts uses regular pricing (per-court price × 2). Packages, discount codes and the first-booking promo don't apply."}
+          </p>
+        )}
+      </section>
+      <section>
+        <StepHead n="3" label={t.selectDuration} />
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+          {DURATION_OPTIONS.map(min => {
+            const sel = duration === min;
+            return (
+              <button key={min} onClick={() => { setDuration(min); setSlot(null); }} style={{padding:"14px 6px",borderRadius:10,border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:sel?"var(--or-bg)":"#fff",cursor:"pointer",textAlign:"center"}}>
+                <p className="bb" style={{fontSize:22,color:sel?"var(--or)":"var(--br)",lineHeight:1}}>{min}</p>
+                <p style={{fontSize:10.5,color:"var(--mu)",marginTop:3}}>{t.minutesLabel}</p>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+      <section>
+        <StepHead n="4" label={t.selectTime} />
+        {(!date||courts.length===0) ? (
+          <div style={{background:"#fff",borderRadius:"var(--r)",padding:"22px",textAlign:"center",border:"1px solid var(--dv)"}}>
+            <p style={{color:"var(--mu)",fontSize:14}}>{t.selectDateFirst}</p>
+          </div>
+        ) : !duration ? (
+          <div style={{background:"#fff",borderRadius:"var(--r)",padding:"22px",textAlign:"center",border:"1px solid var(--dv)"}}>
+            <p style={{color:"var(--mu)",fontSize:14}}>{t.selectDurationFirst}</p>
+          </div>
+        ) : loading ? (
+          <div style={{background:"#fff",borderRadius:"var(--r)",padding:"22px",textAlign:"center",border:"1px solid var(--dv)"}}>
+            <p style={{color:"var(--mu)",fontSize:14}}>{t.loading}</p>
+          </div>
+        ) : availableSlots.length === 0 ? (
+          <div style={{background:"#fff",borderRadius:"var(--r)",padding:"22px",textAlign:"center",border:"1px solid var(--dv)"}}>
+            <p style={{color:"var(--mu)",fontSize:14}}>{t.noSlot}</p>
+          </div>
+        ) : (
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            <div style={{display:"flex",gap:14,marginBottom:8,flexWrap:"wrap"}}>
+              <Dot color="var(--or)" label={`฿${availableSlots.find(s=>!s.peak)?.price ?? "-"} · Off Peak${isGroup?(lang==="th"?" (รวม 2 สนาม)":" (both courts)"):""}`} />
+              <Dot color="var(--bl)" label={`฿${availableSlots.find(s=>s.peak)?.price ?? "-"} · Peak${isGroup?(lang==="th"?" (รวม 2 สนาม)":" (both courts)"):""}`} />
+            </div>
+            {availableSlots.map(ts => {
+              const isSel = slot?.startMin === ts.startMin;
+              return (
+                <button key={ts.startMin} onClick={() => setSlot(ts)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"13px 16px",borderRadius:10,border:`1.5px solid ${isSel?"var(--or)":"var(--dv)"}`,background:isSel?"var(--or-bg)":"#fff",cursor:"pointer",boxShadow:isSel?"0 2px 10px rgba(244,126,31,.15)":"none"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <div style={{width:8,height:8,borderRadius:"50%",background:ts.peak?"var(--bl)":"var(--or)"}} />
+                    <span style={{fontSize:14}}>{ts.label}</span>
+                  </div>
+                  <span style={{fontSize:14,fontWeight:700,color:ts.peak?"var(--bl)":"var(--or)"}}>฿{ts.price.toLocaleString()}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </section>
+      <button className="btn-primary" disabled={!ready} onClick={() => onProceed({date, court: courts[0], courts: isGroup ? courts : null, slot})}>
+        {t.proceed}
+      </button>
+    </div>
+  );
+}
+
+function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onConfirmFree, lineSession, onLineLogin, onLinkPhone, lang="th" }) {
+  const t = T[lang];
+  const { date, court, slot } = booking;
+  const courts = booking.courts; // มี 2 สนามเมื่อเป็นการจองพร้อมกัน (โอนครั้งเดียว)
+  const isGroup = !!(courts && courts.length > 1);
+  // ถ้าล็อกอิน LINE อยู่ กรอกชื่อ/เบอร์ให้อัตโนมัติ (แก้ไขเองได้เสมอ)
+  const lineName = toFormName(lineSession?.displayName || lineSession?.name) || "ลูกค้า LINE"; // ชื่อในการจอง = ชื่อ LINE เสมอ (เซิร์ฟเวอร์ก็ใช้ชื่อนี้ ไม่เชื่อชื่อที่ส่งมาจากหน้าเว็บ)
+  const [name, setName] = useState(lineName);
+  useEffect(() => { setName(lineName); }, [lineName]);
+  const [phone, setPhone] = useState(() => lineSession?.phone || "");
+  const [discountCode, setDiscountCode] = useState("");
+  const [discount, setDiscount] = useState(null);
+  const [discountMsg, setDiscountMsg] = useState("");
+  const [checkingCode, setCheckingCode] = useState(false);
+  const nameOk = name.trim().length >= 1; // ชื่อมาจาก LINE (ตัดที่ 20 ตัวอักษรไว้แล้ว)
+  const phoneOk = /^[0-9]{10}$/.test(phone);
+  const phoneLocked = !!lineSession?.phone;
+  useEffect(() => { if (lineSession?.phone) setPhone(lineSession.phone); }, [lineSession?.phone]); // ผูกกับบัญชี LINE แล้ว → ล็อก ไม่ให้แก้ (เซิร์ฟเวอร์ก็ใช้เบอร์ที่ผูกไว้เสมอ)
+  const [linking, setLinking] = useState(false);
+  const [linkErr, setLinkErr] = useState("");
+  const ok = nameOk && phoneOk;
+
+  // เช็คว่ามีสิทธิ์แพ็คเกจที่ใช้กับรายการนี้ได้ไหม: จอง 60 นาที (ตัด 1 ครั้ง) หรือ 120 นาที (ตัด 2 ครั้ง) + ยังไม่หมดอายุ
+  // + สิทธิ์เหลือพอ (หักที่จองค้างรอแอดมินยืนยันแล้ว) + ทุกชั่วโมงที่จองอยู่ในช่วงที่แพ็คครอบคลุม (เซิร์ฟเวอร์ตรวจซ้ำอีกชั้น)
+  const [matchedPkg, setMatchedPkg] = useState(null);
+  const [pkgNote, setPkgNote] = useState(""); // มีแพ็คเกจ แต่ใช้ไม่ได้เพราะอะไร (ไว้บอกลูกค้า)
+  const [useCredit, setUseCredit] = useState(false);
+  const [checkingPkg, setCheckingPkg] = useState(false);
+  const pkgUnits = slot.durationMinutes === 120 ? 2 : slot.durationMinutes === 60 ? 1 : 0;
+  const playIso = toIso(date);
+  useEffect(() => {
+    setMatchedPkg(null); setPkgNote(""); setUseCredit(false);
+    if (!phoneOk || isGroup) return;
+    let cancelled = false;
+    setCheckingPkg(true);
+    db.myPackages(phone).then(rows => {
+      if (cancelled) return;
+      const today = toIso(new Date());
+      const liveAll = (rows || []).filter(p => p.status === "active" && (!p.expiry_date || String(p.expiry_date).slice(0, 10) >= today) && p.remaining_credits - (p.reserved_credits || 0) > 0);
+      if (liveAll.length === 0) { setCheckingPkg(false); return; }
+      // "วันที่เล่น" ต้องอยู่ภายในอายุแพ็คเกจ (วันสุดท้ายยังเล่นได้) — ไม่ใช่แค่ตอนนี้แพ็คเกจยังไม่หมดอายุ
+      // อายุแพ็คเกจเริ่มนับจาก "วันเล่นครั้งแรก" ที่จองด้วยแพ็คเกจนั้น: ยังไม่เริ่มนับ (ไม่มีวันหมดอายุ) = ใช้ได้ (วันเล่นนี้จะเป็นวันแรก) / เริ่มนับแล้ว = วันเล่นต้องอยู่ในช่วงเริ่มนับ–หมดอายุ
+      const inWindow = (p) => !p.expiry_date || (String(p.expiry_date).slice(0, 10) >= playIso && (!p.first_use_date || playIso >= String(p.first_use_date).slice(0, 10)));
+      const live = liveAll.filter(inWindow);
+      if (live.length === 0) {
+        const p0 = liveAll.slice().sort((x, y) => String(x.expiry_date).localeCompare(String(y.expiry_date)))[0];
+        const range = p0.first_use_date ? `${niceDate(p0.first_use_date, lang)} – ${niceDate(p0.expiry_date, lang)}` : (lang==="th" ? `ถึง ${niceDate(p0.expiry_date, lang)}` : `until ${niceDate(p0.expiry_date, lang)}`);
+        setPkgNote(lang==="th" ? `แพ็คเกจของคุณใช้เล่นได้ ${range} แต่วันที่เล่นที่เลือกอยู่นอกช่วงนี้ — เลือกวันเล่นให้อยู่ภายในอายุแพ็คเกจ` : `Your package is playable ${range}, but the date you chose is outside that period. Pick a play date within the package validity.`);
+        setCheckingPkg(false); return;
+      }
+      if (pkgUnits === 0) { setPkgNote(lang==="th" ? "แพ็คเกจใช้จองได้เฉพาะ 60 หรือ 120 นาที (ตอนนี้เลือกอยู่ " + slot.durationMinutes + " นาที)" : "Packages can only book 60 or 120 minutes."); setCheckingPkg(false); return; }
+      const wkend = date.getDay() === 0 || date.getDay() === 6;
+      const hourPeak = (i) => wkend || (slot.hour + i) >= 16;
+      const tierCovers = (p) => Array.from({ length: pkgUnits }, (_, i) => i).every(i => p.tier === "peak" || !hourPeak(i));
+      const slotTier = slot.peak ? "peak" : "offpeak";
+      const usable = live.filter(p => tierCovers(p) && p.remaining_credits - (p.reserved_credits || 0) >= pkgUnits);
+      // ใช้แพ็คที่ตรงช่วงเวลาก่อน (เก็บแพ็ค Peak ไว้ใช้ช่วงที่จำเป็น) แล้วเรียงตามวันหมดอายุใกล้สุดก่อน
+      usable.sort((x, y) => ((x.tier === slotTier ? 0 : 1) - (y.tier === slotTier ? 0 : 1)) || String(x.expiry_date || "9999-12-31").localeCompare(String(y.expiry_date || "9999-12-31")));
+      if (usable[0]) setMatchedPkg({ ...usable[0], available: usable[0].remaining_credits - (usable[0].reserved_credits || 0) });
+      else if (!live.some(tierCovers)) setPkgNote(lang==="th" ? "แพ็คเกจของคุณใช้กับช่วงเวลานี้ไม่ได้ (แพ็ค Off Peak ใช้ได้เฉพาะ จ.–ศ. ก่อน 16:00 ทุกชั่วโมงที่จอง)" : "Your package doesn't cover this time (Off Peak packages: Mon–Fri before 16:00, every hour booked).");
+      else setPkgNote(lang==="th" ? `สิทธิ์ในแพ็คเกจไม่พอสำหรับรายการนี้ (ต้องใช้ ${pkgUnits} ครั้ง ไม่นับสิทธิ์ที่จองไว้รอแอดมินยืนยัน)` : `Not enough package credits (need ${pkgUnits}; credits waiting for admin confirmation are reserved).`);
+      setCheckingPkg(false);
+    }).catch(() => { if (!cancelled) setCheckingPkg(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phone, phoneOk, slot.durationMinutes, slot.peak, slot.hour, isGroup, playIso]);
+
+  // โปรโมชั่นจองครั้งแรก — เฉพาะ 60 นาที และยังไม่เคยจองที่ไม่ถูกยกเลิกมาก่อนเลย (เซิร์ฟเวอร์เป็นคนชี้ขาดตอนยืนยันจริงอีกชั้น)
+  const [firstTimePrice, setFirstTimePrice] = useState(null);
+  const [ftChecking, setFtChecking] = useState(false); // กำลังเช็คสิทธิ์โปรอยู่ — ยังไม่ให้กดยืนยัน กันราคาที่เห็นไม่ตรงกับที่ระบบคิดจริง
+  useEffect(() => {
+    setFirstTimePrice(null);
+    if (!phoneOk || slot.durationMinutes !== 60 || isGroup) { setFtChecking(false); return; }
+    let cancelled = false;
+    setFtChecking(true);
+    db.checkFirstTime(phone, toIso(date))
+      .then(price => { if (!cancelled) setFirstTimePrice(price); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setFtChecking(false); });
+    return () => { cancelled = true; };
+  }, [phone, phoneOk, slot.durationMinutes, isGroup, date]);
+  const firstTimeEligible = !isGroup && firstTimePrice != null && firstTimePrice < slot.price && !matchedPkg;
+
+  const basePrice = (firstTimeEligible) ? Math.min(slot.price, firstTimePrice) : slot.price;
+  const calcDiscount = (d) => {
+    if (!d) return 0;
+    if (d.discount_amount > 0) return d.discount_amount;
+    return Math.round(basePrice * d.discount_percent / 100);
+  };
+  const discountAmount = (firstTimeEligible || isGroup) ? 0 : calcDiscount(discount); // โปรจองครั้งแรกไม่ร่วมกับโค้ดส่วนลด (เซิร์ฟเวอร์บังคับกฎเดียวกัน)
+  const finalPrice = Math.max(0, basePrice - discountAmount);
+
+  const handleCheckCode = async () => {
+    if (!discountCode.trim()) return;
+    setCheckingCode(true);
+    setDiscountMsg("");
+    const result = await db.checkDiscount(discountCode.trim());
+    if (result && !result.error) {
+      setDiscount(result);
+      const saved = result.discount_amount > 0 ? result.discount_amount : Math.round(slot.price * result.discount_percent / 100);
+      const label = result.discount_amount > 0
+        ? (lang==="th" ? `ส่วนลด ฿${result.discount_amount}` : `฿${result.discount_amount} off`)
+        : (lang==="th" ? `ส่วนลด ${result.discount_percent}%` : `${result.discount_percent}% off`);
+      const expTxt = result.expires_at ? (lang==="th" ? ` • ใช้ได้ถึง ${new Date(result.expires_at+"T00:00:00").toLocaleDateString("th-TH",{day:"numeric",month:"short",year:"numeric"})}` : ` • valid until ${new Date(result.expires_at+"T00:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`) : "";
+      setDiscountMsg(`✅ ${label} — ${t.saveDiscount} ฿${saved}${expTxt}`);
+    } else {
+      setDiscount(null);
+      setDiscountMsg(result?.error === "expired" ? (lang==="th" ? "โค้ดนี้หมดอายุแล้ว" : "This code has expired")
+        : result?.error === "used" ? (lang==="th" ? "โค้ดนี้ถูกใช้ไปแล้ว" : "This code has already been used")
+        : t.invalidCode);
+    }
+    setCheckingCode(false);
+  };
+
+  return (
+    <div style={{padding:"20px 16px 100px"}} className="fu">
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:20}}>{t.confirm}</h2>
+      <div className="card" style={{marginBottom:20}}>
+        <div className="card-header"><p>{t.summaryTitle}</p></div>
+        <div className="card-body">
+          <Row label={`🎾 ${t.court}`} val={isGroup ? courts.map(c => c.courtName).join(" + ") : court.courtName} />
+          <Row label={`📅 ${t.date}`} val={fmtDate(date, lang)} />
+          <Row label={`🕐 ${t.time}`} val={slot.label} />
+          <Row label={`⏱ ${t.duration}`} val={`${slot.durationMinutes} ${t.minutesLabel}`} />
+          {isGroup && <Row label={lang==="th"?"ราคาต่อสนาม":"Per court"} val={`฿${(slot.unitPrice ?? slot.price/courts.length).toLocaleString()} × ${courts.length}`} />}
+          {firstTimeEligible && !useCredit && <Row label="🎉" val={lang==="th"?"ราคาพิเศษจองครั้งแรก":"First booking promo"} />}
+          {discount && !useCredit && !firstTimeEligible && !isGroup && <Row label="🏷" val={`-฿${discountAmount.toLocaleString()}`} />}
+          <div style={{borderTop:"1px solid var(--dv)",margin:"12px 0"}} />
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span style={{fontWeight:700,color:"var(--br)",fontSize:15}}>{t.total}</span>
+            <div style={{textAlign:"right"}}>
+              {useCredit ? (
+                <>
+                  <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿{slot.price.toLocaleString()}</p>
+                  <span style={{fontSize:30,fontWeight:800,color:"#2d7a4f"}}>{lang==="th"?"ใช้สิทธิ์":"Credit"}</span>
+                </>
+              ) : (
+                <>
+                  {(discount || firstTimeEligible) && <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿{slot.price.toLocaleString()}</p>}
+                  <span style={{fontSize:30,fontWeight:800,color:"var(--or)"}}>฿{finalPrice.toLocaleString()}</span>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{display:"flex",flexDirection:"column",gap:15,marginBottom:26}}>
+        {!lineSession ? (
+          <button onClick={() => onLineLogin({ dateIso: toIso(date), courtId: court.courtId, courtIds: isGroup ? courts.map(c => c.courtId) : null, slot })}
+            style={{display:"flex",alignItems:"center",gap:12,padding:"13px 14px",borderRadius:10,border:"1.5px solid #06C755",background:"rgba(6,199,85,.07)",cursor:"pointer",textAlign:"left"}}>
+            <span style={{background:"#06C755",color:"#fff",fontWeight:800,fontSize:11,padding:"6px 8px",borderRadius:8,flexShrink:0}}>LINE</span>
+            <span>
+              <span style={{display:"block",fontSize:13.5,fontWeight:700,color:"var(--br)"}}>{lang==="th"?"เข้าสู่ระบบด้วย LINE":"Sign in with LINE"}</span>
+              <span style={{display:"block",fontSize:11.5,color:"var(--mu)",marginTop:2}}>{lang==="th"?"กรอกชื่อ-เบอร์ให้อัตโนมัติ ไม่ต้องพิมพ์ซ้ำทุกครั้ง":"Auto-fill your name and phone — no retyping"}</span>
+            </span>
+          </button>
+        ) : (
+          <p style={{fontSize:12,color:"#06A04A",fontWeight:600}}>✅ {lang==="th"?"เข้าสู่ระบบด้วย LINE แล้ว":"Signed in with LINE"}: {toFormName(lineSession.displayName)}</p>
+        )}
+        <div>
+          <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.name}</label>
+          <input value={name} readOnly placeholder={lang==="th"?"ชื่อจาก LINE":"Name from LINE"}
+            style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"var(--cr2)",border:"1.5px solid var(--dv)",color:"var(--mu)",outline:"none"}} />
+          <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>{lang==="th" ? "👤 ใช้ชื่อจากบัญชี LINE ของคุณ (เปลี่ยนชื่อได้ที่แอป LINE แล้วเข้าสู่ระบบใหม่)" : "👤 Taken from your LINE account (change it in the LINE app, then sign in again)."}</p>
+        </div>
+        <div>
+          <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.phone}</label>
+          <input value={phone} readOnly={phoneLocked} onChange={e => { if (!phoneLocked) setPhone(e.target.value.replace(/\D/g,"").slice(0,10)); }} placeholder="0812345678" inputMode="numeric"
+            style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:phoneLocked?"var(--cr2)":"#fff",border:`1.5px solid ${phone&&!phoneOk?"#c0392b":"var(--dv)"}`,color:phoneLocked?"var(--mu)":"var(--tx)",outline:"none"}} />
+          <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>{lineSession?.phone ? (lang==="th" ? `🔒 เบอร์ที่ผูกกับบัญชี LINE ของคุณ — เปลี่ยนเองไม่ได้ ต้องการเปลี่ยนติดต่อแอดมิน ${ADMIN_CONTACT_PHONE}` : `🔒 Linked to your LINE account — can't be changed here. Contact admin: ${ADMIN_CONTACT_PHONE}`) : (lang==="th" ? "กรอกครั้งแรกครั้งเดียว — เบอร์นี้จะถูกล็อกกับบัญชี LINE ของคุณ กรุณากรอกให้ถูกต้อง" : "Enter once — this number will be locked to your LINE account. Please double-check it.")}</p>
+        </div>
+        {matchedPkg && (
+          <div onClick={() => setUseCredit(v => !v)} style={{display:"flex",gap:10,alignItems:"flex-start",padding:"13px 14px",borderRadius:10,border:`1.5px solid ${useCredit?"var(--or)":"var(--dv)"}`,background:useCredit?"var(--or-bg)":"#fff",cursor:"pointer"}}>
+            <div style={{width:20,height:20,borderRadius:6,flexShrink:0,marginTop:1,border:`2px solid ${useCredit?"var(--or)":"var(--dv)"}`,background:useCredit?"var(--or)":"#fff",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,fontWeight:800}}>{useCredit?"✓":""}</div>
+            <div>
+              <p style={{fontSize:13.5,fontWeight:700,color:"var(--br)"}}>🎟 {lang==="th"?"ใช้สิทธิ์จากแพ็คเกจ":"Use package credit"}</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`รายการนี้ใช้ ${pkgUnits} ครั้ง (${slot.durationMinutes} นาที) • ใช้ได้ ${matchedPkg.available} ครั้ง — ไม่ต้องชำระเงินเพิ่ม`:`This booking uses ${pkgUnits} credit(s) (${slot.durationMinutes} min) • ${matchedPkg.available} available — no extra payment`}</p>
+              {!matchedPkg.expiry_date && matchedPkg.expiry_days > 0 && <p style={{fontSize:12,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:8,padding:"6px 9px",marginTop:6,lineHeight:1.6}}>🗓 {lang==="th" ? `อายุแพ็คเกจจะเริ่มนับจากวันเล่นนี้ (${niceDate(playIso, lang)}) — ใช้เล่นได้ ${matchedPkg.expiry_days} วัน ถึง ${niceDate(addDaysIsoClient(playIso, matchedPkg.expiry_days - 1), lang)}` : `The package validity will start from this play date (${niceDate(playIso, lang)}) — playable for ${matchedPkg.expiry_days} days, until ${niceDate(addDaysIsoClient(playIso, matchedPkg.expiry_days - 1), lang)}`}</p>}
+              <p style={{fontSize:11,color:"var(--mu)",marginTop:3}}>{lang==="th"?"* รอแอดมินยืนยันก่อน ถึงจะหักสิทธิ์จริง (เหมือนการจองปกติ)":"* Admin confirmation required before a credit is actually deducted"}</p>
+            </div>
+          </div>
+        )}
+        {!matchedPkg && pkgNote && (
+          <p style={{fontSize:12,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:10,padding:"9px 11px",lineHeight:1.6}}>🎟 {pkgNote}</p>
+        )}
+        {!useCredit && firstTimeEligible && (
+          <div style={{display:"flex",gap:10,alignItems:"flex-start",padding:"13px 14px",borderRadius:10,border:"1.5px solid #2d7a4f",background:"rgba(45,122,79,.08)"}}>
+            <span style={{fontSize:20,flexShrink:0}}>🎉</span>
+            <div>
+              <p style={{fontSize:13.5,fontWeight:700,color:"#2d7a4f"}}>{lang==="th"?"ยินดีต้อนรับ! ราคาพิเศษสำหรับการจองครั้งแรก":"Welcome! Special first-booking price"}</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?`เหลือจ่ายแค่ ฿${firstTimePrice} (จากปกติ ฿${slot.price}) — ใช้ได้กับการจอง 60 นาทีครั้งแรกเท่านั้น `:`Only ฿${firstTimePrice} (normally ฿${slot.price}) — first 60-minute booking only`}</p>
+            </div>
+          </div>
+        )}
+        {!useCredit && !firstTimeEligible && !isGroup && (
+          <div>
+            <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.discount}</label>
+            <div style={{display:"flex",gap:8}}>
+              <input value={discountCode} onChange={e => setDiscountCode(e.target.value.toUpperCase())} placeholder="เช่น NOVA10"
+                style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
+              <button onClick={handleCheckCode} disabled={checkingCode || !discountCode.trim()} style={{padding:"0 16px",borderRadius:10,border:"none",background:"var(--br)",color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer",whiteSpace:"nowrap",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {checkingCode ? "..." : t.useCode}
+              </button>
+            </div>
+            {discountMsg && <p style={{fontSize:12,marginTop:6,color:discount?"#2d7a4f":"#c0392b"}}>{discountMsg}</p>}
+          </div>
+        )}
+      </div>
+
+      {finalPrice===0 && discount && !firstTimeEligible && !isGroup && !useCredit && (
+        <p style={{fontSize:12,color:"var(--mu)",marginBottom:10,lineHeight:1.6}}>🎁 {lang==="th" ? "โค้ดนี้ครอบคลุมยอดทั้งหมด ไม่ต้องโอนเงิน — ระบบจะส่งคำขอให้แอดมินยืนยัน" : "This code covers the full amount — nothing to pay. We'll send the request to the admin for confirmation."}</p>
+      )}
+      {linkErr && <p style={{fontSize:12.5,color:"#c0392b",marginBottom:10,lineHeight:1.6}}>{linkErr}</p>}
+      <div style={{display:"flex",gap:12}}>
+        <button onClick={onCancel} style={{flex:1,padding:"14px",borderRadius:"var(--r)",border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:15,cursor:"pointer"}}>{t.cancel}</button>
+        <button disabled={!ok || ftChecking || checkingPkg || linking} onClick={async () => {
+          setLinkErr("");
+          // ครั้งแรก: ผูกเบอร์กับบัญชี LINE ก่อน (เซิร์ฟเวอร์เช็คว่าเบอร์นี้ไม่ได้ผูกกับ LINE อื่น) ผ่านแล้วจึงไปต่อ
+          if (lineSession && !lineSession.phone) {
+            const sure = window.confirm(lang==="th"
+              ? `ยืนยันเบอร์ ${phone} ใช่หรือไม่?\n\nเบอร์นี้จะถูกผูกกับบัญชี LINE ของคุณ และแก้ไขเองไม่ได้อีก (ต้องติดต่อแอดมิน)`
+              : `Confirm phone number ${phone}?\n\nIt will be linked to your LINE account and can't be changed by yourself later.`);
+            if (!sure) return;
+            setLinking(true);
+            const r = await onLinkPhone(name.trim(), phone);
+            setLinking(false);
+            if (!r?.ok) { setLinkErr(accountErrMsg(r?.error, lang) || (lang==="th" ? "ผูกเบอร์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Couldn't link your number. Please try again.")); return; }
+          }
+          if (useCredit && matchedPkg) {
+            onConfirmWithPackage({ name: name.trim(), phone, packageId: matchedPkg.id });
             return;
           }
-        }
-
-        // เงื่อนไข: ต้องเป็นการจองของเบอร์ที่ผูกกับบัญชีนี้ + status=in.(pending,reviewing) (แก้ได้เฉพาะรายการที่ยังไม่ถูกยืนยัน/ยกเลิก)
-        // (เผื่อกรณีลูกค้ากดส่งสลิปซ้ำ หรือกลับมาแนบสลิปใหม่หลัง resume session — ไม่ให้ค้างเหมือนก่อนหน้านี้)
-        const { ok, body } = await sb(`bookings?id=eq.${encodeURIComponent(bookingId)}&customer_id=eq.${who.phone}&status=in.(pending,reviewing)`, {
-          method: "PATCH",
-          headers: { Prefer: "return=representation" },
-          body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
-        });
-        const row = (body || [])[0] || null;
-        if (!ok || !row) {
-          console.error("updateSlip failed or matched no row:", bookingId, body);
-          res.status(409).json({ error: "update_failed", detail: body });
-          return;
-        }
-        // การจองคู่ (2 สนามพร้อมกัน) โอนทีเดียว — ใส่สลิปเดียวกันให้อีกแถวในกลุ่มด้วย
-        if (row.group_id) {
-          await sb(`bookings?group_id=eq.${encodeURIComponent(row.group_id)}&id=neq.${bookingId}&status=in.(pending,reviewing)`, {
-            method: "PATCH",
-            body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
-          });
-        }
-        await notifySlipBooking(row);
-        res.status(200).json({ booking: row });
-        return;
-      }
-
-      case "cancelPending": {
-        // ลูกค้ากดยกเลิกเองจากหน้าชำระเงิน (เช่นกดหมดเวลาแล้วไม่รอ) — ปล่อยช่วงเวลาคืนทันที + แจ้งเตือนแอดมิน
-        const { bookingId } = p;
-        if (!bookingId) { res.status(400).json({ error: "missing bookingId" }); return; }
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        // ยกเลิกได้เฉพาะการจองของตัวเอง (เงื่อนไข customer_id) — ของคนอื่นจะไม่ตรงเงื่อนไข ไม่เกิดอะไรขึ้น
-        const { ok, body } = await sb(`bookings?id=eq.${encodeURIComponent(bookingId)}&customer_id=eq.${who.phone}&status=in.(pending,reviewing)`, {
-          method: "PATCH",
-          headers: { Prefer: "return=representation" },
-          body: JSON.stringify({ status: "cancelled" }),
-        });
-        const row = (body || [])[0] || null;
-        if (ok && row) {
-          if (row.discount_code) await releaseDiscountByCode(row.discount_code); // ยกเลิกรายการที่ยังไม่ได้ชำระ/ยังไม่ยืนยัน → คืนสิทธิ์ใช้โค้ด
-          if (row.package_id) await releasePackageStartIfUnused(row.package_id); // การจองด้วยแพ็คเกจถูกยกเลิก → ถ้าไม่เหลือการจองอื่น ถอยกลับเป็นยังไม่เริ่มนับอายุ
-          let courtLabel = `Court ${row.court_id}`;
-          let totalPrice = row.price || 0;
-          if (row.group_id) {
-            const { body: others } = await sb(`bookings?group_id=eq.${encodeURIComponent(row.group_id)}&id=neq.${bookingId}&status=in.(pending,reviewing)`, {
-              method: "PATCH",
-              headers: { Prefer: "return=representation" },
-              body: JSON.stringify({ status: "cancelled" }),
-            });
-            const ids = [row, ...(others || [])].map(r => r.court_id).sort();
-            courtLabel = ids.map(c => `Court ${c}`).join(" + ");
-            totalPrice += (others || []).reduce((s, r) => s + (r.price || 0), 0);
+          if (discount && !firstTimeEligible) {
+            const confirmed = window.confirm(lang==="th" ? "การใช้โค้ดส่วนลด หากกดดำเนินการต่อแล้วจะไม่สามารถใช้โค้ดนี้ซ้ำได้อีก" : "Once you proceed, this discount code cannot be used again.");
+            if (!confirmed) return;
           }
-          const startMin = (row.hour || 0) * 60 + (row.start_minute || 0);
-          const dur = row.duration_minutes || 60;
-          const text =
-            `❌ <b>ลูกค้ายกเลิกการจองเอง</b>\n\n` +
-            `👤 ${esc(row.customer_name || "-")}\n` +
-            `📞 ${row.customer_id}\n` +
-            `🎾 ${courtLabel}\n` +
-            `📅 ${row.booking_date}\n` +
-            `🕐 ${minutesToLabel(startMin)}–${minutesToLabel(startMin+dur)}\n` +
-            `💰 ฿${totalPrice.toLocaleString()}`;
-          await notifyTelegram(text);
-        }
-        res.status(200).json({ ok: true });
+          // โค้ดครอบคลุมทั้งยอด (ไม่เหลือยอดให้โอน) → ไม่ต้องไปหน้า QR/แนบสลิป ส่งเป็นคำขอรอแอดมินยืนยันเลย
+          if (finalPrice === 0 && discount && !firstTimeEligible && !isGroup) {
+            onConfirmFree({ name: name.trim(), phone, discount });
+            return;
+          }
+          onConfirm({name:name.trim(),phone,discount:firstTimeEligible?null:discount,finalPrice,discountAmount});
+        }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:(ok&&!ftChecking&&!checkingPkg&&!linking)?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:(ok&&!ftChecking&&!checkingPkg&&!linking)?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:(ok&&!ftChecking&&!checkingPkg&&!linking)?"pointer":"not-allowed"}}>{linking?(lang==="th"?"กำลังผูกเบอร์...":"Linking..."):(finalPrice===0&&discount&&!firstTimeEligible&&!isGroup&&!useCredit&&ok&&!ftChecking&&!checkingPkg)?(lang==="th"?"ยืนยันการจอง (ใช้โค้ดเต็มจำนวน) ✓":"Confirm Booking (full-value code) ✓"):(ok&&(ftChecking||checkingPkg))?(lang==="th"?"กำลังตรวจสอบสิทธิ์...":"Checking eligibility..."):useCredit?(lang==="th"?"ยืนยันการจอง (ใช้สิทธิ์) ✓":"Confirm Booking (Use Credit) ✓"):t.confirmBooking}</button>
+      </div>
+    </div>
+  );
+}
+
+// resumeBooking (ถ้ามี) = { id, createdAt } ใช้ตอนกลับมาหน้านี้หลัง reload โดยไม่ต้องสร้างการจองใหม่ซ้ำ
+function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCreated, onStartOver }) {
+  const t = T[lang];
+  const { date, court, slot } = booking;
+  const courts = booking.courts;
+  const isGroup = !!(courts && courts.length > 1);
+  const courtLabel = isGroup ? courts.map(c => c.courtName).join(" + ") : court.courtName;
+  const { finalPrice: clientPrice, discountAmount, discount } = customer; // clientPrice = ราคาที่หน้ากรอกข้อมูลคำนวณไว้ (เป็นแค่ค่าคาดการณ์)
+  const initialSecs = resumeBooking
+    ? Math.max(0, 300 - Math.floor((Date.now() - parseUtc(resumeBooking.createdAt).getTime())/1000))
+    : 300;
+  const [secs, setSecs] = useState(initialSecs);
+  const [expired, setExpired] = useState(initialSecs <= 0);
+  const [slip, setSlip] = useState(null);
+  const [slipPreview, setSlipPreview] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploaded, setUploaded] = useState(false);
+  const [bookingId, setBookingId] = useState(resumeBooking?.id || null);
+  // ราคาจริงที่เซิร์ฟเวอร์คำนวณและบันทึกไว้ — ใช้แสดงยอดโอน/แจ้ง Telegram เสมอ (กู้หน้าจากการจองเดิม ราคามาจากฐานข้อมูลอยู่แล้ว)
+  const [serverPrice, setServerPrice] = useState(resumeBooking ? clientPrice : null);
+  const fileRef = useRef();
+  const savedRef = useRef(!!resumeBooking);
+
+  useEffect(() => {
+    const save = async () => {
+      if (savedRef.current) return;
+      savedRef.current = true;
+      // สร้างการจอง — เซิร์ฟเวอร์เป็นคนตรวจสอบช่วงเวลาว่างและคำนวณราคาสุดท้ายเองทั้งหมด
+      // จอง 2 สนามพร้อมกัน → สร้าง 2 แถวในครั้งเดียว (ไม่ใช้โค้ดส่วนลด) / จอง 1 สนามตามปกติ
+      const result = isGroup
+        ? await db.createBookingMulti({
+            courtIds: courts.map(c => c.courtId),
+            customerId: customer.phone,
+            customerName: customer.name,
+            bookingDate: toIso(date),
+            hour: slot.hour,
+            startMinute: slot.startMinute || 0,
+            durationMinutes: slot.durationMinutes || 60,
+          })
+        : await db.createBooking({
+            courtId: court.courtId,
+            customerId: customer.phone,
+            customerName: customer.name,
+            bookingDate: toIso(date),
+            hour: slot.hour,
+            startMinute: slot.startMinute || 0,
+            durationMinutes: slot.durationMinutes || 60,
+            discountCodeId: discount?.id || null,
+          });
+      const { booking: b, error } = result;
+      if (error) {
+        // บัญชี/เบอร์มีปัญหา → บอกสาเหตุ / นอกนั้นคือช่วงเวลาเพิ่งถูกจองไปโดยคนอื่น (แข่งกันจองพร้อมกัน)
+        alert(error === "discount_invalid" ? (lang==="th" ? "โค้ดส่วนลดนี้ใช้ไม่ได้แล้ว (หมดอายุหรือถูกใช้ไปแล้ว) กรุณากลับไปตรวจสอบโค้ดอีกครั้ง" : "This discount code can no longer be used (expired or already used).")
+          : (accountErrMsg(error, lang) || (lang==="th" ? "ขออภัย ช่วงเวลานี้เพิ่งถูกจองไปแล้ว กรุณาเลือกช่วงเวลาใหม่" : "Sorry, this time slot was just booked. Please choose another time.")));
+        onDone(customer.phone);
         return;
       }
-
-      case "createPackage": {
-        // ซื้อแพ็คเกจใหม่ — เซิร์ฟเวอร์เป็นคนตัดสินราคา/วันหมดอายุเองเสมอ ไม่เชื่อค่าจาก client
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        const customerId = who.phone;
-        const customerName = who.name;
-        // โปรพิเศษ 11.11: เลือกด้วยรหัสโปร (เช่น ALL-11) — ประเภท/จำนวนครั้ง/ราคา/อายุ มาจากตารางโปรของเซิร์ฟเวอร์ ไม่ใช่ค่าที่ส่งมา
-        const promoItem = p.promo ? PROMO_1111.items[p.promo] : null;
-        if (p.promo && !promoItem) { res.status(400).json({ error: "invalid promo" }); return; }
-        if (promoItem && !promoOpen()) { res.status(400).json({ error: promoNotStarted() ? "promo_not_started" : "promo_ended" }); return; }
-        const tier = promoItem ? promoItem.tier : p.tier;
-        const credits = promoItem ? promoItem.credits : p.credits;
-        if (!["offpeak", "peak"].includes(tier)) { res.status(400).json({ error: "invalid tier" }); return; }
-        const def = promoItem ? { price: promoItem.price, days: promoItem.days } : PACKAGE_PRICES[tier]?.[credits];
-        if (!def) { res.status(400).json({ error: "invalid credits" }); return; }
-        if (!/^[0-9]{10}$/.test(customerId || "")) { res.status(400).json({ error: "invalid phone" }); return; }
-        if (!customerName || String(customerName).trim().length < 1) {
-          res.status(400).json({ error: "invalid name" }); return;
-        }
-
-        await sb(`customers`, {
-          method: "POST",
-          headers: { Prefer: "resolution=ignore-duplicates" },
-          body: JSON.stringify({ customer_id: customerId, customer_name: customerName }),
-        });
-
-        const ins = await sb(`packages`, {
-          method: "POST",
-          headers: { Prefer: "return=representation" },
-          body: JSON.stringify({
-            customer_id: customerId, customer_name: customerName, tier,
-            total_credits: credits, remaining_credits: credits,
-            price: def.price, expiry_days: def.days, status: "pending",
-            ...(promoItem ? { promo_code: PROMO_TAG + p.promo } : {}),
-          }),
-        });
-        const pkgRow = Array.isArray(ins.body) ? ins.body[0] : null;
-        if (!pkgRow) { res.status(500).json({ error: /promo_code/.test(JSON.stringify(ins.body || "")) ? "promo_columns_missing" : "insert_failed" }); return; }
-        res.status(200).json({ package: pkgRow });
-        return;
-      }
-
-      case "updatePackageSlip": {
-        const { packageId, slipUrl } = p;
-        if (!packageId || !slipUrl) { res.status(400).json({ error: "missing params" }); return; }
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        if (!isOwnSlipUrl(slipUrl, `pkg_${packageId}`)) { res.status(400).json({ error: "invalid_slip_url" }); return; }
-        const { ok, body } = await sb(`packages?id=eq.${encodeURIComponent(packageId)}&customer_id=eq.${who.phone}&status=in.(pending,reviewing)`, {
-          method: "PATCH",
-          headers: { Prefer: "return=representation" },
-          body: JSON.stringify({ slip_url: slipUrl, status: "reviewing" }),
-        });
-        const row = (body || [])[0] || null;
-        if (!ok || !row) { res.status(409).json({ error: "update_failed", detail: body }); return; }
-        await notifySlipPackage(row);
-        res.status(200).json({ package: row });
-        return;
-      }
-
-      case "cancelPendingPackage": {
-        const { packageId } = p;
-        if (!packageId) { res.status(400).json({ error: "missing packageId" }); return; }
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(403).json({ error: who.error }); return; }
-        const { ok, body } = await sb(`packages?id=eq.${encodeURIComponent(packageId)}&customer_id=eq.${who.phone}&status=in.(pending,reviewing)`, {
-          method: "PATCH",
-          headers: { Prefer: "return=representation" },
-          body: JSON.stringify({ status: "cancelled" }),
-        });
-        const row = (body || [])[0] || null;
-        if (ok && row) {
-          const text =
-            `❌ <b>ลูกค้ายกเลิกการซื้อแพ็คเกจเอง</b>\n\n` +
-            `👤 ${esc(row.customer_name || "-")}\n` +
-            `📞 ${row.customer_id}\n` +
-            `🎟 ${row.tier === "peak" ? "Peak" : "Off Peak"} × ${row.total_credits} ครั้ง\n` +
-            `💰 ฿${row.price?.toLocaleString?.() || row.price}`;
-          await notifyTelegram(text);
-        }
-        res.status(200).json({ ok: true });
-        return;
-      }
-
-      case "myPackages": {
-        const { phone } = p;
-        if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
-        const me = await getSessionUser(p.session);
-        if (me.error) { res.status(403).json({ error: me.error }); return; }
-        if (me.phone && me.phone !== phone) { res.status(403).json({ error: "not_owner" }); return; }
-        const { body } = await sb(`packages?customer_id=eq.${phone}&select=*&order=created_time.desc`);
-        let pkgs = await Promise.all((Array.isArray(body) ? body : []).map(async ({ admin_note, ...pk }) => (pk.status === "active" ? { ...pk, reserved_credits: await getReservedCredits(pk.id) } : pk))); // admin_note = หมายเหตุภายในของแอดมิน ไม่ส่งให้ลูกค้า
-        // ยังไม่ผูกเบอร์ (กำลังกรอกเบอร์เป็นครั้งแรกเพื่อให้ระบบหาสิทธิ์แพ็คเกจให้) → ส่งเฉพาะข้อมูลสิทธิ์ที่จำเป็น ไม่ส่งชื่อ/ราคา/สลิป
-        if (!me.phone) pkgs = pkgs.map(({ id, tier, status, total_credits, remaining_credits, expiry_date, expiry_days, first_use_date, promo_code, reserved_credits }) => ({ id, tier, status, total_credits, remaining_credits, expiry_date, expiry_days, first_use_date, promo_code, reserved_credits }));
-        res.status(200).json({ packages: pkgs });
-        return;
-      }
-
-      case "lineLogin": {
-        // แลก code จาก LINE เป็นข้อมูลโปรไฟล์ — ทำที่เซิร์ฟเวอร์ทั้งหมด secret ไม่หลุดไปที่เบราว์เซอร์
-        const { code } = p;
-        if (!LINE_LOGIN_CHANNEL_ID || !LINE_LOGIN_CHANNEL_SECRET) { res.status(500).json({ error: "line_not_configured" }); return; }
-        if (!code || typeof code !== "string") { res.status(400).json({ error: "missing code" }); return; }
-
-        const tokenRes = await fetch("https://api.line.me/oauth2/v2.1/token", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            grant_type: "authorization_code", code, redirect_uri: LINE_REDIRECT_URI,
-            client_id: LINE_LOGIN_CHANNEL_ID, client_secret: LINE_LOGIN_CHANNEL_SECRET,
-          }).toString(),
-        });
-        const tokenJson = await tokenRes.json().catch(() => ({}));
-        if (!tokenRes.ok || !tokenJson.access_token) {
-          console.error("LINE token exchange failed:", tokenJson?.error, tokenJson?.error_description);
-          res.status(400).json({ error: "line_token_failed" }); return;
-        }
-        const profRes = await fetch("https://api.line.me/v2/profile", {
-          headers: { Authorization: `Bearer ${tokenJson.access_token}` },
-        });
-        const prof = await profRes.json().catch(() => ({}));
-        if (!profRes.ok || !prof.userId) { res.status(400).json({ error: "line_profile_failed" }); return; }
-
-        // เช็คว่าลูกค้าเป็นเพื่อนกับ LINE OA (ที่ผูกกับ Login Channel ไว้) แล้วหรือยัง
-        // true = เป็นเพื่อนแล้ว / false = ยังไม่เป็น / null = เช็คไม่ได้ (เช่นยังไม่ได้ผูก OA หรือ LINE ขัดข้อง) → ฝั่งเว็บจะ "ไม่บล็อก" กันลูกค้าจองไม่ได้
-        let isFriend = null;
+      if (b) {
+        // ราคาจริง = ที่เซิร์ฟเวอร์บันทึก (การจองคู่ = รวมทุกแถว)
+        const total = isGroup ? (result.bookings || []).reduce((s, r) => s + (r.price || 0), 0) : (b.price ?? clientPrice);
+        setServerPrice(total);
+        setBookingId(b.id);
+        // เก็บ bookingId ไว้ทั้งใน URL และ localStorage — ถ้าเบราว์เซอร์รีโหลดตอนออกไปสแกนจ่ายเงินแล้วกลับมา
+        // (โดยเฉพาะ in-app browser บางตัวที่อาจล้าง query string ตอนโหลดใหม่)
+        // ระบบจะดึงการจองนี้กลับมาที่หน้าแนบสลิปได้ทันที ไม่หลุดกลับไปหน้าแรก
         try {
-          const frRes = await fetch("https://api.line.me/friendship/v1/status", {
-            headers: { Authorization: `Bearer ${tokenJson.access_token}` },
-          });
-          if (frRes.ok) {
-            const fr = await frRes.json().catch(() => ({}));
-            if (typeof fr.friendFlag === "boolean") isFriend = fr.friendFlag;
-          } else {
-            console.error("LINE friendship status check failed:", frRes.status);
-          }
-        } catch (e) { console.error("LINE friendship status error:", e?.message); }
+          const url = new URL(window.location.href);
+          url.searchParams.set("booking", b.id);
+          window.history.replaceState(null, "", url.toString());
+        } catch { /* no-op */ }
+        try {
+          localStorage.setItem("nova_pending_booking", JSON.stringify({ id: b.id, createdAt: b.created_time }));
+        } catch { /* no-op */ }
+        // แจ้งขึ้นไปให้ AppV2 รู้จักการจองนี้ด้วย (แม้เป็นการจองใหม่ ไม่ใช่ resume) — เพื่อให้แถบ
+        // "กลับไปชำระเงิน" คำนวณเวลาที่เหลือได้ถูกต้อง ไม่ว่าจะออกจากหน้านี้ไปทางไหนก็ตาม
+        onCreated?.(b.id, b.created_time);
+        const utm = getStoredUtm();
+        if (utm) db.recordSource("booking", b.id, utm).catch(() => {});
+      }
+    };
+    save();
+  }, []);
 
-        // บันทึก/อัปเดตผู้ใช้ (merge เฉพาะคอลัมน์ที่ส่ง — เบอร์/ชื่อที่ผูกไว้เดิมไม่ถูกเขียนทับ)
-        const upsertBody = { line_user_id: prof.userId, display_name: prof.displayName || null, last_login: new Date().toISOString() };
-        if (isFriend !== null) upsertBody.is_friend = isFriend;
-        const upsertRes = await sb(`line_users`, {
-          method: "POST",
-          headers: { Prefer: "resolution=merge-duplicates" },
-          body: JSON.stringify(upsertBody),
-        });
-        if (!upsertRes.ok && "is_friend" in upsertBody) {
-          // คอลัมน์ is_friend ยังไม่ถูกสร้าง (ยังไม่ได้รัน SQL) — บันทึกส่วนอื่นให้ก่อน ล็อกอินจะได้ไม่พัง
-          console.error("line_users upsert with is_friend failed — run add-line-friend-column.sql");
-          delete upsertBody.is_friend;
-          await sb(`line_users`, { method: "POST", headers: { Prefer: "resolution=merge-duplicates" }, body: JSON.stringify(upsertBody) });
-        }
-        const { body: rows } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(prof.userId)}&select=*`);
-        const row = (rows || [])[0] || {};
-        if (row.phone && prof.displayName) {
-          const lineName = toBookingName(prof.displayName);
-          if (lineName && lineName !== row.customer_name) {
-            await sb(`line_users?line_user_id=eq.${encodeURIComponent(prof.userId)}`, { method: "PATCH", body: JSON.stringify({ customer_name: lineName }) });
-            await sb(`customers?customer_id=eq.${row.phone}`, { method: "PATCH", body: JSON.stringify({ customer_name: lineName }) });
-            await sb(`packages?customer_id=eq.${row.phone}`, { method: "PATCH", body: JSON.stringify({ customer_name: lineName }) });
-            row.customer_name = lineName;
-          }
-        }
-        res.status(200).json({
-          session: signLineSession(prof.userId),
-          profile: { displayName: prof.displayName || "", pictureUrl: prof.pictureUrl || "", name: row.customer_name || "", phone: row.phone || "", isFriend: isFriend ?? (typeof row.is_friend === "boolean" ? row.is_friend : null) },
-        });
+  useEffect(() => {
+    if (secs <= 0) { setExpired(true); return; }
+    const timer = setTimeout(() => setSecs(s => s-1), 1000);
+    return () => clearTimeout(timer);
+  }, [secs]);
+
+  const mm = String(Math.floor(Math.max(secs,0)/60)).padStart(2,"0");
+  const ss = String(Math.max(secs,0)%60).padStart(2,"0");
+  const pct = (Math.max(secs,0)/300)*100;
+  const urgent = secs <= 60 && !expired;
+
+  const handleSlipChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setSlip(file);
+    setSlipPreview(URL.createObjectURL(file));
+  };
+
+  const handleUpload = async () => {
+    if (!slip || !bookingId) return;
+    setUploading(true);
+    const up = await db.uploadSlip(slip, bookingId);
+    const url = typeof up === "string" ? up : null;
+    if (!url) { alert(uploadFailMsg(up, lang)); setUploading(false); return; }
+    if (url) {
+      const updated = await db.updateSlip(bookingId, url);
+      if (updated?._error === "slot_taken_late") {
+        // เซิร์ฟเวอร์ยกเลิกรายการนี้แล้ว เก็บสลิปไว้ให้แอดมิน และแจ้ง Telegram แอดมินให้ติดต่อลูกค้า (ลูกค้าอาจโอนเงินมาแล้ว)
+        setUploading(false);
+        alert(lang==="th"
+          ? `หมดเวลาชำระเงินแล้ว และช่วงเวลานี้ถูกลูกค้าท่านอื่นจองไปแล้ว\n\nหากท่านโอนเงินไปแล้ว ทางร้านได้รับแจ้งพร้อมสลิปของท่านแล้ว และจะติดต่อกลับเพื่อคืนเงินหรือจัดเวลาใหม่ให้\nหรือติดต่อร้านโดยตรงได้ที่ ${ADMIN_CONTACT_PHONE}`
+          : `The payment time has expired and this time slot has been booked by someone else.\n\nIf you have already transferred the money, the studio has been notified with your slip and will contact you to refund or reschedule.\nYou can also call us directly: ${ADMIN_CONTACT_PHONE}`);
+        onStartOver?.();
         return;
       }
-
-      case "lineMe": {
-        const userId = verifyLineSession(p.session);
-        if (!userId) { res.status(401).json({ error: "invalid_session" }); return; }
-        const { body: rows } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}&select=*`);
-        const row = (rows || [])[0];
-        if (!row) { res.status(401).json({ error: "invalid_session" }); return; }
-        res.status(200).json({ profile: { displayName: row.display_name || "", name: row.customer_name || "", phone: row.phone || "", isFriend: typeof row.is_friend === "boolean" ? row.is_friend : null } });
+      if (!updated) {
+        // อัปเดตสถานะไม่สำเร็จจริง — ไม่ถือว่าส่งสลิปสำเร็จ ไม่แจ้งเตือนแอดมิน ให้ลูกค้าลองใหม่
+        setUploading(false);
+        alert(lang==="th" ? "ส่งสลิปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง หรือติดต่อร้านโดยตรง" : "Failed to submit slip. Please try again or contact us directly.");
         return;
       }
-
-      case "lineLinkPhone": {
-        // ผูกเบอร์ + ชื่อกับบัญชี LINE นี้ "ครั้งแรกครั้งเดียว" แล้วล็อกถาวร
-        //  - 1 เบอร์ผูกได้กับ 1 บัญชี LINE เท่านั้น / 1 บัญชี LINE มีได้ 1 เบอร์ (เปลี่ยนเบอร์ต้องให้แอดมินทำ)
-        //  - ชื่อที่ส่งมา (ค่าตั้งต้น = ชื่อ LINE) จะแทนชื่อเดิมในข้อมูลลูกค้าของเบอร์นี้ (เช่นชื่อที่แอดมินใส่ตอนจองให้) เพื่อไม่ให้ข้อมูลซ้ำซ้อน
-        //  - ถ้าเบอร์นี้มีประวัติเดิมอยู่ (เช่นแอดมินเคยจองให้) แจ้ง Telegram ให้แอดมินตรวจว่าเป็นเจ้าของเบอร์จริง
-        const userId = verifyLineSession(p.session);
-        if (!userId) { res.status(401).json({ error: "invalid_session" }); return; }
-        const { phone } = p;
-        if (!/^[0-9]{10}$/.test(phone || "")) { res.status(400).json({ error: "invalid phone" }); return; }
-
-        const { body: meRows } = await sb(`line_users?line_user_id=eq.${encodeURIComponent(userId)}&select=*`);
-        const me = (meRows || [])[0];
-        // ชื่อ = ชื่อ LINE ของบัญชีนี้ (ถ้ายังไม่มีในฐานข้อมูลจริงๆ ใช้ชื่อที่หน้าเว็บส่งมาเป็นตัวสำรอง)
-        const cleanName = toBookingName(me?.display_name) || toBookingName(p.name);
-        if (cleanName.length < 1) { res.status(400).json({ error: "invalid name" }); return; }
-        if (me?.phone) {
-          // ผูกไว้แล้ว: เบอร์เดิมเท่านั้น (ส่งเบอร์เดิมซ้ำ = ไม่เป็นไร / ส่งเบอร์ใหม่ = ปฏิเสธ)
-          if (me.phone === phone) { res.status(200).json({ ok: true, phone: me.phone, name: me.customer_name || cleanName, already: true }); return; }
-          res.status(409).json({ error: "phone_locked", phone: me.phone }); return;
-        }
-
-        const { body: others } = await sb(`line_users?phone=eq.${phone}&line_user_id=neq.${encodeURIComponent(userId)}&select=line_user_id&limit=1`);
-        if (others && others.length > 0) { res.status(409).json({ error: "phone_linked_elsewhere" }); return; }
-
-        // ดูประวัติเดิมของเบอร์นี้ก่อนผูก (ไว้แจ้งแอดมิน)
-        const { body: oldCust } = await sb(`customers?customer_id=eq.${phone}&select=customer_name`);
-        const { body: oldBookings } = await sb(`bookings?customer_id=eq.${phone}&status=neq.cancelled&select=id,customer_name&limit=50`);
-        const { body: oldPkgs } = await sb(`packages?customer_id=eq.${phone}&status=neq.cancelled&select=id&limit=50`);
-
-        const link = await sb(`line_users`, {
-          method: "POST",
-          headers: { Prefer: "resolution=merge-duplicates" },
-          body: JSON.stringify({ line_user_id: userId, phone, customer_name: cleanName }),
-        });
-        if (!link.ok) { res.status(500).json({ error: "link_failed" }); return; }
-
-        // ชื่อในข้อมูลลูกค้า = ชื่อที่ลงทะเบียนกับ LINE (แทนชื่อที่แอดมินใส่ครั้งแรก)
-        await sb(`customers`, {
-          method: "POST",
-          headers: { Prefer: "resolution=merge-duplicates" },
-          body: JSON.stringify({ customer_id: phone, customer_name: cleanName }),
-        });
-        await sb(`packages?customer_id=eq.${phone}`, { method: "PATCH", body: JSON.stringify({ customer_name: cleanName }) });
-
-        const hadHistory = (oldCust || []).length > 0 || (oldBookings || []).length > 0 || (oldPkgs || []).length > 0;
-        if (hadHistory) {
-          const oldName = (oldCust || [])[0]?.customer_name || (oldBookings || [])[0]?.customer_name || "-";
-          await notifyTelegram(
-            `🔗 <b>มีลูกค้าผูกเบอร์ที่มีประวัติเดิม</b>\n\n` +
-            `📞 ${phone}\n` +
-            `👤 ชื่อเดิมในระบบ: ${esc(oldName)} → ชื่อ LINE: ${esc(cleanName)}\n` +
-            `📋 ประวัติเดิม: จอง ${(oldBookings || []).length} รายการ, แพ็คเกจ ${(oldPkgs || []).length} รายการ\n\n` +
-            `กรุณาตรวจสอบว่าเป็นเจ้าของเบอร์จริง (เช่นทักถามผ่าน LINE) ถ้าไม่ใช่ ให้เปลี่ยนเบอร์ที่ผูกในหน้า Admin`
-          );
-        }
-        res.status(200).json({ ok: true, phone, name: cleanName, hadHistory });
-        return;
-      }
-
-      case "recordSource": {
-        // บันทึกแหล่งที่มา (UTM จากโฆษณา) ติดกับการจอง/แพ็คเกจ — ทำแยกหลังสร้างรายการเสร็จ ถ้าล้มเหลว (เช่นยังไม่ได้รัน SQL) การจองหลักไม่กระทบ
-        const { kind, id } = p;
-        const who = await getLinkedCustomer(p.session);
-        if (who.error) { res.status(200).json({ ok: false }); return; }
-        const ALLOWED = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"];
-        const utm = {};
-        if (p.utm && typeof p.utm === "object") {
-          for (const k of ALLOWED) { const v = p.utm[k]; if (typeof v === "string" && v.trim()) utm[k] = v.trim().slice(0, 80); }
-        }
-        if (!id || !["booking", "package"].includes(kind) || Object.keys(utm).length === 0) { res.status(200).json({ ok: false }); return; }
-        const table = kind === "package" ? "packages" : "bookings";
-        // เขียนได้ครั้งเดียว (utm ต้องยังว่าง) — กันถูกเขียนทับภายหลัง
-        const { ok, body } = await sb(`${table}?id=eq.${encodeURIComponent(id)}&customer_id=eq.${who.phone}&utm=is.null`, {
-          method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ utm }),
-        });
-        if (ok && kind === "booking" && body?.[0]?.group_id) {
-          await sb(`bookings?group_id=eq.${encodeURIComponent(body[0].group_id)}&utm=is.null`, { method: "PATCH", body: JSON.stringify({ utm }) });
-        }
-        res.status(200).json({ ok: !!ok });
-        return;
-      }
-
-      case "checkFirstTime": {
-        { const me = await getSessionUser(p.session); if (me.error) { res.status(403).json({ error: me.error }); return; } }
-        const { phone, bookingDate } = p;
-        if (!/^[0-9]{10}$/.test(phone || "")) { res.status(200).json({ eligible: false }); return; }
-        const promoPrice = getFirstTimePrice(bookingDate); // null = วันที่เล่นนี้อยู่นอกช่วงโปรโมชั่น
-        if (promoPrice == null) { res.status(200).json({ eligible: false }); return; }
-        const eligible = await isFirstTimeCustomer(phone);
-        res.status(200).json({ eligible, price: promoPrice });
-        return;
-      }
-
-      default:
-        res.status(400).json({ error: "unknown action" });
+      setUploaded(true);
+      trackFb("Purchase", { value: serverPrice ?? clientPrice, currency: "THB", content_name: isGroup ? "court_booking_2courts" : "court_booking" });
+      // การแจ้งเตือน Telegram ถึงแอดมินทำที่เซิร์ฟเวอร์ตอนบันทึกสลิปสำเร็จ (api/booking-actions.js) ไม่ได้ให้หน้าเว็บส่งข้อมูลเอง
     }
-  } catch (err) {
-    console.error("booking-actions error:", err);
-    res.status(500).json({ error: "internal error" });
+    setUploading(false);
+  };
+
+  return (
+    <div style={{padding:"20px 16px 90px"}} className="fu">
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:18}}>{t.payment}</h2>
+
+      <div style={{background:"#fff",borderRadius:"var(--r)",marginBottom:16,border:`1.5px solid ${expired?"#c0392b":urgent?"#e67e22":"var(--dv)"}`,padding:"16px 20px",textAlign:"center",boxShadow:"var(--sh)"}}>
+        <p style={{fontSize:12,color:"var(--mu)",marginBottom:3}}>{expired?t.timeExpired:t.payWithin}</p>
+        <p className="bb" style={{fontSize:54,lineHeight:1,color:expired?"#c0392b":urgent?"#e67e22":"var(--br)"}}>{mm}:{ss}</p>
+        <div style={{height:4,background:"var(--cr2)",borderRadius:4,marginTop:12,overflow:"hidden"}}>
+          <div style={{height:"100%",borderRadius:4,width:`${pct}%`,background:expired?"#c0392b":urgent?"#e67e22":"var(--or)",transition:"width 1s linear"}} />
+        </div>
+        {expired && onStartOver && !uploaded && (
+          <button onClick={onStartOver} style={{marginTop:12,background:"none",border:"none",color:"#c0392b",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            {lang==="th" ? "ยกเลิกรายการนี้ แล้วเริ่มจองใหม่" : "Cancel this and start a new booking"}
+          </button>
+        )}
+      </div>
+
+      <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",boxShadow:"0 4px 24px rgba(102,57,36,.12)",marginBottom:16,border:"1px solid var(--dv)"}}>
+        <p style={{fontSize:13,color:"var(--mu)",marginBottom:12}}>{t.scanQR}</p>
+        <img src="/qr-payment.png" alt="PromptPay QR" style={{width:200,height:200,objectFit:"contain",borderRadius:10,border:"1px solid var(--dv)",background:"#fff"}} />
+        <div style={{marginTop:14,display:"inline-flex",alignItems:"center",gap:8,background:"var(--or-bg)",borderRadius:20,padding:"8px 18px"}}>
+          <span style={{fontSize:24,fontWeight:800,color:"var(--or)"}}>{serverPrice != null ? `฿${serverPrice.toLocaleString()}` : (lang==="th" ? "กำลังคำนวณราคา..." : "Calculating price...")}</span>
+          <span style={{fontSize:12,color:"var(--mu)"}}>{t.transfer}</span>
+        </div>
+        {serverPrice != null && !resumeBooking && serverPrice !== clientPrice && (
+          <p style={{marginTop:10,fontSize:12,lineHeight:1.6,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:10,padding:"8px 10px"}}>
+            {lang==="th"
+              ? `ℹ️ ยอดที่ต้องโอนคือ ฿${serverPrice.toLocaleString()} (คิดตามเงื่อนไขล่าสุดของระบบ ต่างจากที่แสดงในหน้ากรอกข้อมูล ฿${clientPrice.toLocaleString()}) กรุณาโอนตามยอดนี้`
+              : `ℹ️ Please transfer ฿${serverPrice.toLocaleString()} (calculated by our system, different from ฿${clientPrice.toLocaleString()} shown earlier).`}
+          </p>
+        )}
+        <div style={{marginTop:12,padding:"10px 14px",background:"var(--cr)",borderRadius:10}}>
+          <p style={{fontSize:11,color:"var(--mu)"}}>{t.accountName}</p>
+          <p style={{fontSize:14,fontWeight:700,color:"var(--br)"}}>{PAYMENT_ACCOUNT_NAME}</p>
+          <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{PAYMENT_PHONE} (PromptPay)</p>
+        </div>
+        {discountAmount > 0 && (
+          <p style={{fontSize:12,color:"#2d7a4f",marginTop:8}}>🏷 {t.saveDiscount} ฿{discountAmount.toLocaleString()}</p>
+        )}
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div className="card-header"><p>{t.bookingDetail}</p></div>
+        <div className="card-body">
+          <Row label="👤" val={customer.name} />
+          <Row label="📞" val={customer.phone} />
+          <Row label={`🎾 ${t.court}`} val={courtLabel} />
+          <Row label={`📅 ${t.date}`} val={fmtDate(date, lang)} />
+          <Row label={`🕐 ${t.time}`} val={slot.label} />
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div className="card-header"><p>{t.uploadSlip}</p></div>
+        <div className="card-body">
+          {uploaded ? (
+            <div style={{textAlign:"center",padding:"10px 0"}}>
+              <p style={{color:"#2d7a4f",fontWeight:700,fontSize:15}}>{t.slipSent}</p>
+              <p style={{color:"var(--mu)",fontSize:13,marginTop:4}}>{t.slipSentDesc}</p>
+            </div>
+          ) : (
+            <>
+              {slipPreview && (
+                <img src={slipPreview} alt="slip" style={{width:"100%",borderRadius:10,marginBottom:12,maxHeight:200,objectFit:"cover"}} />
+              )}
+              <input ref={fileRef} type="file" accept="image/*" onChange={handleSlipChange} style={{display:"none"}} />
+              <button onClick={() => fileRef.current.click()} style={{width:"100%",padding:"12px",borderRadius:10,border:"1.5px dashed var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:600,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {slip ? t.changeSlip : t.selectSlip}
+              </button>
+              {!slip && <p style={{fontSize:12,color:"var(--mu)",marginTop:8,textAlign:"center"}}>{lang==="th"?`กรุณาเลือกรูปสลิปก่อนกดปุ่ม "ส่งสลิป" ด้านล่าง`:`Please select a slip image before pressing "Send Slip" below`}</p>}
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:24}}>
+        <div style={{padding:"11px 18px",borderBottom:"1px solid var(--dv)",background:"var(--bl-bg)"}}>
+          <p style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{t.steps}</p>
+        </div>
+        <div style={{padding:"14px 18px",display:"flex",flexDirection:"column",gap:12}}>
+          {t.stepsList.map((s,i) => (
+            <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+              <div style={{width:24,height:24,borderRadius:"50%",flexShrink:0,background:"var(--br)",color:"var(--or)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800,marginTop:1}}>{i+1}</div>
+              <p style={{fontSize:13.5,color:"var(--mu)",lineHeight:1.65}}>{s}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {uploaded ? (
+        <button className="btn-primary" onClick={() => onDone(customer.phone)}>{t.checkMyBooking} →</button>
+      ) : (
+        <button className="btn-primary" disabled={!slip || uploading || !bookingId} onClick={handleUpload} style={{opacity:(!slip||uploading||!bookingId)?0.6:1,cursor:(!slip||uploading||!bookingId)?"not-allowed":"pointer"}}>
+          {uploading ? t.sending : t.sendSlip}
+        </button>
+      )}
+
+      {/* popup แจ้งข้อควรเตรียมก่อนเข้าสนาม — ขึ้นหลังแนบสลิปสำเร็จ */}
+      {uploaded && (
+        <div style={{position:"fixed",inset:0,zIndex:400,background:"rgba(46,26,14,.55)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div className="fu" style={{background:"#fff",borderRadius:18,padding:"24px 22px",maxWidth:360,width:"100%",maxHeight:"85vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.35)"}}>
+            <p style={{fontSize:17,fontWeight:800,color:"var(--br)",marginBottom:6}}>{lang==="th" ? "✅ ส่งสลิปเรียบร้อยแล้ว" : "✅ Slip submitted"}</p>
+            <p style={{fontSize:12.5,color:"var(--mu)",marginBottom:16}}>{lang==="th" ? "สถานะ: รอการยืนยัน — ทีมงานกำลังตรวจสอบ" : "Status: awaiting confirmation"}</p>
+            <div style={{background:"var(--or-bg)",border:"1px solid rgba(244,126,31,.25)",borderRadius:12,padding:"14px 14px",marginBottom:12}}>
+              <p style={{fontSize:14,fontWeight:700,color:"var(--br)",lineHeight:1.7}}>
+                {lang==="th"
+                  ? "กรุณาเตรียมรองเท้ากีฬา รองเท้าเทนนิส รองเท้าวิ่ง หรือรองเท้ายิม มาให้เรียบร้อย รองเท้าประเภทอื่นไม่อนุญาตให้เดินในสนามทุกกรณี"
+                  : "Please bring your sports shoes — tennis, running, or gym shoes. Other types of footwear are not allowed on the court under any circumstances."}
+              </p>
+            </div>
+            <p style={{fontSize:13,color:"var(--tx)",lineHeight:1.7,marginBottom:6}}>
+              {lang==="th" ? "* หากต้องการเดินสามารถถอดรองเท้าเดินได้เลยค่ะ" : "* If you prefer, you may take your shoes off and walk on the court without them."}
+            </p>
+            <p style={{fontSize:13,fontWeight:700,color:"var(--br)",lineHeight:1.7,marginBottom:18}}>
+              {lang==="th" ? "** เข้าใช้สนามได้สูงสุด 4 คนต่อห้องเท่านั้น" : "** A maximum of 4 people per room."}
+            </p>
+            <button className="btn-primary" onClick={() => onDone(customer.phone)}>{lang==="th" ? "รับทราบ" : "Got it"}</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StepHead({ n, label }) {
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:13}}>
+      <div style={{width:28,height:28,borderRadius:"50%",background:"var(--br)",color:"var(--or)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:800}}>{n}</div>
+      <span style={{fontWeight:700,fontSize:16,color:"var(--br)"}}>{label}</span>
+    </div>
+  );
+}
+
+function Row({ label, val }) {
+  return (
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:9,gap:12}}>
+      <span style={{color:"var(--mu)",fontSize:13,flexShrink:0}}>{label}</span>
+      <span style={{fontWeight:600,fontSize:13,color:"var(--tx)",textAlign:"right"}}>{val}</span>
+    </div>
+  );
+}
+
+function Dot({ color, label }) {
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:6}}>
+      <div style={{width:9,height:9,borderRadius:"50%",background:color,flexShrink:0}} />
+      <span style={{fontSize:12,color:"var(--mu)"}}>{label}</span>
+    </div>
+  );
+}
+
+// ─── Package (แพ็คเกจสมาชิก) ──────────────────────────────────────────────────
+function PackagePage({ lang="th", lineSession, onLineLogin, onLinkPhone }) {
+  const t = T[lang];
+  const promo = usePromo1111(); // โปร 11.11 เปิดอยู่ → แสดงรายการโปรแทนแพ็คเกจปกติ
+  useEffect(() => { // มาจากแบนเนอร์หน้าแรก → เลื่อนลงไปที่รายการโปรให้เห็นตัวเลือกชัดๆ (ครั้งเดียว)
+    if (!window.__promoScroll) return; window.__promoScroll = false;
+    const id = setTimeout(() => document.getElementById("promo-1111")?.scrollIntoView({ behavior: "smooth", block: "start" }), 450);
+    return () => clearTimeout(id);
+  }, []);
+  const [selected, setSelected] = useState(null); // { tier, credits, price, days }
+  const lineName = toFormName(lineSession?.displayName || lineSession?.name) || "ลูกค้า LINE"; // ชื่อในการจอง = ชื่อ LINE เสมอ (เซิร์ฟเวอร์ก็ใช้ชื่อนี้ ไม่เชื่อชื่อที่ส่งมาจากหน้าเว็บ)
+  const [name, setName] = useState(lineName);
+  useEffect(() => { setName(lineName); }, [lineName]);
+  const [phone, setPhone] = useState(() => lineSession?.phone || "");
+  const [creating, setCreating] = useState(false);
+  const [createErr, setCreateErr] = useState("");
+  const [pkg, setPkg] = useState(null); // แพ็คเกจที่สร้างแล้ว รอชำระเงิน
+  const [resumed, setResumed] = useState(false); // true = เปิดกลับมาจากรายการที่ค้างอยู่ (ไม่ใช่เพิ่งสร้าง)
+  const [busyId, setBusyId] = useState(null);
+
+  const [lookupPhone, setLookupPhone] = useState(() => lineSession?.phone || "");
+  const [myPkgs, setMyPkgs] = useState([]);
+  const [lookupLoading, setLookupLoading] = useState(false);
+  const [searched, setSearched] = useState(false);
+
+  // ล็อกอิน LINE แล้วและมีเบอร์ที่ผูกไว้ → แสดงแพ็คเกจของฉันให้เลย ไม่ต้องกดค้นหา
+  useEffect(() => {
+    const ph = lineSession?.phone;
+    if (!ph || !/^[0-9]{10}$/.test(ph)) return;
+    setLookupLoading(true);
+    db.myPackages(ph).then(rows => { setMyPkgs(rows || []); setSearched(true); }).catch(() => {}).finally(() => setLookupLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lineSession?.phone]);
+
+  const nameOk = name.trim().length >= 1; // ชื่อมาจาก LINE (ตัดที่ 20 ตัวอักษรไว้แล้ว)
+  const phoneOk = /^[0-9]{10}$/.test(phone);
+  const phoneLocked = !!lineSession?.phone;
+  useEffect(() => { if (lineSession?.phone) { setPhone(lineSession.phone); setLookupPhone(lineSession.phone); } }, [lineSession?.phone]);
+
+  const handleLookup = async () => {
+    if (!/^[0-9]{10}$/.test(lookupPhone)) return;
+    setLookupLoading(true); setSearched(false);
+    const rows = await db.myPackages(lookupPhone);
+    setMyPkgs(rows || []); setLookupLoading(false); setSearched(true);
+  };
+
+  const handleBuy = async () => {
+    if (!selected || !nameOk || !phoneOk || creating) return;
+    setCreateErr("");
+    if (lineSession && !lineSession.phone) {
+      const sure = window.confirm(lang==="th"
+        ? `ยืนยันเบอร์ ${phone} ใช่หรือไม่?\n\nเบอร์นี้จะถูกผูกกับบัญชี LINE ของคุณ และแก้ไขเองไม่ได้อีก (ต้องติดต่อแอดมิน)`
+        : `Confirm phone number ${phone}?\n\nIt will be linked to your LINE account and can't be changed by yourself later.`);
+      if (!sure) return;
+      setCreating(true);
+      const r = await onLinkPhone(name.trim(), phone);
+      if (!r?.ok) { setCreating(false); setCreateErr(accountErrMsg(r?.error, lang) || (lang==="th" ? "ผูกเบอร์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Couldn't link your number. Please try again.")); return; }
+    }
+    setCreating(true);
+    const { package: pkgRow, error } = await db.createPackage({
+      tier: selected.tier, credits: selected.credits, promo: selected.promo, customerId: phone, customerName: name.trim(),
+    });
+    setCreating(false);
+    const promoErr = { promo_ended: lang==="th" ? "โปร 11.11 ปิดรับซื้อแล้ว" : "The 11.11 promo has ended", promo_not_started: lang==="th" ? "โปร 11.11 ยังไม่เปิดขาย (เริ่ม 10 พ.ย. 69 เวลา 00:00)" : "The 11.11 promo hasn't started yet (starts 10 Nov 2026, 00:00)", promo_columns_missing: lang==="th" ? "ระบบโปรยังตั้งค่าไม่ครบ กรุณาแจ้งแอดมิน" : "Promo setup is incomplete. Please contact admin." }[error];
+    if (error || !pkgRow) { setCreateErr(promoErr || accountErrMsg(error, lang) || (lang==="th" ? "สร้างรายการไม่สำเร็จ ลองใหม่อีกครั้ง" : "Failed to create order, please try again")); return; }
+    setPkg(pkgRow);
+    const utm = getStoredUtm();
+    if (utm) db.recordSource("package", pkgRow.id, utm).catch(() => {});
+  };
+
+  // โหลดรายการ "แพ็คเกจของฉัน" ใหม่ (หลังชำระ/ยกเลิก/กลับจากหน้าชำระเงิน) เพื่อให้สถานะตรงกับเซิร์ฟเวอร์
+  const reloadMine = async () => {
+    const ph = lineSession?.phone || lookupPhone;
+    if (!/^[0-9]{10}$/.test(ph || "")) return;
+    const rows = await db.myPackages(ph).catch(() => null);
+    if (rows) setMyPkgs(rows);
+  };
+  const cancelPending = async (row) => {
+    const sure = window.confirm(lang==="th" ? "ยกเลิกรายการนี้ใช่หรือไม่?\n\n(ถ้าคุณโอนเงินไปแล้ว อย่ายกเลิก — ให้กด “ไปชำระเงินต่อ” แล้วแนบสลิปแทน)" : "Cancel this order?\n\n(If you've already paid, don't cancel — tap “Continue to payment” and attach your slip instead.)");
+    if (!sure) return;
+    setBusyId(row.id);
+    await db.cancelPendingPackage(row.id).catch(() => {});
+    await reloadMine();
+    setBusyId(null);
+  };
+  if (pkg) {
+    const leave = () => { setPkg(null); setResumed(false); reloadMine(); };
+    return <PackagePaymentView pkg={pkg} lang={lang} resumed={resumed} onBack={leave} onDone={() => { setSelected(null); setName(lineName); setPhone(lineSession?.phone || ""); leave(); }} />;
   }
+
+  const pkgStatusInfo = (s) => {
+    if (s === "active") return { text: lang==="th"?"ใช้งานได้":"Active", color: "#2d7a4f" };
+    if (s === "reviewing") return { text: lang==="th"?"รอการยืนยัน":"Awaiting confirmation", color: "#e67e22" };
+    if (s === "cancelled") return { text: lang==="th"?"ยกเลิกแล้ว":"Cancelled", color: "#c0392b" };
+    return { text: lang==="th"?"รอชำระเงิน":"Awaiting payment", color: "var(--mu)" };
+  };
+
+  return (
+    <div style={{padding:"20px 16px 100px",display:"flex",flexDirection:"column",gap:22}} className="fu">
+      <section>
+        <h2 className="bb" style={{fontSize:26,color:"var(--br)",marginBottom:4}}>{lang==="th"?"แพ็คเกจสมาชิก":"Membership Packages"}</h2>
+        <p style={{fontSize:12.5,color:"var(--mu)"}}>{lang==="th"?"ซื้อจำนวนครั้งล่วงหน้า ถูกกว่าจ่ายเดี่ยว ใช้จองได้ภายในระยะเวลาที่กำหนด โดยอายุแพ็คเกจเริ่มนับจากวันเล่นครั้งแรกที่จอง (จอง 60 นาที ตัด 1 ครั้ง หรือ 120 นาที ตัด 2 ครั้ง)":"Buy sessions in advance, cheaper than paying per visit. The validity starts from your first play date and all play dates must fall within it. Book 60 minutes (uses 1 credit) or 120 minutes (uses 2 credits)."}</p>
+      </section>
+
+      <section>
+        <div style={{background:"var(--bl-bg)",border:"1px solid rgba(141,182,199,.4)",borderRadius:12,padding:"14px 16px"}}>
+          <p style={{fontSize:13,fontWeight:700,color:"var(--br)",marginBottom:8}}>{lang==="th"?"📌 วิธีใช้สิทธิ์แพ็คเกจ":"📌 How to use your package"}</p>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {(lang==="th" ? [
+              "เลือกและซื้อแพ็คเกจด้านล่าง แล้วโอนเงิน + แนบสลิป",
+              "รอแอดมินตรวจสอบและกดยืนยัน แพ็คเกจก็พร้อมใช้งานทันที (ยังไม่เริ่มนับอายุ)",
+              "ไปที่แท็บ \"จองสนาม\" ตามปกติ — แพ็ค Peak จองได้ทุกช่วงเวลา (ทั้ง Peak และ Off Peak) ส่วนแพ็ค Off Peak จองได้เฉพาะช่วง Off Peak",
+              "ตอนกรอกชื่อ-เบอร์โทร ถ้ามีสิทธิ์คงเหลือ ระบบจะโชว์ตัวเลือก \"ใช้สิทธิ์จากแพ็คเกจ\" ให้กดเลือกแทนการโอนเงิน — อายุแพ็คเกจจะเริ่มนับจาก \"วันเล่นครั้งแรก\" ที่จองด้วยแพ็คเกจ (วันเล่นวันแรกนับเป็นวันที่ 1) เช่น แพ็ค 7 วัน จองเล่นครั้งแรก 2 พ.ย. ใช้เล่นได้ 2–8 พ.ย. การจองครั้งต่อไปต้องอยู่ในช่วงนี้",
+              "แอดมินจะกดยืนยันการจองนี้อีกครั้ง (เหมือนการจองปกติ) ถึงจะหักสิทธิ์จริง",
+            ] : [
+              "Choose and buy a package below, then transfer and upload your payment slip",
+              "Wait for admin to verify and confirm — your package is then ready to use (the validity period has not started yet)",
+              "Go to the \"Book\" tab as usual — a Peak package works for any time (Peak and Off Peak); an Off Peak package works for Off Peak times only",
+              "When entering your name/phone, if you have credits left, you'll see an option to \"Use package credit\" instead of paying. The validity starts from your first play date booked with the package (that day counts as day 1) — e.g. a 7-day package first used on Nov 2 is playable Nov 2–8; later bookings must fall within that period",
+              "Admin will confirm this booking (same as a normal booking) — only then is a credit actually deducted",
+            ]).map((txt,i) => (
+              <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start"}}>
+                <span style={{fontSize:11.5,fontWeight:800,color:"var(--br)",flexShrink:0}}>{i+1}.</span>
+                <p style={{fontSize:12,color:"var(--tx)",lineHeight:1.6}}>{txt}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* ค้นหาแพ็คเกจของฉัน */}
+      <section>
+        <StepHead n="🔍" label={lang==="th"?"แพ็คเกจของฉัน":"My Packages"} />
+        <div style={{display:"flex",gap:8,marginBottom:12}}>
+          <input value={lookupPhone} readOnly={phoneLocked} onChange={e => { if (!phoneLocked) setLookupPhone(e.target.value.replace(/\D/g,"").slice(0,10)); }}
+            placeholder={t.searchPlaceholder} inputMode="numeric"
+            style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
+          <button onClick={handleLookup} disabled={lookupLoading || lookupPhone.length < 10} style={{padding:"0 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
+            {lookupLoading ? "..." : t.searchBtn}
+          </button>
+        </div>
+        {searched && myPkgs.length === 0 && (
+          <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",border:"1px solid var(--dv)"}}>
+            <p style={{color:"var(--mu)",fontSize:13.5}}>{lang==="th"?"ไม่พบแพ็คเกจสำหรับเบอร์นี้":"No packages found for this number"}</p>
+          </div>
+        )}
+        {myPkgs.length > 0 && (
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {myPkgs.map(p => {
+              const st = pkgStatusInfo(p.status);
+              const expired = p.status==="active" && p.expiry_date && new Date(p.expiry_date+"T23:59:59") < new Date();
+              return (
+                <div key={p.id} className="card" style={p.status==="pending" ? {border:"2px solid var(--or)"} : undefined}>
+                  <div style={{padding:"13px 16px"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                      <span style={{fontWeight:700,color:"var(--br)",fontSize:14}}>{promoOf(p.promo_code) ? promoLabel(promoOf(p.promo_code), lang==="th") : <>{p.tier==="peak"?"Peak":"Off Peak"} × {p.total_credits} {lang==="th"?"ครั้ง":"sessions"}</>}</span>
+                      <span style={{fontSize:11.5,fontWeight:600,color:expired?"#c0392b":st.color,background:`${expired?"#c0392b":st.color}18`,padding:"3px 9px",borderRadius:20}}>
+                        {expired ? (lang==="th"?"หมดอายุแล้ว":"Expired") : st.text}
+                      </span>
+                    </div>
+                    {p.status==="active" && !expired && (
+                      <>
+                        <Row label={lang==="th"?"เหลือ":"Remaining"} val={`${p.remaining_credits} / ${p.total_credits} ${lang==="th"?"ครั้ง":"sessions"}${p.reserved_credits > 0 ? (lang==="th" ? ` (จองรอยืนยัน ${p.reserved_credits})` : ` (${p.reserved_credits} pending)`) : ""}`} />
+                        {p.expiry_date ? (
+                          <>
+                            {p.first_use_date && <Row label={lang==="th"?"เริ่มนับอายุ":"Started"} val={niceDate(p.first_use_date, lang)} />}
+                            <Row label={lang==="th"?"ใช้เล่นได้ถึง":"Play until"} val={niceDate(p.expiry_date, lang)} />
+                          </>
+                        ) : (
+                          <Row label={lang==="th"?"อายุแพ็คเกจ":"Validity"} val={lang==="th" ? `ยังไม่เริ่มนับ (เริ่มนับจากวันเล่นครั้งแรกที่จอง • ใช้ได้ ${p.expiry_days} วัน)` : `Not started (counts from your first play date • ${p.expiry_days} days)`} />
+                        )}
+                      </>
+                    )}
+                    {(p.status==="pending" || p.status==="reviewing") && (
+                      <Row label={lang==="th"?"อายุการใช้งาน":"Valid for"} val={lang==="th"?`${p.expiry_days} วัน (นับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ)`:`${p.expiry_days} days (counted from your first play date)`} />
+                    )}
+                    <Row label={t.rowPrice} val={`฿${p.price?.toLocaleString()}`} />
+                    {p.status==="pending" && (
+                      <div style={{display:"flex",gap:8,marginTop:12}}>
+                        <button onClick={() => { setResumed(true); setPkg(p); }} data-testid={`resume-${p.id}`} style={{flex:2,padding:"12px 8px",borderRadius:10,border:"none",background:"linear-gradient(90deg,var(--or),var(--or2))",color:"#fff",fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                          💳 {lang==="th" ? "ไปชำระเงินต่อ →" : "Continue to payment →"}
+                        </button>
+                        <button onClick={() => cancelPending(p)} disabled={busyId===p.id} data-testid={`cancel-${p.id}`} style={{flex:1,padding:"12px 8px",borderRadius:10,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                          {busyId===p.id ? "..." : (lang==="th" ? "ยกเลิก" : "Cancel")}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      {/* เลือกซื้อแพ็คเกจใหม่ — ระหว่างโปร 11.11 แสดงรายการโปรแทนแพ็คเกจปกติ */}
+      {promo.active ? (
+        <section>
+          <StepHead n="🔥" label={lang==="th"?"โปรพิเศษ 11.11":"11.11 Special Offer"} />
+          <Promo1111Section lang={lang} selected={selected} onSelect={setSelected} msLeft={promo.msLeft} />
+        </section>
+      ) : (
+        <section>
+          <StepHead n="🎟" label={lang==="th"?"ซื้อแพ็คเกจใหม่":"Buy a New Package"} />
+          {["offpeak","peak"].map(tier => (
+            <div key={tier} style={{marginBottom:14}}>
+              <p style={{fontSize:13,fontWeight:700,color:"var(--br)",marginBottom:8}}>
+                {tier==="peak" ? "Peak" : "Off Peak"}
+                <span style={{fontWeight:400,color:"var(--mu)",fontSize:11.5,marginLeft:6}}>
+                  {tier==="peak" ? (lang==="th"?"(ใช้ได้ทุกช่วงเวลา: Peak + Off Peak)":"(valid for all times: Peak + Off Peak)") : (lang==="th"?"(เฉพาะ จ.-ศ. 06:00–16:00)":"(Mon-Fri 06:00–16:00 only)")}
+                </span>
+              </p>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+                {PACKAGE_TIERS[tier].map(opt => {
+                  const sel = selected?.tier===tier && selected?.credits===opt.credits;
+                  return (
+                    <button key={opt.credits} onClick={() => setSelected({ tier, ...opt })}
+                      style={{padding:"12px 6px",borderRadius:10,border:`2px solid ${sel?"var(--or)":"var(--dv)"}`,background:sel?"var(--or-bg)":"#fff",cursor:"pointer",textAlign:"center"}}>
+                      <p className="bb" style={{fontSize:20,color:sel?"var(--or)":"var(--br)",lineHeight:1}}>{opt.credits}</p>
+                      <p style={{fontSize:10,color:"var(--mu)",marginTop:2}}>{lang==="th"?"ครั้ง":"sessions"}</p>
+                      <p style={{fontSize:10.5,color:"var(--mu)",textDecoration:"line-through",marginTop:4}}>฿{opt.fullPrice.toLocaleString()}</p>
+                      <p style={{fontSize:14,fontWeight:800,color:sel?"var(--or)":"var(--br)"}}>฿{opt.price.toLocaleString()}</p>
+                      <p style={{fontSize:9.5,color:"var(--mu)",marginTop:2}}>{lang==="th"?`อายุการใช้งาน ${opt.days} วัน`:`Valid ${opt.days} days`}</p>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </section>
+      )}
+
+      {selected && (
+        <section>
+          <StepHead n="📝" label={lang==="th"?"กรอกข้อมูลผู้ซื้อ":"Buyer Info"} />
+          <div className="card" style={{marginBottom:14}}>
+            <div className="card-body">
+              <Row label={lang==="th"?"แพ็คเกจที่เลือก":"Selected package"} val={selected.promo ? promoLabel(PROMO_1111.items.find(i => i.code === selected.promo), lang==="th") : `${selected.tier==="peak"?"Peak":"Off Peak"} × ${selected.credits} ${lang==="th"?"ครั้ง":"sessions"}`} />
+              <Row label={t.total} val={`฿${selected.price.toLocaleString()}`} />
+            </div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:15,marginBottom:16}}>
+            {!lineSession ? (
+              <button onClick={() => onLineLogin(null)}
+                style={{display:"flex",alignItems:"center",gap:12,padding:"13px 14px",borderRadius:10,border:"1.5px solid #06C755",background:"rgba(6,199,85,.07)",cursor:"pointer",textAlign:"left"}}>
+                <span style={{background:"#06C755",color:"#fff",fontWeight:800,fontSize:11,padding:"6px 8px",borderRadius:8,flexShrink:0}}>LINE</span>
+                <span>
+                  <span style={{display:"block",fontSize:13.5,fontWeight:700,color:"var(--br)"}}>{lang==="th"?"เข้าสู่ระบบด้วย LINE":"Sign in with LINE"}</span>
+                  <span style={{display:"block",fontSize:11.5,color:"var(--mu)",marginTop:2}}>{lang==="th"?"กรอกชื่อ-เบอร์ให้อัตโนมัติ และดูแพ็คเกจของคุณได้ทันที":"Auto-fill your details and see your packages instantly"}</span>
+                </span>
+              </button>
+            ) : (
+              <p style={{fontSize:12,color:"#06A04A",fontWeight:600}}>✅ {lang==="th"?"เข้าสู่ระบบด้วย LINE แล้ว":"Signed in with LINE"}: {toFormName(lineSession.displayName)}</p>
+            )}
+            <div>
+              <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.name}</label>
+              <input value={name} readOnly placeholder={lang==="th"?"ชื่อจาก LINE":"Name from LINE"}
+                style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:"var(--cr2)",border:"1.5px solid var(--dv)",color:"var(--mu)",outline:"none"}} />
+              <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>{lang==="th" ? "👤 ใช้ชื่อจากบัญชี LINE ของคุณ (เปลี่ยนชื่อได้ที่แอป LINE แล้วเข้าสู่ระบบใหม่)" : "👤 Taken from your LINE account (change it in the LINE app, then sign in again)."}</p>
+            </div>
+            <div>
+              <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.phone}</label>
+              <input value={phone} readOnly={phoneLocked} onChange={e => { if (!phoneLocked) setPhone(e.target.value.replace(/\D/g,"").slice(0,10)); }} placeholder="0812345678" inputMode="numeric"
+                style={{width:"100%",padding:"13px 14px",borderRadius:10,fontSize:15,background:phoneLocked?"var(--cr2)":"#fff",border:`1.5px solid ${phone&&!phoneOk?"#c0392b":"var(--dv)"}`,color:phoneLocked?"var(--mu)":"var(--tx)",outline:"none"}} />
+              <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>{lineSession?.phone ? (lang==="th" ? `🔒 เบอร์ที่ผูกกับบัญชี LINE ของคุณ — เปลี่ยนเองไม่ได้ ต้องการเปลี่ยนติดต่อแอดมิน ${ADMIN_CONTACT_PHONE}` : `🔒 Linked to your LINE account — can't be changed here. Contact admin: ${ADMIN_CONTACT_PHONE}`) : (lang==="th" ? "กรอกครั้งแรกครั้งเดียว — เบอร์นี้จะถูกล็อกกับบัญชี LINE ของคุณ กรุณากรอกให้ถูกต้อง" : "Enter once — this number will be locked to your LINE account. Please double-check it.")}</p>
+            </div>
+          </div>
+          {createErr && <p style={{fontSize:12,color:"#c0392b",marginBottom:10}}>{createErr}</p>}
+          <button className="btn-primary" disabled={!nameOk || !phoneOk || creating} onClick={handleBuy} style={{opacity:(!nameOk||!phoneOk||creating)?0.6:1,cursor:(!nameOk||!phoneOk||creating)?"not-allowed":"pointer"}}>
+            {creating ? "..." : (lang==="th" ? "ดำเนินการชำระเงิน →" : "Proceed to Payment →")}
+          </button>
+        </section>
+      )}
+    </div>
+  );
+}
+
+// หน้าชำระเงินสำหรับแพ็คเกจ (QR + แนบสลิป) — คล้ายหน้าชำระเงินจองสนาม แต่เรียบง่ายกว่า
+function PackagePaymentView({ pkg, lang="th", onDone, onBack, resumed=false }) {
+  const t = T[lang];
+  // เปิดซ้ำจากรายการที่ค้างอยู่ (resumed): เวลาที่เหลือนับจากเวลาที่สร้างรายการจริง ไม่เริ่ม 5:00 ใหม่ทุกครั้ง — หมดเวลาแล้วก็ยังแนบสลิป/ยกเลิกได้ (เซิร์ฟเวอร์ไม่จำกัดเวลา)
+  const [secs, setSecs] = useState(() => {
+    if (!resumed || !pkg.created_time) return 300;
+    const el = Math.floor((Date.now() - parseUtc(pkg.created_time).getTime()) / 1000);
+    return Number.isFinite(el) ? Math.max(0, 300 - Math.max(0, el)) : 300;
+  });
+  const [expired, setExpired] = useState(false);
+  const [slip, setSlip] = useState(null);
+  const [slipPreview, setSlipPreview] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploaded, setUploaded] = useState(false);
+  const fileRef = useRef();
+
+  useEffect(() => {
+    if (secs <= 0) { setExpired(true); return; }
+    const timer = setTimeout(() => setSecs(s => s-1), 1000);
+    return () => clearTimeout(timer);
+  }, [secs]);
+
+  const mm = String(Math.floor(Math.max(secs,0)/60)).padStart(2,"0");
+  const ss = String(Math.max(secs,0)%60).padStart(2,"0");
+
+  const handleSlipChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setSlip(file);
+    setSlipPreview(URL.createObjectURL(file));
+  };
+
+  const handleUpload = async () => {
+    if (!slip) return;
+    setUploading(true);
+    const up = await db.uploadSlip(slip, `pkg_${pkg.id}`);
+    const url = typeof up === "string" ? up : null;
+    if (!url) { alert(uploadFailMsg(up, lang)); setUploading(false); return; }
+    if (url) {
+      const updated = await db.updatePackageSlip(pkg.id, url);
+      if (!updated) {
+        setUploading(false);
+        alert(lang==="th" ? "ส่งสลิปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง หรือติดต่อร้านโดยตรง" : "Failed to submit slip. Please try again or contact us directly.");
+        return;
+      }
+      setUploaded(true);
+      trackFb("Purchase", { value: pkg.price, currency: "THB", content_name: "package" });
+      // การแจ้งเตือน Telegram ถึงแอดมินทำที่เซิร์ฟเวอร์ตอนบันทึกสลิปสำเร็จ (api/booking-actions.js)
+    }
+    setUploading(false);
+  };
+
+  const handleStartOver = () => {
+    if (!expired) return;
+    db.cancelPendingPackage(pkg.id).catch(() => {});
+    onDone();
+  };
+
+  return (
+    <div style={{padding:"20px 16px 90px"}} className="fu">
+      {onBack && !uploaded && (
+        <button onClick={onBack} data-testid="pay-back" style={{background:"none",border:"none",color:"var(--mu)",fontSize:13,fontWeight:600,cursor:"pointer",padding:"0 0 10px",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+          {lang==="th" ? "← กลับไปหน้าแพ็คเกจ (รายการนี้ยังรอชำระอยู่ กลับมาชำระต่อได้)" : "← Back to packages (this order is still awaiting payment — you can come back to pay)"}
+        </button>
+      )}
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:18}}>{t.payment}</h2>
+
+      <div style={{background:"#fff",borderRadius:"var(--r)",marginBottom:16,border:`1.5px solid ${expired?"#c0392b":"var(--dv)"}`,padding:"16px 20px",textAlign:"center",boxShadow:"var(--sh)"}}>
+        <p style={{fontSize:12,color:"var(--mu)",marginBottom:3}}>{expired?t.timeExpired:t.payWithin}</p>
+        <p className="bb" style={{fontSize:54,lineHeight:1,color:expired?"#c0392b":"var(--br)"}}>{mm}:{ss}</p>
+        {expired && !uploaded && (
+          <button onClick={handleStartOver} style={{marginTop:12,background:"none",border:"none",color:"#c0392b",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            {lang==="th" ? "ยกเลิกรายการนี้" : "Cancel this order"}
+          </button>
+        )}
+        {expired && !uploaded && (
+          <p data-testid="pay-expired-note" style={{marginTop:10,fontSize:12.5,color:"var(--tx)",lineHeight:1.6}}>
+            {lang==="th" ? "หมดเวลาที่แนะนำแล้ว — ถ้าคุณโอนเงินแล้ว แนบสลิปด้านล่างได้เลย ทีมงานจะตรวจสอบให้ / ถ้ายังไม่ได้โอน กดยกเลิกแล้วเลือกแพ็คเกจใหม่" : "The suggested time has passed — if you've already transferred, just attach your slip below and we'll verify it. If not, cancel and pick a package again."}
+          </p>
+        )}
+      </div>
+
+      <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",boxShadow:"0 4px 24px rgba(102,57,36,.12)",marginBottom:16,border:"1px solid var(--dv)"}}>
+        <p style={{fontSize:13,color:"var(--mu)",marginBottom:12}}>{t.scanQR}</p>
+        <img src="/qr-package.png" alt="Package payment QR" style={{width:200,height:200,objectFit:"contain",borderRadius:10,border:"1px solid var(--dv)",background:"#fff"}} />
+        <div style={{marginTop:14,display:"inline-flex",alignItems:"center",gap:8,background:"var(--or-bg)",borderRadius:20,padding:"8px 18px"}}>
+          <span style={{fontSize:24,fontWeight:800,color:"var(--or)"}}>฿{pkg.price.toLocaleString()}</span>
+        </div>
+        <div style={{marginTop:12,padding:"10px 14px",background:"var(--cr)",borderRadius:10}}>
+          <p style={{fontSize:11,color:"var(--mu)"}}>{t.accountName}</p>
+          <p style={{fontSize:14,fontWeight:700,color:"var(--br)"}}>{PAYMENT_ACCOUNT_NAME}</p>
+          <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>{lang==="th"?"บัญชี":"Account"} xxx-x-x0085-x</p>
+          <p style={{fontSize:11,color:"var(--mu)",marginTop:2}}>{lang==="th"?"รับโอนได้จากทุกธนาคาร":"Accepts all banks"}</p>
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div className="card-header"><p>{t.bookingDetail}</p></div>
+        <div className="card-body">
+          <Row label="👤" val={pkg.customer_name} />
+          <Row label="📞" val={pkg.customer_id} />
+          <Row label="🎟" val={promoOf(pkg.promo_code) ? promoLabel(promoOf(pkg.promo_code), lang==="th") : `${pkg.tier==="peak"?"Peak":"Off Peak"} × ${pkg.total_credits} ${lang==="th"?"ครั้ง":"sessions"}`} />
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:24}}>
+        <div className="card-header"><p>{t.uploadSlip}</p></div>
+        <div className="card-body">
+          {uploaded ? (
+            <div style={{textAlign:"center",padding:"10px 0"}}>
+              <p style={{color:"#2d7a4f",fontWeight:700,fontSize:15}}>{t.slipSent}</p>
+              <p style={{color:"var(--mu)",fontSize:13,marginTop:4}}>{lang==="th"?"ทีมงานจะตรวจสอบและเปิดใช้งานแพ็คเกจให้ภายในไม่นาน":"Our team will verify and activate your package shortly."}</p>
+            </div>
+          ) : (
+            <>
+              {slipPreview && <img src={slipPreview} alt="slip" style={{width:"100%",borderRadius:10,marginBottom:12,maxHeight:200,objectFit:"cover"}} />}
+              <input ref={fileRef} type="file" accept="image/*" onChange={handleSlipChange} style={{display:"none"}} />
+              <button onClick={() => fileRef.current.click()} style={{width:"100%",padding:"12px",borderRadius:10,border:"1.5px dashed var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:600,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {slip ? t.changeSlip : t.selectSlip}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {uploaded ? (
+        <button className="btn-primary" onClick={onDone}>{lang==="th"?"เสร็จสิ้น":"Done"}</button>
+      ) : (
+        <button className="btn-primary" disabled={!slip || uploading} onClick={handleUpload} style={{opacity:(!slip||uploading)?0.6:1,cursor:(!slip||uploading)?"not-allowed":"pointer"}}>
+          {uploading ? t.sending : t.sendSlip}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ─── เรียนกับโค้ช (สนาม+โค้ช) ─────────────────────────────────────────────────────
+// ลูกค้าเลือกคอร์สแล้วจ่ายเงินเลย ไม่มีการเลือกวัน/เวลา/โค้ชในเว็บ — ระบบส่งข้อความเข้า LINE OA ของลูกค้าทันที แล้วแอดมินนัดวัน-เวลากับลูกค้าในแชทนั้น
+// ราคาทั้งหมดมาจากเซิร์ฟเวอร์ (api/booking-actions.js → COACH_PRICES) แก้ราคาที่นั่นที่เดียว
+const COACH_QR = "/qr-package.png"; // QR รับเงินคอร์สโค้ช (ค่าตั้งต้นใช้อันเดียวกับแพ็คเกจ — ถ้าใช้บัญชีอื่น ให้เปลี่ยนชื่อไฟล์ตรงนี้)
+const coachLabel = (o, lang = "th") => {
+  const th = lang === "th";
+  const type = o.type === "duo" ? (th ? "Private Duo (2 คน : 1 โค้ช)" : "Private Duo (2 people : 1 coach)") : (th ? "Private (1 คน : 1 โค้ช)" : "Private (1 person : 1 coach)");
+  const who = o.audience === "kid" ? (th ? "เด็ก" : "Kids") : (th ? "ผู้ใหญ่" : "Adult");
+  const n = Number(o.sessions) === 1 ? (th ? "ครั้งเดียว" : "Single session") : (th ? `แพ็ค ${o.sessions} ครั้ง` : `${o.sessions}-session package`);
+  return `${type} • ${who} • ${n}`;
+};
+// เปิดแชท LINE OA ของร้านพร้อมข้อความที่เตรียมไว้ในช่องพิมพ์ (ลูกค้ากดส่งเอง) — รูปแบบตามเอกสาร LINE: https://line.me/R/oaMessage/{LINE ID เข้ารหัส %}/?{ข้อความเข้ารหัส %}
+const LINE_OA_ID = "@347mlhra";
+const oaChatUrl = (text) => `https://line.me/R/oaMessage/${encodeURIComponent(LINE_OA_ID)}/?${encodeURIComponent(text)}`;
+const coachChatText = (o, lang = "th") => lang === "th"
+  ? `สวัสดีค่ะ ต้องการนัดวัน-เวลาเรียนกับโค้ช\nรหัสคำสั่งซื้อ: C-${o.id}\nคอร์ส: ${coachLabel(o, "th")}\nชื่อ: ${o.customer_name}\nเบอร์: ${o.customer_id}\nวัน-เวลาที่สะดวก: `
+  : `Hello, I'd like to schedule my coaching lesson.\nOrder: C-${o.id}\nCourse: ${coachLabel(o, "en")}\nName: ${o.customer_name}\nPhone: ${o.customer_id}\nPreferred days/times: `;
+const coachStatusInfo = (s, lang = "th") => {
+  const th = lang === "th";
+  if (s === "confirmed") return { text: th ? "ยืนยันแล้ว" : "Confirmed", color: "#2d7a4f" };
+  if (s === "reviewing") return { text: th ? "รอตรวจสอบสลิป" : "Verifying slip", color: "#e67e22" };
+  if (s === "cancelled") return { text: th ? "ยกเลิกแล้ว" : "Cancelled", color: "#c0392b" };
+  return { text: th ? "รอชำระเงิน" : "Awaiting payment", color: "var(--mu)" };
+};
+
+// กล่อง "คอร์สเรียนกับโค้ชของฉัน": คอร์สที่ซื้อไว้ สถานะ ใช้สิทธิ์แล้ว/เหลือ นัดหมายที่แอดมินลงให้ และปุ่มทักไลน์ OA — แสดงบนสุดของหน้า "เรียนโค้ช" (เฉพาะคนที่เคยซื้อ)
+function MyCoachCourses({ orders, bookings, lang="th", onPay }) {
+  const t = T[lang];
+  if (!orders || orders.length === 0) return null;
+  return (
+          <div style={{marginBottom:8}}>
+            <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:10}}>👤 {lang==="th" ? "คอร์สเรียนกับโค้ชของฉัน" : "My coaching courses"}</p>
+            <div style={{display:"flex",flexDirection:"column",gap:12}}>
+              {orders.map(o => {
+                const st = coachStatusInfo(o.status, lang);
+                return (
+                  <div key={o.id} className="card">
+                    <div style={{padding:"14px 16px"}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:10}}>
+                        <span style={{fontWeight:700,color:"var(--br)",fontSize:13.5,lineHeight:1.4}}>{coachLabel(o, lang)}</span>
+                        <span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 10px",borderRadius:20,whiteSpace:"nowrap"}}>{st.text}</span>
+                      </div>
+                      <Row label={t.rowPrice} val={`฿${o.price?.toLocaleString()}`} />
+                      {o.status === "confirmed" && <Row label={lang==="th" ? "ใช้สิทธิ์แล้ว" : "Used"} val={`${o.sessions_used} / ${o.sessions} ${lang==="th" ? "ครั้ง" : "sessions"} (${lang==="th" ? "เหลือ" : "left"} ${o.sessions - o.sessions_used})`} />}
+                      {o.status === "confirmed" && (() => {
+                        const mine = bookings.filter(b => b.coach_order_id === o.id && b.status !== "cancelled").sort((x, y) => String(x.booking_date).localeCompare(String(y.booking_date)) || ((x.hour||0)*60 + (x.start_minute||0)) - ((y.hour||0)*60 + (y.start_minute||0)));
+                        if (mine.length === 0) return null;
+                        return (
+                          <div style={{margin:"6px 0 10px",padding:"10px 12px",background:"var(--cr)",borderRadius:10}}>
+                            <p style={{fontSize:12,fontWeight:700,color:"var(--br)",marginBottom:6}}>📅 {lang==="th" ? "นัดหมายที่แอดมินลงให้แล้ว" : "Scheduled lessons"}</p>
+                            {mine.map((b, i) => {
+                              const s = (b.hour||0)*60 + (b.start_minute||0);
+                              return <p key={b.id} style={{fontSize:12.5,color:"var(--tx)",lineHeight:1.7}}>{i + 1}. {new Date(b.booking_date + "T00:00:00").toLocaleDateString(lang==="th" ? "th-TH" : "en-GB", { weekday: "short", day: "numeric", month: "short" })} • {minutesToLabel(s)}–{minutesToLabel(s + (b.duration_minutes||60))} • Court {b.court_id}{b.coach_name ? ` • 👤 ${b.coach_name}` : ""}{(b.duration_minutes || 60) >= 120 ? (lang==="th" ? " • ใช้ 2 ครั้ง" : " • 2 sessions") : ""}</p>;
+                            })}
+                          </div>
+                        );
+                      })()}
+                      {o.status === "pending" && onPay && (
+                        <button onClick={() => onPay(o)} style={{width:"100%",marginTop:4,padding:"11px",borderRadius:10,border:"none",background:"linear-gradient(90deg,var(--or),var(--or2))",color:"#fff",fontWeight:800,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{lang==="th" ? "ไปชำระเงิน →" : "Go to payment →"}</button>
+                      )}
+                      {o.status === "reviewing" && <p style={{fontSize:12,color:"var(--mu)",lineHeight:1.6}}>{lang==="th" ? "ทางร้านกำลังตรวจสอบสลิป แล้วจะนัดวัน-เวลาเรียนทาง LINE OA" : "We're verifying your slip, then will schedule your lesson on LINE OA."}</p>}
+                      {o.status === "confirmed" && <p style={{fontSize:12,color:"var(--mu)",lineHeight:1.6}}>{lang==="th" ? "แอดมินจะนัดวัน-เวลาเรียนกับคุณทาง LINE OA (หรือส่งวัน-เวลาที่สะดวกมาในแชทได้เลย)" : "Our admin will schedule your lessons on LINE OA (or message us your preferred times)."}</p>}
+                      <a href={oaChatUrl(coachChatText(o, lang))} target="_blank" rel="noopener noreferrer" style={{display:"block",textAlign:"center",marginTop:10,padding:"10px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>💬 {lang==="th" ? "ทักไลน์ OA เพื่อนัดวัน-เวลา" : "Message LINE OA"}</a>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+      
+  );
+}
+
+function CoachPage({ lang="th", lineSession, onLinkPhone }) {
+  const th = lang === "th";
+  const lineName = toFormName(lineSession?.displayName || lineSession?.name) || "ลูกค้า LINE";
+  const [items, setItems] = useState(null);
+  const [loadErr, setLoadErr] = useState(false);
+  const [audience, setAudience] = useState("adult");
+  const [sel, setSel] = useState(null); // { type, sessions }
+  const [note, setNote] = useState("");
+  const [phone, setPhone] = useState(() => lineSession?.phone || "");
+  const [creating, setCreating] = useState(false);
+  const [err, setErr] = useState("");
+  const [order, setOrder] = useState(null);
+  const [linePushed, setLinePushed] = useState(false);
+  const formRef = useRef();
+
+  const loadCatalog = () => { setLoadErr(false); db.coachCatalog().then(r => (r ? setItems(r) : setLoadErr(true))).catch(() => setLoadErr(true)); };
+  useEffect(() => { loadCatalog(); }, []);
+  useEffect(() => { if (lineSession?.phone) setPhone(lineSession.phone); }, [lineSession?.phone]);
+  // คอร์สที่ลูกค้าเคยซื้อ + นัดหมายที่แอดมินลงให้ (ไว้แสดงกล่อง "คอร์สเรียนกับโค้ชของฉัน" ด้านบนสุด)
+  const [myOrders, setMyOrders] = useState([]);
+  const [myBookings, setMyBookings] = useState([]);
+  const loadMy = () => {
+    db.myCoachOrders().then(setMyOrders).catch(() => {});
+    if (lineSession?.phone) db.myBookings(lineSession.phone).then(setMyBookings).catch(() => {});
+  };
+  useEffect(() => { loadMy(); }, [lineSession?.phone]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const phoneOk = /^[0-9]{10}$/.test(phone);
+  const phoneLocked = !!lineSession?.phone;
+  const pick = (type, sessions) => items?.find(i => i.audience === audience && i.type === type && i.sessions === sessions) || null;
+  const selected = sel ? pick(sel.type, sel.sessions) : null;
+  const baht = (n) => `฿${Number(n).toLocaleString()}`;
+
+  const choose = (type, sessions) => {
+    setSel({ type, sessions }); setErr("");
+    setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 80);
+  };
+
+  const go = async () => {
+    if (!selected || !phoneOk || creating) return;
+    setErr(""); setCreating(true);
+    if (lineSession && !lineSession.phone) {
+      const sure = window.confirm(th
+        ? `ยืนยันเบอร์ ${phone} ใช่หรือไม่?\n\nเบอร์นี้จะถูกผูกกับบัญชี LINE ของคุณ และแก้ไขเองไม่ได้อีก (ต้องติดต่อแอดมิน)`
+        : `Confirm phone number ${phone}?\n\nIt will be linked to your LINE account and can't be changed by yourself later.`);
+      if (!sure) { setCreating(false); return; }
+      const lr = await onLinkPhone(lineName, phone);
+      if (!lr?.ok) { setCreating(false); setErr(accountErrMsg(lr?.error, lang) || (th ? "ผูกเบอร์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Couldn't link your number. Please try again.")); return; }
+    }
+    const r = await db.createCoachOrder({ audience, type: selected.type, sessions: selected.sessions, learnerNote: note.trim() });
+    setCreating(false);
+    if (!r.order) {
+      setErr(r.error === "too_many_orders" ? (th ? "สั่งซื้อบ่อยเกินไป กรุณาติดต่อร้านทาง LINE" : "Too many orders. Please contact us on LINE.")
+        : (accountErrMsg(r.error, lang) || (th ? "สร้างคำสั่งซื้อไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Couldn't create the order. Please try again.")));
+      return;
+    }
+    trackFb("InitiateCheckout", { value: r.order.price, currency: "THB", content_name: "coach" });
+    setOrder(r.order); setLinePushed(r.linePushed);
+  };
+
+  if (order) return <CoachPaymentView order={order} linePushed={linePushed} lang={lang} onDone={() => { setOrder(null); setSel(null); setNote(""); loadMy(); }} />;
+
+  const TYPES = [
+    { type: "duo", title: "PRIVATE DUO", sub: th ? "2 คน : 1 โค้ช" : "2 people : 1 coach", tag: th ? "เรียนเป็นคู่ สนุกขึ้น พัฒนาด้วยกัน" : "Learn together, grow together", icon: "👥", accent: "#F47E1F" },
+    { type: "private", title: "PRIVATE", sub: th ? "1 คน : 1 โค้ช" : "1 person : 1 coach", tag: th ? "โฟกัสเต็มที่ พัฒนาได้เร็วกว่า" : "Full focus, faster progress", icon: "👤", accent: "#5E97AE" },
+  ];
+  const rowLabel = (s) => (s === 1 ? (th ? "ครั้งเดียว" : "Single session") : (th ? `แพ็ค ${s} ครั้ง` : `${s}-session package`));
+
+  return (
+    <div style={{padding:"20px 16px 110px",display:"flex",flexDirection:"column",gap:18}} className="fu">
+      <section>
+        <h2 className="bb" style={{fontSize:26,color:"var(--br)",marginBottom:4}}>{th ? "เรียนกับโค้ช" : "Train with a Coach"}</h2>
+        {myOrders.length === 0 && <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7}}>{th ? "สนาม + โค้ช + อุปกรณ์ รวมในราคา — ไม่ต้องเลือกวัน-เวลาในเว็บ ชำระเงินแล้วแอดมินจะนัดวัน-เวลากับคุณทาง LINE OA" : "Court + coach + equipment all included. No need to pick a date or time here — after payment our admin will schedule it with you on LINE."}</p>}
+      </section>
+
+      <MyCoachCourses orders={myOrders} bookings={myBookings} lang={lang} onPay={(o) => { setOrder(o); setLinePushed(!!o.line_pushed); }} />
+
+      {myOrders.length > 0 && (
+        <section>
+          <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:4}}>🛒 {th ? "ซื้อคอร์สเพิ่ม" : "Buy another course"}</p>
+          <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7}}>{th ? "สนาม + โค้ช + อุปกรณ์ รวมในราคา — ไม่ต้องเลือกวัน-เวลาในเว็บ ชำระเงินแล้วแอดมินจะนัดวัน-เวลากับคุณทาง LINE OA" : "Court + coach + equipment all included. No need to pick a date or time here — after payment our admin will schedule it with you on LINE."}</p>
+        </section>
+      )}
+
+      <section style={{background:"var(--bl-bg)",border:"1px solid rgba(141,182,199,.4)",borderRadius:12,padding:"12px 14px"}}>
+        {(th ? ["เลือกคอร์สด้านล่าง", "ชำระเงินและส่งสลิป", "กดปุ่ม \"ทักไลน์ OA\" (ข้อความถูกเตรียมไว้ให้แล้ว แค่กดส่ง) แอดมินจะนัดวัน-เวลาเรียนกับคุณในแชทนั้น"] : ["Choose a course below", "Pay and upload your slip", "Tap \"Message LINE OA\" (the text is prefilled — just send) and our admin will schedule your lesson in that chat"]).map((txt, i) => (
+          <div key={i} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:i < 2 ? 5 : 0}}>
+            <span style={{fontSize:11.5,fontWeight:800,color:"var(--br)",flexShrink:0}}>{i + 1}.</span>
+            <p style={{fontSize:12,color:"var(--tx)",lineHeight:1.6}}>{txt}</p>
+          </div>
+        ))}
+      </section>
+
+      <div style={{display:"flex",gap:8}}>
+        {[["adult", th ? "🧑 ผู้ใหญ่" : "🧑 Adult"], ["kid", th ? "🧒 เด็ก" : "🧒 Kids"]].map(([v, label]) => (
+          <button key={v} onClick={() => { setAudience(v); setSel(null); }} style={{flex:1,padding:"11px 6px",borderRadius:12,border:`2px solid ${audience === v ? "var(--or)" : "var(--dv)"}`,background:audience === v ? "var(--or-bg)" : "#fff",color:audience === v ? "var(--or)" : "var(--mu)",fontWeight:800,fontSize:14.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+        ))}
+      </div>
+
+      {loadErr && (
+        <div style={{background:"#fff",borderRadius:"var(--r)",padding:"18px",textAlign:"center",border:"1px solid var(--dv)"}}>
+          <p style={{color:"#c0392b",fontSize:13.5,marginBottom:10}}>{th ? "โหลดราคาไม่สำเร็จ" : "Couldn't load prices"}</p>
+          <button onClick={loadCatalog} style={{padding:"9px 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{th ? "ลองใหม่" : "Retry"}</button>
+        </div>
+      )}
+      {!items && !loadErr && <p style={{textAlign:"center",color:"var(--mu)",fontSize:13}}>{th ? "กำลังโหลดราคา..." : "Loading prices..."}</p>}
+
+      {items && TYPES.map(T0 => (
+        <div key={T0.type} className="card" style={{border:`1.5px solid ${T0.accent}55`}}>
+          <div style={{padding:"14px 16px 6px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <span style={{fontSize:26}}>{T0.icon}</span>
+              <div>
+                <p className="bb" style={{fontSize:22,color:"var(--br)",lineHeight:1.1}}>{T0.title}</p>
+                <p style={{fontSize:12,fontWeight:700,color:T0.accent}}>{T0.sub}</p>
+              </div>
+            </div>
+            <p style={{fontSize:12.5,color:"var(--mu)",margin:"8px 0 10px"}}>{T0.tag}</p>
+          </div>
+          <div style={{padding:"0 12px 14px",display:"flex",flexDirection:"column",gap:8}}>
+            {[1, 5, 10].map(s => {
+              const it = pick(T0.type, s); if (!it) return null;
+              const on = sel && sel.type === T0.type && sel.sessions === s;
+              return (
+                <button key={s} onClick={() => choose(T0.type, s)} style={{textAlign:"left",padding:"11px 13px",borderRadius:12,border:`2px solid ${on ? T0.accent : "var(--dv)"}`,background:on ? `${T0.accent}14` : "#fff",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+                  <span>
+                    <span style={{display:"block",fontWeight:800,fontSize:14.5,color:"var(--br)"}}>{on ? "✓ " : ""}{rowLabel(s)}</span>
+                    <span style={{display:"block",fontSize:11.5,color:"var(--mu)",marginTop:2}}>
+                      {s === 1 ? `${baht(it.perPerson)}${it.people > 1 ? (th ? "/คน/ชม." : "/person/hr") : (th ? "/ชม." : "/hr")}` : `${baht(it.perPerson)}${it.people > 1 ? (th ? "/คน" : "/person") : ""} = ${baht(it.perSessionPerPerson)}${it.people > 1 ? (th ? "/คน/ชม." : "/person/hr") : (th ? "/ชม." : "/hr")}`}
+                    </span>
+                  </span>
+                  <span style={{textAlign:"right",flexShrink:0}}>
+                    <span style={{display:"block",fontWeight:900,fontSize:19,color:T0.accent}}>{baht(it.total)}</span>
+                    {it.people > 1 && <span style={{display:"block",fontSize:10.5,color:"var(--mu)"}}>{th ? `รวม ${it.people} คน` : `total, ${it.people} people`}</span>}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+
+      {items && (
+        <div style={{display:"flex",justifyContent:"space-around",gap:6,background:"#fff",border:"1px solid var(--dv)",borderRadius:12,padding:"10px 6px"}}>
+          {(th ? [["🎾", "ไม้ให้ยืม"], ["🟢", "ลูกคุณภาพ"], ["🏟", "สนามในร่ม"], ["🎒", "มาตัวเปล่า"]] : [["🎾", "Racket provided"], ["🟢", "Quality balls"], ["🏟", "Indoor"], ["🎒", "Just bring yourself"]]).map(([ic, tx]) => (
+            <div key={tx} style={{textAlign:"center",flex:1}}><div style={{fontSize:20}}>{ic}</div><div style={{fontSize:10.5,color:"var(--mu)",fontWeight:600,lineHeight:1.3}}>{tx}</div></div>
+          ))}
+        </div>
+      )}
+
+      {selected && (
+        <section ref={formRef} style={{background:"#fff",border:"1.5px solid var(--or)",borderRadius:"var(--r)",padding:"16px",boxShadow:"var(--sh)"}}>
+          <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:2}}>{th ? "สรุปคำสั่งซื้อ" : "Order summary"}</p>
+          <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.6}}>{coachLabel({ ...selected }, lang)}</p>
+          <p style={{fontWeight:900,fontSize:28,color:"var(--or)",margin:"6px 0 2px"}}>{baht(selected.total)}</p>
+          {selected.people > 1 && <p style={{fontSize:11.5,color:"var(--mu)",marginBottom:6}}>{th ? `(${baht(selected.perPerson)} × ${selected.people} คน)` : `(${baht(selected.perPerson)} × ${selected.people} people)`}</p>}
+
+          <div style={{display:"flex",flexDirection:"column",gap:12,marginTop:10}}>
+            <div>
+              <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>{th ? "ชื่อผู้เรียน / อายุเด็ก (ไม่บังคับ)" : "Learner name / child's age (optional)"}</label>
+              <input value={note} onChange={e => setNote(e.target.value.slice(0, 120))} placeholder={selected.people > 1 ? (th ? "เช่น น้องมะลิ และน้องกล้า (8 ขวบ)" : "e.g. Mali and Klar (8 yrs)") : (th ? "เช่น น้องกล้า (8 ขวบ)" : "e.g. Klar (8 yrs)")}
+                style={{width:"100%",padding:"12px 14px",borderRadius:10,fontSize:14.5,border:"1.5px solid var(--dv)",outline:"none",background:"#fff"}} />
+            </div>
+            <div>
+              <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>{th ? "ชื่อ (จาก LINE)" : "Name (from LINE)"}</label>
+              <input value={lineName} readOnly style={{width:"100%",padding:"12px 14px",borderRadius:10,fontSize:14.5,border:"1.5px solid var(--dv)",outline:"none",background:"var(--cr2)",color:"var(--mu)"}} />
+            </div>
+            <div>
+              <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>{T[lang].phone}</label>
+              <input value={phone} readOnly={phoneLocked} onChange={e => { if (!phoneLocked) setPhone(e.target.value.replace(/\D/g, "").slice(0, 10)); }} placeholder="0812345678" inputMode="numeric"
+                style={{width:"100%",padding:"12px 14px",borderRadius:10,fontSize:14.5,border:`1.5px solid ${phone && !phoneOk ? "#c0392b" : "var(--dv)"}`,outline:"none",background:phoneLocked ? "var(--cr2)" : "#fff",color:phoneLocked ? "var(--mu)" : "var(--tx)"}} />
+              <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>
+                {phoneLocked ? (th ? `🔒 เบอร์ที่ผูกกับบัญชี LINE ของคุณ — เปลี่ยนเองไม่ได้ ต้องการเปลี่ยนติดต่อแอดมิน ${ADMIN_CONTACT_PHONE}` : `🔒 Linked to your LINE account — contact admin to change: ${ADMIN_CONTACT_PHONE}`)
+                  : (th ? "กรอกครั้งแรกครั้งเดียว — เบอร์นี้จะถูกล็อกกับบัญชี LINE ของคุณ กรุณากรอกให้ถูกต้อง" : "Enter once — this number will be locked to your LINE account. Please double-check it.")}
+              </p>
+            </div>
+          </div>
+          {err && <p style={{fontSize:12.5,color:"#c0392b",marginTop:10,lineHeight:1.6}}>{err}</p>}
+          <button className="btn-primary" onClick={go} disabled={!phoneOk || creating} style={{marginTop:14,opacity:(!phoneOk || creating) ? 0.6 : 1,cursor:(!phoneOk || creating) ? "not-allowed" : "pointer"}}>
+            {creating ? (th ? "กำลังสร้างคำสั่งซื้อ..." : "Creating order...") : (th ? "ไปชำระเงิน →" : "Continue to payment →")}
+          </button>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function CoachPaymentView({ order, linePushed, lang="th", onDone }) {
+  const th = lang === "th";
+  const t = T[lang];
+  const [slip, setSlip] = useState(null);
+  const [slipPreview, setSlipPreview] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploaded, setUploaded] = useState(false);
+  const [chatTapped, setChatTapped] = useState(false); // ลูกค้ากดปุ่มทักไลน์ OA แล้วหรือยัง (ใช้เตือนถ้ายังไม่ได้ทัก)
+  const fileRef = useRef();
+
+  const handleSlipChange = (e) => { const file = e.target.files[0]; if (!file) return; setSlip(file); setSlipPreview(URL.createObjectURL(file)); };
+  const handleUpload = async () => {
+    if (!slip || uploading) return;
+    setUploading(true);
+    const up = await db.uploadSlip(slip, `coach_${order.id}`);
+    const url = typeof up === "string" ? up : null;
+    if (!url) { alert(uploadFailMsg(up, lang)); setUploading(false); return; }
+    const updated = await db.updateCoachSlip(order.id, url);
+    if (!updated) {
+      setUploading(false);
+      alert(th ? "ส่งสลิปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง หรือติดต่อร้านโดยตรง" : "Failed to submit slip. Please try again or contact us directly.");
+      return;
+    }
+    setUploaded(true); setUploading(false);
+    trackFb("Purchase", { value: order.price, currency: "THB", content_name: "coach" });
+    // การแจ้งเตือน Telegram ถึงแอดมินทำที่เซิร์ฟเวอร์ตอนบันทึกสลิปสำเร็จ (api/booking-actions.js)
+  };
+  const cancelOrder = async () => {
+    if (!window.confirm(th ? "ยกเลิกคำสั่งซื้อนี้ใช่หรือไม่?" : "Cancel this order?")) return;
+    await db.cancelCoachOrder(order.id).catch(() => {});
+    onDone();
+  };
+
+  return (
+    <div style={{padding:"20px 16px 90px"}} className="fu">
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:14}}>{t.payment}</h2>
+
+      {linePushed ? (
+        <div style={{background:"rgba(6,199,85,.1)",border:"1px solid rgba(6,199,85,.35)",borderRadius:12,padding:"12px 14px",marginBottom:14}}>
+          <p style={{fontSize:13,fontWeight:800,color:"#047a38",marginBottom:2}}>💬 {th ? "ส่งสรุปรายการเข้า LINE OA ของคุณแล้ว" : "We've sent your order summary on LINE"}</p>
+          <p style={{fontSize:12,color:"var(--tx)",lineHeight:1.6}}>{th ? "ตรวจดูได้ในแชท LINE OA ของ NOVA Tennis — หลังชำระเงิน แอดมินจะนัดวัน-เวลาเรียนกับคุณในแชทนั้น" : "Check the NOVA Tennis LINE OA chat — after payment our admin will schedule your lesson there."}</p>
+        </div>
+      ) : (
+        <div style={{background:"rgba(6,199,85,.08)",border:`1.5px solid ${chatTapped ? "rgba(6,199,85,.35)" : "#06C755"}`,borderRadius:12,padding:"14px 14px",marginBottom:14}}>
+          <p style={{fontSize:13.5,fontWeight:800,color:"#047a38",marginBottom:4}}>{chatTapped ? "✅" : "👉"} {th ? "ทักไลน์ OA เพื่อนัดวัน-เวลาเรียน" : "Message our LINE OA to schedule your lesson"}</p>
+          <p style={{fontSize:12,color:"var(--tx)",lineHeight:1.65,marginBottom:10}}>{th ? "กดปุ่มด้านล่าง LINE จะเปิดแชทพร้อมข้อความที่เตรียมไว้ให้ (รหัส C-" + order.id + " คอร์ส ชื่อ เบอร์) แค่กดส่ง — ควรทักเลย แม้ยังไม่ได้ชำระเงิน เพื่อให้แอดมินรู้ว่าเป็นคุณและนัดเวลาได้" : "Tap the button — LINE opens with your message prefilled (order C-" + order.id + ", course, name, phone). Just press send. Do it now, even before paying, so our admin knows it's you."}</p>
+          <a href={oaChatUrl(coachChatText(order, lang))} onClick={() => setChatTapped(true)} target="_blank" rel="noopener noreferrer" style={{display:"block",textAlign:"center",padding:"12px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:14.5,textDecoration:"none"}}>💬 {th ? "ทักไลน์ OA เพื่อนัดวัน-เวลา" : "Message LINE OA"}</a>
+        </div>
+      )}
+
+      <div style={{background:"#fff",borderRadius:"var(--r)",padding:"20px",textAlign:"center",boxShadow:"0 4px 24px rgba(102,57,36,.12)",marginBottom:16,border:"1px solid var(--dv)"}}>
+        <p style={{fontSize:13,color:"var(--mu)",marginBottom:12}}>{t.scanQR}</p>
+        <img src={COACH_QR} alt="Payment QR" style={{width:200,height:200,objectFit:"contain",borderRadius:10,border:"1px solid var(--dv)",background:"#fff"}} />
+        <div style={{marginTop:14,display:"inline-flex",alignItems:"center",gap:8,background:"var(--or-bg)",borderRadius:20,padding:"8px 18px"}}>
+          <span style={{fontSize:24,fontWeight:800,color:"var(--or)"}}>฿{order.price.toLocaleString()}</span>
+        </div>
+        <div style={{marginTop:12,padding:"10px 14px",background:"var(--cr)",borderRadius:10}}>
+          <p style={{fontSize:11,color:"var(--mu)"}}>{t.accountName}</p>
+          <p style={{fontSize:14,fontWeight:700,color:"var(--br)"}}>{PAYMENT_ACCOUNT_NAME}</p>
+          <p style={{fontSize:11,color:"var(--mu)",marginTop:2}}>{th ? "รับโอนได้จากทุกธนาคาร" : "Accepts all banks"}</p>
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <div className="card-header"><p>{th ? "รายละเอียดคำสั่งซื้อ" : "Order details"}</p></div>
+        <div className="card-body">
+          <Row label="👤" val={coachLabel(order, lang)} />
+          {order.people > 1 && <Row label="💰" val={`฿${(order.price / order.people).toLocaleString()} × ${order.people} ${th ? "คน" : "people"}`} />}
+          {order.learner_note && <Row label="📝" val={order.learner_note} />}
+          <Row label="👤" val={order.customer_name} />
+          <Row label="📞" val={order.customer_id} />
+          <Row label="#" val={`C-${order.id}`} />
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:20}}>
+        <div className="card-header"><p>{t.uploadSlip}</p></div>
+        <div className="card-body">
+          {uploaded ? (
+            <div style={{textAlign:"center",padding:"10px 0"}}>
+              <p style={{color:"#2d7a4f",fontWeight:700,fontSize:15}}>{t.slipSent}</p>
+              <p style={{color:"var(--mu)",fontSize:13,marginTop:4,lineHeight:1.6}}>{th ? "ทีมงานจะตรวจสอบสลิป แล้วนัดวัน-เวลาเรียนกับคุณทาง LINE OA" : "Our team will verify your slip and schedule your lesson with you on LINE OA."}</p>
+              {!linePushed && !chatTapped && (
+                <div style={{marginTop:14,background:"rgba(255,213,74,.28)",border:"1px solid rgba(232,162,0,.45)",borderRadius:12,padding:"12px 14px",textAlign:"left"}}>
+                  <p style={{fontSize:12.5,fontWeight:700,color:"#8a5a00",lineHeight:1.6,marginBottom:8}}>⚠️ {th ? "ขั้นตอนสุดท้าย: ยังไม่ได้ทักไลน์ OA — ถ้าไม่ทักมา แอดมินจะไม่ทราบว่าเป็นคุณและนัดวัน-เวลาให้ไม่ได้" : "Last step: you haven't messaged our LINE OA yet — without it we can't tell who you are or schedule your lesson."}</p>
+                  <a href={oaChatUrl(coachChatText(order, lang))} onClick={() => setChatTapped(true)} target="_blank" rel="noopener noreferrer" style={{display:"block",textAlign:"center",padding:"11px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:14,textDecoration:"none"}}>💬 {th ? "ทักไลน์ OA เลย" : "Message LINE OA now"}</a>
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              {slipPreview && <img src={slipPreview} alt="slip" style={{width:"100%",borderRadius:10,marginBottom:12,maxHeight:200,objectFit:"cover"}} />}
+              <input ref={fileRef} type="file" accept="image/*" onChange={handleSlipChange} style={{display:"none"}} />
+              <button onClick={() => fileRef.current.click()} style={{width:"100%",padding:"12px",borderRadius:10,border:"1.5px dashed var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:600,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {slip ? t.changeSlip : t.selectSlip}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {uploaded ? (
+        <button className="btn-primary" onClick={onDone}>{th ? "เสร็จสิ้น" : "Done"}</button>
+      ) : (
+        <>
+          <button className="btn-primary" disabled={!slip || uploading} onClick={handleUpload} style={{opacity:(!slip || uploading) ? 0.6 : 1,cursor:(!slip || uploading) ? "not-allowed" : "pointer"}}>
+            {uploading ? t.sending : t.sendSlip}
+          </button>
+          {order.status === "pending" && (
+            <button onClick={cancelOrder} style={{display:"block",margin:"14px auto 0",background:"none",border:"none",color:"#c0392b",fontSize:12.5,textDecoration:"underline",cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+              {th ? "ยกเลิกคำสั่งซื้อนี้" : "Cancel this order"}
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+
+// ─── Cancel / Check Booking Page ─────────────────────────────────────────────
+function CancelPage({ lang="th", initialPhone="", lockedPhone="" }) {
+  const t = T[lang];
+  const [phone, setPhone] = useState(lockedPhone || initialPhone);
+  useEffect(() => { if (lockedPhone) setPhone(lockedPhone); }, [lockedPhone]); // ผูก LINE แล้ว → ดูได้เฉพาะการจองของเบอร์ตัวเอง
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [searched, setSearched] = useState(false);
+
+  const handleSearch = async (phoneToSearch) => {
+    const p = phoneToSearch || phone;
+    if (!/^[0-9]{10}$/.test(p)) return;
+    setLoading(true); setSearched(false); setBookings([]);
+    const data = await db.myBookings(p);
+    setBookings(data || []);
+    setLoading(false); setSearched(true);
+  };
+
+  useEffect(() => {
+    if (initialPhone && /^[0-9]{10}$/.test(initialPhone)) {
+      handleSearch(initialPhone);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialPhone]);
+
+  const statusLabel = (s) => {
+    if (s === "cancelled") return { text: t.statusCancelled, color: "#c0392b" };
+    if (s === "reviewing") return { text: t.statusReviewing, color: "#e67e22" };
+    if (s === "confirmed") return { text: t.statusConfirmed, color: "#2d7a4f" };
+    return { text: t.statusPending, color: "var(--mu)" };
+  };
+
+  return (
+    <div style={{padding:"20px 16px 100px"}} className="fu">
+      <h2 className="bb" style={{fontSize:28,color:"var(--br)",marginBottom:20}}>{t.myBookings}</h2>
+      <p style={{fontWeight:800,color:"var(--br)",fontSize:15,marginBottom:10}}>📅 {lang==="th" ? "ประวัติการจอง" : "Booking history"}</p>
+      <div style={{display:"flex",gap:8,marginBottom:20}}>
+        <input value={phone} readOnly={!!lockedPhone} onChange={e => { if (!lockedPhone) setPhone(e.target.value.replace(/\D/g,"").slice(0,10)); }}
+          placeholder={t.searchPlaceholder} inputMode="numeric"
+          style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:lockedPhone?"var(--cr2)":"#fff",border:"1.5px solid var(--dv)",color:lockedPhone?"var(--mu)":"var(--tx)",outline:"none"}} />
+        <button onClick={() => handleSearch()} disabled={loading || phone.length < 10} style={{padding:"0 18px",borderRadius:10,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
+          {loading ? "..." : t.searchBtn}
+        </button>
+      </div>
+
+      {searched && bookings.length === 0 && (
+        <div style={{background:"#fff",borderRadius:"var(--r)",padding:"24px",textAlign:"center",border:"1px solid var(--dv)"}}>
+          <p style={{color:"var(--mu)"}}>{t.notFound}</p>
+        </div>
+      )}
+
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {bookings.map(b => {
+          const st = statusLabel(b.status);
+          const startMin = (b.hour||0)*60 + (b.start_minute||0);
+          const dur = b.duration_minutes || 60;
+          return (
+            <div key={b.id} className="card">
+              <div style={{padding:"14px 16px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                  <span style={{fontWeight:700,color:"var(--br)",fontSize:15}}>Court {b.court_id}</span>
+                  <span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 10px",borderRadius:20}}>{st.text}</span>
+                </div>
+                <Row label={`📅 ${t.date}`} val={new Date(b.booking_date).toLocaleDateString(lang==="th"?"th-TH":"en-GB",{year:"numeric",month:"long",day:"numeric"})} />
+                <Row label={`🕐 ${t.time}`} val={`${minutesToLabel(startMin)} – ${minutesToLabel(startMin+dur)}`} />
+                {b.moved_from && <Row label={lang==="th" ? "🕐 เลื่อนเวลาแล้ว" : "🕐 Rescheduled"} val={(() => { const m = parseMovedFrom(b.moved_from); return lang==="th" ? `เดิม ${niceDate(m.date, lang)} ${m.time}` : `Was ${niceDate(m.date, lang)} ${m.time}`; })()} />}
+                {b.coach_name && <Row label={lang==="th" ? "👤 โค้ช" : "👤 Coach"} val={b.coach_name} />}
+                <Row label={t.rowPrice} val={b.coach_order_id ? (lang==="th" ? `ชำระแล้ว (ใช้สิทธิ์คอร์ส C-${b.coach_order_id}${(b.duration_minutes || 60) >= 120 ? " • 2 ครั้ง" : ""})` : `Paid (course C-${b.coach_order_id}${(b.duration_minutes || 60) >= 120 ? " • 2 sessions" : ""})`) : `฿${b.price?.toLocaleString()}`} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{marginTop:18,background:"#fff",border:"1px solid var(--dv)",borderRadius:"var(--r)",padding:"16px 18px",boxShadow:"var(--sh)"}}>
+        <p style={{fontWeight:800,color:"var(--br)",fontSize:14.5,marginBottom:6}}>{lang==="th" ? "ต้องการยกเลิกหรือสอบถามเรื่องการจอง?" : "Need to cancel or ask about a booking?"}</p>
+        <p style={{fontSize:12.5,color:"var(--mu)",lineHeight:1.7,marginBottom:12}}>
+          {lang==="th" ? "หลังส่งสลิปหรือยืนยันการจองแล้ว ยกเลิกเองในระบบไม่ได้ กรุณาติดต่อคอร์ททาง LINE หรือโทรศัพท์" : "Once a slip is submitted or a booking is confirmed, it can't be cancelled online. Please contact us via LINE or phone."}
+          <br />
+          {lang==="th" ? "ตามเงื่อนไขของคอร์ท: สงวนสิทธิ์การเลื่อนจอง และไม่คืนค่าบริการทุกกรณี" : "Per our conditions: no rescheduling and no refunds under any circumstances."}
+        </p>
+        <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+          <a href={LINE_OA_URL} target="_blank" rel="noopener noreferrer" style={{flex:1,minWidth:140,textAlign:"center",padding:"11px 12px",borderRadius:10,background:"#06C755",color:"#fff",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>💬 LINE</a>
+          <a href={adminTel()} style={{flex:1,minWidth:140,textAlign:"center",padding:"11px 12px",borderRadius:10,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--br)",fontWeight:800,fontSize:13.5,textDecoration:"none"}}>📞 {ADMIN_CONTACT_PHONE}</a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── App V2 with Cancel Tab + Admin ──────────────────────────────────────────
+export default function AppV2() {
+  const [tab, setTab] = useState("home");
+  const [page, setPage] = useState("booking");
+  const [booking, setBooking] = useState(null);
+  const [customer, setCustomer] = useState(null);
+  const [resumeBooking, setResumeBooking] = useState(null);
+  const [adminToken, setAdminToken] = useState(() => {
+    try { return sessionStorage.getItem("nova_admin_token") || null; } catch { return null; }
+  });
+  const [adminMode, setAdminMode] = useState(() => {
+    try { return window.location.pathname.replace(/\/$/, "") === "/admin"; } catch { return false; }
+  });
+  const [adminPw, setAdminPw] = useState("");
+  const [adminErr, setAdminErr] = useState(false);
+  const [adminErrMsg, setAdminErrMsg] = useState("");
+  const [adminChecking, setAdminChecking] = useState(false);
+  const [logoTaps, setLogoTaps] = useState(0);
+  const [lang, setLang] = useState("th");
+  const [prefillPhone, setPrefillPhone] = useState("");
+
+  // ── LINE Login ──
+  const isLineCallbackPath = () => { try { return window.location.pathname.replace(/\/$/, "") === "/line-callback"; } catch { return false; } };
+  const [lineSession, setLineSession] = useState(() => loadLineSession());
+  const [lineCbStatus, setLineCbStatus] = useState(() => (isLineCallbackPath() ? "processing" : null));
+  const lineCbStarted = useRef(false);
+
+  const clearResumeParam = () => {
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("booking");
+      window.history.replaceState(null, "", url.toString());
+    } catch { /* no-op */ }
+    try { localStorage.removeItem("nova_pending_booking"); } catch { /* no-op */ }
+  };
+
+  // เปลี่ยนแท็บ/หน้าไหนก็ตาม ให้เลื่อนขึ้นบนสุดเสมอ — กันปัญหาเข้าหน้าจองแล้วหน้าเด้งไปอยู่ตรงกลาง
+  // (ค่าตำแหน่งเลื่อนของหน้าแรกที่ยาวๆ ค้างมา) จนลูกค้าข้ามขั้น "เลือกวันที่" ไป
+  useEffect(() => {
+    try { window.scrollTo(0, 0); } catch { /* no-op */ }
+    try { document.documentElement.scrollTop = 0; document.body.scrollTop = 0; } catch { /* no-op */ }
+  }, [tab, page]);
+
+  const goTab = (id) => {
+    // ตัดสินใจตอน "กด" (ไม่ใช่ตอนแสดงผล) — กด Back จากหน้า LINE แล้วกลับมาหน้าแรกได้ปกติ ไม่วนลูปเด้งไปล็อกอินซ้ำ
+    if (LINE_SKIP_INTRO && LINE_GATE_MODE === "booking" && (id === "book" || id === "package" || id === "coach") && !lineSession) {
+      startLineLogin(id, null); // กลับมาแล้วจะเข้าหน้าที่กดไว้
+      return;
+    }
+    if (id === "book") {
+      // ถ้ามีการจองที่ยังค้างชำระเงินอยู่ (ยังไม่จบ ไม่ว่าจะสำเร็จหรือหมดเวลา) ให้กลับไปหน้าชำระเงินเดิมเลย
+      // แทนที่จะเริ่มจองใหม่ทับ — กันปัญหาเผลอกดแท็บอื่นแล้วหากลับไม่เจอ
+      setPage(booking && customer ? "payment" : "booking");
+    }
+    setTab(id);
+    // ไม่ล้าง resume state ที่นี่ — จะล้างจริงๆ แค่ตอนจ่ายเงินสำเร็จ (handlePaymentDone) เท่านั้น
+    // เพื่อให้เผลอกดแท็บอื่นแล้วยังกลับมาจ่ายเงินต่อได้เสมอ
+  };
+
+  useEffect(() => {
+    if (isLineCallbackPath()) return; // กำลังกลับจากหน้าล็อกอิน LINE — ไม่ต้องพาไปหน้าชำระเงินค้าง
+    // เช็คก่อนจาก URL (?booking=...) ถ้าไม่มีค่อยเช็คจาก localStorage เป็นสำรอง
+    // (เผื่อ in-app browser บางตัวรีโหลดแล้วล้าง query string ทิ้ง)
+    let bId = new URLSearchParams(window.location.search).get("booking");
+    if (!bId) {
+      try {
+        const saved = JSON.parse(localStorage.getItem("nova_pending_booking") || "null");
+        if (saved?.id) bId = saved.id;
+      } catch { /* no-op */ }
+    }
+    if (!bId) return;
+    db.getBookingById(bId).then(b => {
+      if (!b || b.status === "cancelled") { clearResumeParam(); return; }
+      if (b.status !== "pending") { clearResumeParam(); return; }
+      const courtObj = COURTS.find(c => c.courtId === b.court_id);
+      if (!courtObj) { clearResumeParam(); return; }
+      const dateObj = new Date(b.booking_date + "T00:00:00");
+      const dur = b.duration_minutes || 60;
+      const startMin = (b.hour || 0) * 60 + (b.start_minute || 0);
+      const groupCourts = b._group ? b._group.map(r => COURTS.find(c => c.courtId === r.court_id)).filter(Boolean) : null;
+      const isGroupBooking = !!(groupCourts && groupCourts.length > 1);
+      const totalPrice = isGroupBooking ? b._group.reduce((s, r) => s + (r.price || 0), 0) : b.price;
+      const restoredSlot = {
+        startMin, durationMinutes: dur, hour: b.hour, startMinute: b.start_minute || 0,
+        label: `${minutesToLabel(startMin)} – ${minutesToLabel(startMin+dur)}`,
+        price: totalPrice, unitPrice: b.price, peak: false,
+      };
+      setBooking({ date: dateObj, court: courtObj, courts: isGroupBooking ? groupCourts : null, slot: restoredSlot });
+      setCustomer({ name: b.customer_name, phone: b.customer_id, finalPrice: totalPrice, discountAmount: b.discount_amount || 0, discount: null });
+      setResumeBooking({ id: b.id, createdAt: b.created_time });
+      setTab("book"); setPage("payment");
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ติดตามโฆษณา: เก็บ UTM + เริ่ม Meta Pixel (ไม่ทำงานในหน้า Admin)
+  useEffect(() => {
+    captureUtm();
+    let isAdminPath = false;
+    try { isAdminPath = window.location.pathname.replace(/\/$/, "") === "/admin"; } catch { /* no-op */ }
+    if (!isAdminPath) initMetaPixel();
+  }, []);
+  useEffect(() => {
+    if (tab === "book" || tab === "package" || tab === "coach") trackFb("ViewContent", { content_name: tab === "book" ? "booking" : tab === "coach" ? "coach" : "packages" });
+  }, [tab]);
+  useEffect(() => {
+    if (tab === "book" && page === "checkout" && booking) trackFb("InitiateCheckout", { value: booking.slot?.price || 0, currency: "THB" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, tab]);
+
+  // จัดการตอน LINE ส่งลูกค้ากลับมาที่ /line-callback — แลก code ที่เซิร์ฟเวอร์ แล้วพากลับไปหน้าเดิม
+  useEffect(() => {
+    if (lineCbStatus !== "processing" || lineCbStarted.current) return;
+    lineCbStarted.current = true;
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    const state = params.get("state") || "";
+    const [returnTarget, nonce] = state.split(".");
+    let storedNonce = null;
+    try { storedNonce = localStorage.getItem("nova_line_nonce"); } catch { /* no-op */ }
+    if (params.get("error") || !code) { setLineCbStatus("error"); return; }
+    // ถ้าเบราว์เซอร์นี้เป็นตัวที่เริ่มล็อกอินและค่าไม่ตรง = ปฏิเสธ (กันถูกหลอกให้ล็อกอินด้วยลิงก์ของคนอื่น)
+    if (storedNonce && nonce && storedNonce !== nonce) { setLineCbStatus("error"); return; }
+    db.lineLogin(code).then(result => {
+      if (!result || result.error || !result.session) { setLineCbStatus("error"); return; }
+      const p = result.profile || {};
+      const sess = {
+        token: result.session, displayName: p.displayName || "", pictureUrl: p.pictureUrl || "",
+        name: p.name || toFormName(p.displayName), phone: p.phone || "",
+        isFriend: typeof p.isFriend === "boolean" ? p.isFriend : null, // null = เช็คไม่ได้ → ไม่บล็อกลูกค้า
+      };
+      saveLineSession(sess); setLineSession(sess);
+      trackFb("CompleteRegistration", { status: true });
+      try { localStorage.removeItem("nova_line_nonce"); } catch { /* no-op */ }
+      window.history.replaceState(null, "", "/");
+      let restored = false;
+      try {
+        const pc = JSON.parse(localStorage.getItem("nova_pending_checkout") || "null");
+        localStorage.removeItem("nova_pending_checkout");
+        const courtObj = pc && COURTS.find(c => c.courtId === pc.courtId);
+        if (pc && pc.dateIso && pc.slot && courtObj) {
+          const groupCourts = Array.isArray(pc.courtIds) ? pc.courtIds.map(id => COURTS.find(c => c.courtId === id)).filter(Boolean) : null;
+          setBooking({ date: new Date(pc.dateIso + "T00:00:00"), court: courtObj, courts: groupCourts && groupCourts.length > 1 ? groupCourts : null, slot: pc.slot });
+          setCustomer(null); setPage("checkout"); setTab("book"); restored = true;
+        }
+      } catch { /* no-op */ }
+      if (!restored) {
+        setPage("booking");
+        setTab(["home", "book", "package", "coach", "cancel"].includes(returnTarget) ? returnTarget : "home");
+      }
+      setLineCbStatus(null);
+    }).catch(() => setLineCbStatus("error"));
+  }, [lineCbStatus]);
+
+  // ตอนเปิดเว็บ เช็คว่า session LINE เดิมยังใช้ได้ไหม (และดึงชื่อ/เบอร์ที่ผูกไว้ล่าสุดมาอัปเดต)
+  useEffect(() => {
+    const s = loadLineSession();
+    if (!s?.token || isLineCallbackPath()) return;
+    db.lineMe(s.token).then(r => {
+      if (r?.error === "invalid_session") { clearLineSession(); setLineSession(null); return; }
+      if (r?.profile) {
+        const next = { ...s, displayName: r.profile.displayName || s.displayName, name: r.profile.name || s.name, phone: r.profile.phone || "", // เซิร์ฟเวอร์เป็นตัวตัดสิน: ถ้าแอดมินปลดล็อกเบอร์แล้ว ต้องล้างเบอร์เก่าในเครื่องลูกค้าด้วย
+          isFriend: typeof r.profile.isFriend === "boolean" ? r.profile.isFriend : (s.isFriend ?? null) };
+        saveLineSession(next); setLineSession(next);
+      }
+    }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleLineLogin = (pendingCheckout = null) => startLineLogin(tab, pendingCheckout);
+  const handleLineLogout = () => {
+    if (!window.confirm(lang === "th" ? "ออกจากระบบ LINE ใช่หรือไม่?" : "Log out of LINE?")) return;
+    clearLineSession(); setLineSession(null);
+  };
+  // ผูกชื่อ+เบอร์ที่กรอกล่าสุดไว้กับบัญชี LINE — ครั้งหน้ากรอกให้อัตโนมัติ (ทำเบื้องหลัง ไม่ให้ลูกค้ารอ)
+  const handleLinkPhone = async (name, phone) => {
+    if (!lineSession?.token) return { ok: false, error: "line_required" };
+    try {
+      const r = await db.lineLinkPhone(lineSession.token, name, phone);
+      if (r?.ok) {
+        const next = { ...lineSession, name: r.name || name, phone: r.phone || phone };
+        saveLineSession(next); setLineSession(next);
+        return { ok: true };
+      }
+      return { ok: false, error: r?.error };
+    } catch { return { ok: false, error: "network" }; }
+  };
+
+  const handleLogoTap = () => {
+    const next = logoTaps + 1;
+    setLogoTaps(next);
+    if (next >= 5) { setAdminMode(true); setLogoTaps(0); }
+    setTimeout(() => setLogoTaps(0), 3000);
+  };
+
+  const handlePaymentDone = (phone) => {
+    setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
+    setPrefillPhone(phone || "");
+    setTab("cancel");
+    clearResumeParam();
+  };
+
+  // จองด้วยสิทธิ์แพ็คเกจ — จ่ายไว้ล่วงหน้าแล้ว ยืนยันทันทีไม่ต้องผ่านหน้า QR/แนบสลิปอีก
+  const [pkgBookingBusy, setPkgBookingBusy] = useState(false);
+  // จองด้วยโค้ดส่วนลดที่ครอบคลุมทั้งยอด (฿0): สร้างการจองเป็น "รอแอดมินยืนยัน" ทันที ไม่ผ่านหน้า QR
+  const handleConfirmFree = async ({ name, phone, discount }) => {
+    if (!booking || pkgBookingBusy) return;
+    setPkgBookingBusy(true);
+    const { slot, court, date } = booking;
+    const { booking: b, error } = await db.createBooking({
+      courtId: court.courtId, customerId: phone, customerName: name, bookingDate: toIso(date),
+      hour: slot.hour, startMinute: slot.startMinute, durationMinutes: slot.durationMinutes, discountCodeId: discount.id,
+    });
+    setPkgBookingBusy(false);
+    if (error || !b) {
+      alert(error === "discount_invalid" ? (lang==="th" ? "โค้ดส่วนลดนี้ใช้ไม่ได้แล้ว (หมดอายุหรือถูกใช้ไปแล้ว) กรุณาตรวจสอบโค้ด" : "This discount code can no longer be used (expired or already used).")
+        : error === "slot_taken" ? (lang==="th" ? "ช่วงเวลานี้เพิ่งถูกจองไปก่อนหน้าแล้ว กรุณาเลือกช่วงเวลาใหม่" : "This slot was just booked by someone else. Please choose another time.")
+        : (accountErrMsg(error, lang) || (lang==="th" ? "จองไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Booking failed, please try again")));
+      return;
+    }
+    if (b.status === "reviewing" && (b.price || 0) === 0) {
+      alert(lang==="th" ? "✅ ส่งคำขอจองแล้ว! ใช้โค้ดส่วนลดเต็มจำนวน รอแอดมินยืนยันการจอง" : "✅ Booking request sent with a full-value code! Awaiting admin confirmation.");
+      setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
+      setPrefillPhone(phone || ""); setTab("cancel"); clearResumeParam();
+      return;
+    }
+    // เซิร์ฟเวอร์คิดยอดได้มากกว่า 0 (ต่างจากที่หน้าเว็บคำนวณ) → ไปหน้าชำระเงินของการจองที่เพิ่งสร้างนี้ต่อ (ไม่สร้างซ้ำ)
+    setCustomer({ name, phone, finalPrice: b.price, discountAmount: b.discount_amount || 0, discount });
+    setResumeBooking({ id: b.id, createdAt: b.created_time });
+    setPage("payment");
+  };
+  const handleConfirmWithPackage = async ({ name, phone, packageId }) => {
+    if (!booking || pkgBookingBusy) return;
+    setPkgBookingBusy(true);
+    const { slot, court, date } = booking;
+    const { error, available, needed, expiry_date, start_date } = await db.createBookingWithPackage({
+      courtId: court.courtId, customerId: phone, customerName: name,
+      bookingDate: toIso(date), hour: slot.hour, startMinute: slot.startMinute, durationMinutes: slot.durationMinutes, packageId,
+    });
+    setPkgBookingBusy(false);
+    if (error) {
+      const msg = {
+        slot_taken: lang==="th" ? "ช่วงเวลานี้เพิ่งถูกจองไปก่อนหน้าแล้ว กรุณาเลือกช่วงเวลาใหม่" : "This slot was just booked by someone else. Please choose another time.",
+        package_no_credits: lang==="th" ? `สิทธิ์ในแพ็คเกจไม่พอ (ต้องใช้ ${needed ?? "?"} ครั้ง ใช้ได้ ${available ?? 0} ครั้ง — ไม่นับสิทธิ์ที่จองไว้รอแอดมินยืนยัน)` : `Not enough credits (need ${needed ?? "?"}, ${available ?? 0} available — credits waiting for admin confirmation are reserved)`,
+        package_duration: lang==="th" ? "แพ็คเกจใช้จองได้เฉพาะ 60 หรือ 120 นาที" : "Packages can only book 60 or 120 minutes",
+        package_expired: lang==="th" ? "แพ็คเกจหมดอายุแล้ว" : "This package has expired",
+        package_date_before_start: lang==="th" ? `แพ็คเกจนี้เริ่มนับอายุแล้ว ใช้เล่นได้ ${start_date ? niceDate(start_date, lang) : "-"} – ${expiry_date ? niceDate(expiry_date, lang) : "-"} แต่วันที่เล่นที่เลือกอยู่ก่อนวันเริ่มนับ กรุณาเลือกวันเล่นให้อยู่ในช่วงอายุแพ็คเกจ` : `This package has already started: playable ${start_date ? niceDate(start_date, lang) : "-"} – ${expiry_date ? niceDate(expiry_date, lang) : "-"}. Your chosen date is before it starts.`,
+        package_columns_missing: lang==="th" ? "ระบบยังตั้งค่าไม่ครบ กรุณาแจ้งแอดมิน (ยังไม่ได้เพิ่มคอลัมน์อายุแพ็คเกจ)" : "System setup is incomplete. Please contact admin.",
+        package_date_out_of_range: lang==="th" ? `แพ็คเกจนี้ใช้เล่นได้ถึง ${expiry_date ?? "-"} แต่วันที่เล่นที่เลือกเลยจากนั้น กรุณาเลือกวันเล่นให้อยู่ภายในอายุแพ็คเกจ` : `This package is playable until ${expiry_date ?? "-"}, but your chosen date is later. Please pick a date within the validity.`,
+        package_wrong_tier: lang==="th" ? "แพ็คเกจนี้ใช้กับช่วงเวลานี้ไม่ได้" : "This package cannot be used for this time slot",
+      }[error] || accountErrMsg(error, lang) || (lang==="th" ? "จองไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Booking failed, please try again");
+      alert(msg);
+      return;
+    }
+    alert(lang==="th" ? "✅ ส่งคำขอจองแล้ว! รอแอดมินยืนยันก่อนถึงจะหักสิทธิ์และถือว่าจองสำเร็จ" : "✅ Booking request sent! Awaiting admin confirmation before the credit is deducted.");
+    setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
+    setPrefillPhone(phone || "");
+    setTab("cancel");
+    clearResumeParam();
+  };
+
+  // ให้ลูกค้ายกเลิกการจองที่ค้าง (เช่นหมดเวลาแล้ว) แล้วเริ่มจองใหม่ได้เอง โดยไม่ต้องรอ/ติดอยู่ที่เดิม
+  const resetBookingFlow = () => {
+    // แจ้งเตือนแอดมินและยกเลิกรายการนี้ในฐานข้อมูลจริงด้วย (ไม่ใช่แค่เคลียร์หน้าจอฝั่งลูกค้า)
+    // ทำแบบ fire-and-forget เพื่อไม่ให้ลูกค้าต้องรอ แต่ยังยิงคำขอไปแน่นอน
+    if (resumeBooking?.id) {
+      db.cancelPending(resumeBooking.id).catch(() => {});
+    }
+    setBooking(null); setCustomer(null); setResumeBooking(null); setPage("booking");
+    clearResumeParam();
+  };
+
+  // ตรวจรหัสผ่าน Admin ที่เซิร์ฟเวอร์เสมอ (ไม่มีการเก็บ/เทียบรหัสผ่านในโค้ดฝั่งเว็บอีกต่อไป)
+  const handleAdminLogin = async () => {
+    if (!adminPw.trim() || adminChecking) return;
+    setAdminChecking(true);
+    setAdminErr(false);
+    const showErr = (msg, ms) => { setAdminErrMsg(msg); setAdminErr(true); setTimeout(() => setAdminErr(false), ms); };
+    try {
+      const res = await fetch("/api/admin-actions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "login", password: adminPw.trim() }), // ตัดช่องว่างหัวท้าย (คีย์บอร์ดมือถือชอบเติมให้เอง)
+      });
+      let data = null;
+      try { data = await res.json(); } catch { /* ไม่ใช่ JSON */ }
+      if (data?.ok && data.token) {
+        setAdminToken(data.token);
+        try { sessionStorage.setItem("nova_admin_token", data.token); } catch { /* no-op */ }
+      } else if (res.status === 401) {
+        showErr("รหัสผ่านไม่ถูกต้อง", 2500);
+      } else if (res.status === 500 && data?.error === "Server not configured") {
+        showErr("เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า ADMIN_PASSWORD (ตรวจ Environment Variables ที่ Vercel แล้ว Redeploy)", 9000);
+      } else {
+        showErr(`เชื่อมต่อระบบไม่ได้ (รหัส ${res.status}) — ดู Vercel → Logs`, 9000);
+      }
+    } catch {
+      showErr("เชื่อมต่อระบบไม่ได้ ตรวจอินเทอร์เน็ตแล้วลองใหม่", 5000);
+    }
+    setAdminChecking(false);
+  };
+
+  const handleAdminLogout = () => {
+    setAdminToken(null);
+    setAdminMode(false);
+    setAdminPw("");
+    try { sessionStorage.removeItem("nova_admin_token"); } catch { /* no-op */ }
+  };
+
+  if (lineCbStatus) return (
+    <>
+      <style>{CSS}</style>
+      <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16,padding:24,textAlign:"center"}}>
+        <NovaLogo width={120} />
+        {lineCbStatus === "processing" ? (
+          <p style={{fontSize:15,color:"var(--br)",fontWeight:600}}>{lang==="th" ? "กำลังเข้าสู่ระบบด้วย LINE..." : "Signing in with LINE..."}</p>
+        ) : (
+          <>
+            <p style={{fontSize:15,color:"#c0392b",fontWeight:700}}>{lang==="th" ? "เข้าสู่ระบบด้วย LINE ไม่สำเร็จ" : "LINE sign-in failed"}</p>
+            <p style={{fontSize:13,color:"var(--mu)"}}>{lang==="th" ? "กรุณาลองใหม่อีกครั้ง หรือกรอกชื่อ-เบอร์โทรเองได้ตามปกติ" : "Please try again, or enter your name and phone manually."}</p>
+            <button className="btn-primary" style={{maxWidth:260}} onClick={() => { window.history.replaceState(null, "", "/"); setLineCbStatus(null); setTab("home"); }}>
+              {lang==="th" ? (LINE_GATE_MODE==="gate" || LINE_GATE_MODE==="booking" ? "ลองใหม่อีกครั้ง" : "กลับหน้าแรก") : (LINE_GATE_MODE==="gate" || LINE_GATE_MODE==="booking" ? "Try again" : "Back to Home")}
+            </button>
+            <a href={adminTel()} style={{fontSize:13,fontWeight:700,color:"var(--br)",textDecoration:"underline"}}>
+              {lang==="th" ? `ไม่มี LINE หรือเข้าไม่ได้ โทรจองกับแอดมิน ${ADMIN_CONTACT_PHONE}` : `No LINE or can't sign in? Call the admin: ${ADMIN_CONTACT_PHONE}`}
+            </a>
+          </>
+        )}
+      </div>
+    </>
+  );
+
+  if (adminMode && !adminToken) return (
+    <>
+      <style>{CSS}</style>
+      <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(135deg,#663924,#3a1a0a)"}}>
+        <div style={{background:"#fff",borderRadius:20,padding:"40px 32px",width:300,textAlign:"center",boxShadow:"0 20px 60px rgba(0,0,0,.3)"}}>
+          <NovaLogo width={140} />
+          <p style={{fontSize:13,color:"var(--mu)",margin:"12px 0 28px"}}>Admin Dashboard</p>
+          <input type="password" value={adminPw} onChange={e=>setAdminPw(e.target.value)}
+            onKeyDown={e=>e.key==="Enter"&&handleAdminLogin()}
+            placeholder="รหัสผ่าน"
+            style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1.5px solid ${adminErr?"#c0392b":"var(--dv)"}`,fontSize:15,marginBottom:12,outline:"none"}} />
+          {adminErr && <p style={{color:"#c0392b",fontSize:12,marginBottom:8,lineHeight:1.5}}>{adminErrMsg || "รหัสผ่านไม่ถูกต้อง"}</p>}
+          <button onClick={handleAdminLogin} disabled={adminChecking}
+            style={{width:"100%",padding:"13px",borderRadius:10,border:"none",background:"#663924",color:"#F47E1F",fontWeight:700,fontSize:15,cursor:adminChecking?"not-allowed":"pointer",fontFamily:"'Noto Sans Thai',sans-serif",opacity:adminChecking?0.7:1}}>
+            {adminChecking ? "⏳ กำลังตรวจสอบ..." : "เข้าสู่ระบบ"}
+          </button>
+          <button onClick={()=>{setAdminMode(false);setAdminPw("");}}
+            style={{marginTop:10,background:"none",border:"none",color:"var(--mu)",fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            ยกเลิก
+          </button>
+        </div>
+      </div>
+    </>
+  );
+
+  if (adminMode && adminToken) return (
+    <>
+      <style>{CSS}</style>
+      <AdminDashboard token={adminToken} onLogout={handleAdminLogout} />
+    </>
+  );
+
+  const needLogin = !lineSession;
+  // ล็อกอินแล้วแต่ LINE ยืนยันว่ายังไม่เป็นเพื่อนกับ OA (false เท่านั้น — ถ้าเช็คไม่ได้เป็น null จะไม่บล็อก กันลูกค้าจองไม่ได้เพราะระบบเรา/LINE ขัดข้อง)
+  const needFriend = (LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && !!lineSession && lineSession.isFriend === false;
+  // กลับไปล็อกอินใหม่เพื่อตรวจสถานะเพื่อน โดยจำรายการที่เลือกไว้ (ถ้ามี) ให้กลับมาต่อได้
+  const recheckFriend = () => handleLineLogin(
+    booking && booking.slot && booking.court
+      ? { dateIso: toIso(booking.date), courtId: booking.court.courtId, courtIds: booking.courts ? booking.courts.map(c => c.courtId) : null, slot: booking.slot }
+      : null
+  );
+  if (LINE_GATE_MODE === "gate" && (needLogin || needFriend)) return (
+    <>
+      <style>{CSS}</style>
+      {needLogin
+        ? <LineLoginGate lang={lang} setLang={setLang} onLogin={() => handleLineLogin(null)} />
+        : <LineFriendGate lang={lang} name={toFormName(lineSession?.displayName)} onRecheck={recheckFriend} />}
+    </>
+  );
+  // โหมด booking: กั้นเฉพาะหน้าจองสนาม/แพ็คเกจ (หน้าแรก ราคา แบนเนอร์ ดูได้อิสระ)
+  const blockedByLine = LINE_GATE_MODE === "booking" && (needLogin || needFriend) && (tab === "book" || tab === "package" || tab === "coach");
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <div style={{maxWidth:480,margin:"0 auto",minHeight:"100dvh",background:"var(--cr)"}}>
+        {!(tab==="book" && page==="payment") && booking && customer && resumeBooking && (
+          <PendingPaymentBanner createdAt={resumeBooking.createdAt} lang={lang} onResume={() => { setTab("book"); setPage("payment"); }} />
+        )}
+        <header style={{position:"sticky",top:0,zIndex:100,backgroundColor:"rgba(249,232,212,0.93)",backdropFilter:"blur(10px)",borderBottom:"1px solid var(--dv)",padding:"8px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",cursor:"pointer"}} onClick={handleLogoTap}>
+          <NovaLogo width={90} />
+          <div onClick={e=>e.stopPropagation()} style={{display:"flex",gap:4,alignItems:"center"}}>
+            {lineSession ? (
+              <button onClick={handleLineLogout} title={lang==="th"?"ออกจากระบบ LINE":"Log out"} style={{padding:"5px 9px",borderRadius:8,border:"1.5px solid #06C755",background:"#fff",color:"#06A04A",fontWeight:700,fontSize:11.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",maxWidth:110,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                👤 {graphemeList(toFormName(lineSession.displayName)).slice(0,8).join("") || "LINE"}
+              </button>
+            ) : (
+              <button onClick={() => handleLineLogin(null)} style={{padding:"5px 10px",borderRadius:8,border:"none",background:"#06C755",color:"#fff",fontWeight:700,fontSize:11.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
+                LINE Login
+              </button>
+            )}
+            {["th","en"].map(l => (
+              <button key={l} onClick={()=>setLang(l)} style={{padding:"5px 10px",borderRadius:8,border:"1.5px solid var(--dv)",background:lang===l?"var(--br)":"#fff",color:lang===l?"var(--or)":"var(--mu)",fontWeight:lang===l?700:400,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                {l==="th"?"🇹🇭 TH":"🇬🇧 EN"}
+              </button>
+            ))}
+          </div>
+        </header>
+        <main>
+          {blockedByLine && (needLogin
+            ? <LineLoginGate lang={lang} compact onLogin={() => handleLineLogin(null)} />
+            : <LineFriendGate lang={lang} compact name={toFormName(lineSession?.displayName)} onRecheck={recheckFriend} />)}
+          {tab==="home" && <HomePage goBook={() => goTab("book")} goPackage={() => goTab("package")} goCoach={() => goTab("coach")} lang={lang} />}
+          {!blockedByLine && tab==="book" && page==="booking" && <BookingPage onProceed={b => { setBooking(b); setPage("checkout"); }} lang={lang} />}
+          {!blockedByLine && tab==="book" && page==="checkout" && booking && (
+            <CheckoutPage booking={booking} onCancel={() => setPage("booking")} onConfirm={c => { setCustomer(c); setPage("payment"); }} onConfirmWithPackage={handleConfirmWithPackage} onConfirmFree={handleConfirmFree} lineSession={lineSession} onLineLogin={handleLineLogin} onLinkPhone={handleLinkPhone} lang={lang} />
+          )}
+          {!blockedByLine && tab==="book" && page==="payment" && booking && customer && (
+            <PaymentPage booking={booking} customer={customer} onDone={handlePaymentDone} lang={lang} resumeBooking={resumeBooking} onCreated={(id, createdAt) => setResumeBooking({ id, createdAt })} onStartOver={resetBookingFlow} />
+          )}
+          {!blockedByLine && tab==="package" && <PackagePage lang={lang} lineSession={lineSession} onLineLogin={handleLineLogin} onLinkPhone={handleLinkPhone} />}
+          {!blockedByLine && tab==="coach" && <CoachPage lang={lang} lineSession={lineSession} onLinkPhone={handleLinkPhone} />}
+          {tab==="cancel" && <CancelPage lang={lang} initialPhone={prefillPhone || lineSession?.phone || ""} lockedPhone={lineSession?.phone || ""} />}
+        </main>
+        <TabBar tab={tab} setTab={goTab} lang={lang} />
+      </div>
+    </>
+  );
+}
+
+// ─── Admin Dashboard (inline) ─────────────────────────────────────────────────
+// ─── รูปคูปองส่วนลด (วาดด้วย canvas ขนาด 1200×630 — แบบเดียวกับคูปองที่เคยทำไว้) ────────────────────────
+// ใช้ในหน้า "ส่วนลด" ของแอดมิน: ตัวอย่างสดตอนกรอก / รูปพร้อมดาวน์โหลดและส่ง LINE หลังสร้างโค้ด / เปิดดูคูปองของโค้ดที่มีอยู่
+const CP_W = 1200, CP_H = 630, CP_SX = 830;
+const CP_FONT = "'Sukhumvit Set','Thonburi','Noto Sans Thai','Leelawadee UI','Sarabun','Tahoma','Loma',sans-serif";
+const CP_MONO = "ui-monospace,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono','Courier New',monospace";
+const CP_THEMES = {
+  orange: { label: "ส้ม (NOVA)", stub: "#F47E1F", accent: "#F47E1F", ink: "#663924" },
+  brown:  { label: "น้ำตาล",     stub: "#663924", accent: "#B5651D", ink: "#4a2a1a" },
+  blue:   { label: "ฟ้า",        stub: "#5E97AE", accent: "#4E8AA3", ink: "#2c4a58" },
+};
+const CP_PRESET_HINTS = { 490: "เท่ากับค่าสนาม Off Peak 1 ชม. (จ.–ศ. ก่อน 16:00)", 590: "เท่ากับค่าสนาม Peak 1 ชม. (จ.–ศ. หลัง 16:00 / ส.–อา.)" };
+const CP_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
+const cpThaiDate = (iso) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || ""); return m ? `${+m[3]} ${CP_MONTHS[+m[2] - 1]} ${+m[1] + 543}` : ""; };
+const cpHexA = (hex, a) => { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; };
+const cpRound = (ctx, x, y, w, h, r) => { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); };
+const cpFit = (ctx, text, maxW, startPx, weight, family) => { let px = startPx; do { ctx.font = `${weight} ${px}px ${family}`; if (ctx.measureText(text).width <= maxW) break; px -= 2; } while (px > 12); return px; };
+const cpSpaced = (ctx, text, cx, y, gap) => { // วาดโค้ดทีละตัวพร้อมเว้นระยะ
+  const chars = [...text]; const ws = chars.map(c => ctx.measureText(c).width);
+  const total = ws.reduce((a, b) => a + b, 0) + gap * (chars.length - 1); let x = cx - total / 2;
+  ctx.textAlign = "left"; chars.forEach((c, i) => { ctx.fillText(c, x, y); x += ws[i] + gap; });
+};
+let _cpLogo = null; // โลโก้โหลดครั้งเดียว (ไฟล์เดียวกับเว็บ จึงไม่ติดข้อจำกัดข้ามโดเมน) — โหลดไม่ได้ก็วาดเป็นข้อความแทน
+const cpLoadLogo = () => (_cpLogo ||= new Promise((resolve) => { const img = new Image(); img.onload = () => resolve(img); img.onerror = () => resolve(null); img.src = "/nova-logo.png"; }));
+async function drawCouponImage(cv, o) {
+  try { await Promise.all(["600", "700", "800", "900"].map(w => document.fonts.load(`${w} 24px "Noto Sans Thai"`))); } catch { /* ใช้ฟอนต์ของเครื่องแทน */ }
+  const logo = await cpLoadLogo();
+  const T = CP_THEMES[o.theme] || CP_THEMES.orange;
+  cv.width = CP_W; cv.height = CP_H; const ctx = cv.getContext("2d");
+  const W = CP_W, H = CP_H, SX = CP_SX;
+  ctx.fillStyle = "#F9E8D4"; ctx.fillRect(0, 0, W, H);
+  const X0 = 40, Y0 = 40, TW = 1120, TH = 550;
+  ctx.save(); ctx.shadowColor = "rgba(102,57,36,.22)"; ctx.shadowBlur = 28; ctx.shadowOffsetY = 10;
+  cpRound(ctx, X0, Y0, TW, TH, 30); ctx.fillStyle = "#fff"; ctx.fill(); ctx.restore();
+  ctx.save(); cpRound(ctx, X0, Y0, SX - X0, TH, 30); ctx.clip();
+  ctx.fillStyle = cpHexA(T.accent, .06); ctx.beginPath(); ctx.arc(640, 340, 255, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = cpHexA(T.accent, .12); ctx.lineWidth = 16; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.arc(405, 215, 330, -0.25 * Math.PI, 0.25 * Math.PI); ctx.stroke();
+  ctx.beginPath(); ctx.arc(875, 465, 330, 0.75 * Math.PI, 1.25 * Math.PI); ctx.stroke();
+  ctx.restore();
+  ctx.save(); cpRound(ctx, X0, Y0, TW, TH, 30); ctx.clip(); ctx.fillStyle = T.stub; ctx.fillRect(SX, Y0, X0 + TW - SX, TH); ctx.restore();
+  ctx.fillStyle = "#F9E8D4"; [Y0, Y0 + TH].forEach(y => { ctx.beginPath(); ctx.arc(SX, y, 24, 0, Math.PI * 2); ctx.fill(); });
+  ctx.save(); ctx.strokeStyle = "rgba(255,255,255,.9)"; ctx.lineWidth = 3; ctx.setLineDash([10, 12]); ctx.beginPath(); ctx.moveTo(SX, Y0 + 40); ctx.lineTo(SX, Y0 + TH - 40); ctx.stroke(); ctx.restore();
+
+  // ── ด้านซ้าย ──
+  ctx.textBaseline = "alphabetic"; ctx.textAlign = "left";
+  let lw;
+  if (logo) { const lh = 86; lw = lh * logo.width / logo.height; ctx.drawImage(logo, 86, 66, lw, lh); }
+  else { ctx.font = `900 54px ${CP_FONT}`; ctx.fillStyle = T.accent; ctx.fillText("NOVA", 86, 132); lw = ctx.measureText("NOVA").width; }
+  const pill = "คูปองส่วนลด"; ctx.font = `800 26px ${CP_FONT}`; const pw = ctx.measureText(pill).width + 40;
+  cpRound(ctx, 86 + lw + 28, 92, pw, 42, 21); ctx.fillStyle = cpHexA(T.accent, .13); ctx.fill();
+  ctx.fillStyle = T.accent; ctx.fillText(pill, 86 + lw + 48, 122);
+  ctx.fillStyle = T.ink; ctx.font = `800 30px ${CP_FONT}`; ctx.fillText("ส่วนลดค่าสนามเทนนิส", 90, 196);
+  const isPct = !!o.percent;
+  const amt = String(Math.max(0, Math.round(+(isPct ? o.percent : o.amount) || 0)));
+  if (isPct) {
+    ctx.font = `900 84px ${CP_FONT}`; const sw = ctx.measureText("%").width;
+    const aPx = cpFit(ctx, amt, 470 - sw, 214, "900", CP_FONT);
+    ctx.font = `900 ${aPx}px ${CP_FONT}`; ctx.fillStyle = T.ink; ctx.fillText(amt, 92, 372);
+    const aw = ctx.measureText(amt).width;
+    ctx.font = `900 96px ${CP_FONT}`; ctx.fillStyle = T.accent; ctx.fillText("%", 100 + aw, 372);
+  } else {
+    ctx.font = `900 84px ${CP_FONT}`; const bw = ctx.measureText("฿").width;
+    const aPx = cpFit(ctx, amt, 470 - bw, 214, "900", CP_FONT);
+    ctx.font = `900 84px ${CP_FONT}`; ctx.fillStyle = T.accent; ctx.fillText("฿", 88, 372 - (aPx * 0.40));
+    ctx.font = `900 ${aPx}px ${CP_FONT}`; ctx.fillStyle = T.ink; ctx.fillText(amt, 92 + bw, 372);
+    const aw = ctx.measureText(amt).width;
+    ctx.font = `800 52px ${CP_FONT}`; ctx.fillStyle = T.accent; ctx.fillText("บาท", 100 + bw + aw, 372);
+  }
+  if (o.hint) { const px = cpFit(ctx, o.hint, 700, 28, "700", CP_FONT); ctx.font = `700 ${px}px ${CP_FONT}`; ctx.fillStyle = cpHexA(T.ink, .85); ctx.fillText("= " + o.hint.replace(/^=\s*/, ""), 90, 428); }
+  const uses = Math.max(1, Math.round(+o.maxUses || 1));
+  const lines = ["ใส่โค้ดในช่อง “โค้ดส่วนลด” ตอนกรอกข้อมูลจอง", uses > 1 ? `โค้ดนี้ใช้ได้รวม ${uses} ครั้ง ใช้ครบแล้วหมดสิทธิ์` : "ใช้ได้ 1 ครั้งต่อ 1 โค้ด ใช้ซ้ำไม่ได้", "ไม่ใช้ร่วมกับโปรจองครั้งแรก แพ็คเกจ และจอง 2 สนามพร้อมกัน"];
+  lines.forEach((t, i) => { ctx.fillStyle = T.accent; ctx.beginPath(); ctx.arc(98, 487 + i * 35 - 7, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = cpHexA(T.ink, .8); const px = cpFit(ctx, t, 690, 24, "600", CP_FONT); ctx.font = `600 ${px}px ${CP_FONT}`; ctx.fillText(t, 116, 487 + i * 35); });
+
+  // ── แถบโค้ดด้านขวา ──
+  const cx = SX + (X0 + TW - SX) / 2; ctx.textAlign = "center"; ctx.fillStyle = "#fff";
+  ctx.font = `800 28px ${CP_FONT}`; ctx.fillText("โค้ดส่วนลดของคุณ", cx, 128);
+  const bx = cx - 150, by = 152, bW = 300, bH = 112;
+  cpRound(ctx, bx, by, bW, bH, 18); ctx.fillStyle = "#fff"; ctx.fill();
+  ctx.save(); ctx.strokeStyle = cpHexA(T.ink, .5); ctx.lineWidth = 3; ctx.setLineDash([9, 8]); cpRound(ctx, bx + 9, by + 9, bW - 18, bH - 18, 12); ctx.stroke(); ctx.restore();
+  const code = String(o.code || "").toUpperCase(); ctx.fillStyle = T.ink;
+  let cp = 58; ctx.font = `800 ${cp}px ${CP_MONO}`; const gap = 5;
+  while (cp > 22) { ctx.font = `800 ${cp}px ${CP_MONO}`; const tw = [...code].reduce((s, c) => s + ctx.measureText(c).width, 0) + gap * (Math.max(code.length, 1) - 1); if (tw <= bW - 44) break; cp -= 2; }
+  cpSpaced(ctx, code, cx, by + bH / 2 + cp * 0.34, gap);
+  ctx.textAlign = "center"; ctx.fillStyle = "rgba(255,255,255,.92)"; ctx.font = `600 23px ${CP_FONT}`; ctx.fillText("พิมพ์โค้ดนี้ตอนจองสนาม", cx, 306);
+  const ed = cpThaiDate(o.expiry);
+  ctx.fillStyle = "rgba(255,255,255,.85)"; ctx.font = `700 25px ${CP_FONT}`; ctx.fillText(ed ? "ใช้ได้ถึง" : "ระยะเวลาใช้งาน", cx, 380);
+  const label = ed || "ไม่มีวันหมดอายุ"; const ep = cpFit(ctx, label, 290, ed ? 50 : 40, "900", CP_FONT); ctx.fillStyle = "#fff"; ctx.font = `900 ${ep}px ${CP_FONT}`; ctx.fillText(label, cx, 380 + 56);
+  ctx.fillStyle = "rgba(255,255,255,.95)"; ctx.font = `800 23px ${CP_FONT}`; ctx.fillText("nova-tennis.vercel.app", cx, 530);
+  ctx.fillStyle = "rgba(255,255,255,.8)"; ctx.font = `600 21px ${CP_FONT}`; ctx.fillText("LINE @347mlhra", cx, 500);
+  cv.dataset.coupon = JSON.stringify({ code, amount: isPct ? null : +amt, percent: isPct ? +amt : null, expiry: o.expiry || "", theme: o.theme || "orange", hint: o.hint || "", uses, logo: !!logo });
+}
+function CouponImage({ code, amount, percent, expiry, theme = "orange", hint = "", maxUses = 1, showActions = false }) {
+  const ref = useRef(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    setFailed(false);
+    drawCouponImage(ref.current, { code, amount, percent, expiry, theme, hint, maxUses }).catch(() => { if (alive) setFailed(true); });
+    return () => { alive = false; };
+  }, [code, amount, percent, expiry, theme, hint, maxUses]);
+  const fileName = `NOVA-coupon-${String(code || "code").toUpperCase()}.png`;
+  const toBlob = () => new Promise((resolve) => { try { ref.current.toBlob(b => resolve(b), "image/png"); } catch { resolve(null); } });
+  const download = async () => {
+    const b = await toBlob();
+    if (!b) { alert("สร้างไฟล์รูปไม่สำเร็จ — ลองแคปหน้าจอรูปคูปองแทน"); return; }
+    const url = URL.createObjectURL(b); const a = document.createElement("a"); a.href = url; a.download = fileName; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 3000);
+  };
+  const share = async () => {
+    const b = await toBlob();
+    if (!b) { alert("สร้างไฟล์รูปไม่สำเร็จ — ลองแคปหน้าจอรูปคูปองแทน"); return; }
+    const file = new File([b], fileName, { type: "image/png" });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { try { await navigator.share({ files: [file], title: "คูปองส่วนลด NOVA Tennis" }); } catch { /* ยกเลิกการแชร์ */ } }
+    else alert("เครื่องนี้ยังแชร์รูปตรงๆ ไม่ได้ — กด “ดาวน์โหลดรูป” แล้วส่งรูปทาง LINE แทน");
+  };
+  return (
+    <div>
+      <canvas ref={ref} width={CP_W} height={CP_H} style={{ width: "100%", height: "auto", display: "block", borderRadius: 12, boxShadow: "0 6px 24px rgba(102,57,36,.18)" }} />
+      {failed && <p style={{ fontSize: 12, color: "#c0392b", marginTop: 6 }}>วาดรูปคูปองไม่สำเร็จ — ลองรีเฟรชหน้า</p>}
+      {showActions && (
+        <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+          <button onClick={download} style={{ flex: 1, minWidth: 150, padding: "12px 14px", borderRadius: 10, border: "none", background: "linear-gradient(90deg,var(--or),var(--or2))", color: "#fff", fontWeight: 800, fontSize: 14, cursor: "pointer", fontFamily: "'Noto Sans Thai',sans-serif" }}>⬇️ ดาวน์โหลดรูป</button>
+          <button onClick={share} style={{ flex: 1, minWidth: 150, padding: "12px 14px", borderRadius: 10, border: "1.5px solid var(--dv)", background: "#fff", color: "var(--br)", fontWeight: 800, fontSize: 14, cursor: "pointer", fontFamily: "'Noto Sans Thai',sans-serif" }}>📤 ส่งต่อ (LINE / แอปอื่น)</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AdminDashboard({ token, onLogout }) {
+  const [tab, setTab] = useState("bookings");
+  const [bookings, setBookings] = useState([]);
+  const [discounts, setDiscounts] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  // สถิติลูกค้า (นับการจองที่ยืนยันแล้วตามวันที่ลูกค้าจอง): ช่วงเวลา + มุมมอง (ทั้งหมด / ใหม่ / จองซ้ำ / จองเยอะสุด)
+  const [custPeriod, setCustPeriod] = useState(30);
+  const [custView, setCustView] = useState("all");
+  const [custStats, setCustStats] = useState(null); // { stats: {เบอร์: {...}}, summary: {...} } | { error }
+  const loadCustStats = async (days) => {
+    setCustStats(null);
+    const r = await callAdminAction("customerStats", token, { days });
+    setCustStats(r?.stats ? r : { error: true });
+  };
+  const [loading, setLoading] = useState(true);
+  const [date, setDate] = useState(toIso(new Date()));
+  const [newCode, setNewCode] = useState("");
+  const [newAmt, setNewAmt] = useState("50");
+  const [newMax, setNewMax] = useState("1");
+  const [newExp, setNewExp] = useState(""); // วันหมดอายุ (เว้นว่าง = ไม่หมดอายุ)
+  // รูปคูปองส่วนลด: สี / ข้อความอธิบายมูลค่า (เติมให้อัตโนมัติสำหรับ ฿490 / ฿590 จนกว่าแอดมินจะแก้เอง) / คูปองที่เพิ่งสร้าง / คูปองที่เปิดดูจากตาราง
+  const [cpTheme, setCpTheme] = useState("orange");
+  const [cpHint, setCpHint] = useState("");
+  const [cpHintTouched, setCpHintTouched] = useState(false);
+  const [cpCreated, setCpCreated] = useState(null);
+  const [cpView, setCpView] = useState(null);
+
+  const [queue, setQueue] = useState([]);
+  const [queueLoading, setQueueLoading] = useState(true);
+
+  const [reportFrom, setReportFrom] = useState(() => {
+    const d = new Date(); d.setDate(d.getDate()-6);
+    return toIso(d);
+  });
+  const [reportTo, setReportTo] = useState(toIso(new Date()));
+  const [reportRows, setReportRows] = useState([]);
+  // แหล่งที่มาของลูกค้า (โฆษณา) + คำนวณความคุ้มค่า
+  const [sourceRows, setSourceRows] = useState(null);
+  const [sourceMsg, setSourceMsg] = useState("");
+  const [sourceLoading, setSourceLoading] = useState(false);
+  const [adSpend, setAdSpend] = useState("");
+  const [marginalCost, setMarginalCost] = useState("150");
+  const loadSourceReport = async () => {
+    setSourceLoading(true); setSourceMsg("");
+    const r = await callAdminAction("sourceReport", token, { from: reportFrom, to: reportTo });
+    if (r?.error === "utm_column_missing") { setSourceRows(null); setSourceMsg("ยังไม่ได้รัน SQL add-utm-columns.sql ที่ Supabase"); }
+    else if (r?.error) { setSourceRows(null); setSourceMsg("ดึงข้อมูลไม่สำเร็จ ลองใหม่อีกครั้ง"); }
+    else setSourceRows(r?.rows || []);
+    setSourceLoading(false);
+  };
+  const [reportLoading, setReportLoading] = useState(false);
+  // รายละเอียดของวันที่ admin กดดูเพิ่ม (ใครจอง จองวันไหน เวลาไหน โอนตอนกี่โมง)
+  const [expandedDay, setExpandedDay] = useState(null);
+  const [dayDetail, setDayDetail] = useState([]);
+  const [dayDetailLoading, setDayDetailLoading] = useState(false);
+
+  // ปิดสนาม — เลือกวันที่/สนาม/ช่วงเวลาแล้วอัปเดตทีเดียว
+  const [blocks, setBlocks] = useState([]);
+  const [blocksLoading, setBlocksLoading] = useState(true);
+  const [closeDate, setCloseDate] = useState(toIso(new Date()));
+  const [closeCourt, setCloseCourt] = useState("both"); // "1" | "2" | "both"
+  const [closeStart, setCloseStart] = useState("06:00");
+  const [closeEnd, setCloseEnd] = useState("07:00");
+  const [closeReason, setCloseReason] = useState("");
+  const [closing, setClosing] = useState(false);
+  const CLOSE_TIME_OPTIONS = (() => {
+    const opts = [];
+    for (let m = 6*60; m <= 23*60; m += 30) opts.push(`${String(Math.floor(m/60)).padStart(2,"0")}:${String(m%60).padStart(2,"0")}`);
+    return opts;
+  })();
+
+  // แพ็คเกจสมาชิก
+  // กดที่ชื่อลูกค้าในตารางว่าง → ไปแท็บ "การจอง" (วันเดียวกัน) แล้วเลื่อน/ไฮไลต์แถวของการจองนั้นให้
+  const [highlightId, setHighlightId] = useState(null);
+  const goToBooking = (b) => { setHighlightId(b.id); setTab("bookings"); };
+  useEffect(() => {
+    if (tab !== "bookings" || !highlightId) return;
+    const t1 = setTimeout(() => document.getElementById(`bk-${highlightId}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 250);
+    const t2 = setTimeout(() => setHighlightId(null), 6000);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [tab, highlightId, bookings]);
+
+  // ── จองแทนลูกค้า (ลูกค้าโทรมาจอง / ไม่มี LINE) ──
+  const START_OPTS = (() => { const o = []; for (let m = DAY_START_MIN; m < DAY_END_MIN; m += 30) o.push(m); return o; })();
+  const [nb, setNb] = useState({ phone: "", name: "", date: toIso(new Date()), courts: [1], startMin: 10 * 60, duration: 60, price: "", status: "reviewing", packageId: "", coachOrderId: "", coachName: "" });
+  const [nbInfo, setNbInfo] = useState(null);
+  const nbAutoName = useRef(""); // ชื่อที่ระบบเติมให้อัตโนมัติจากเบอร์ (ใช้แยกจากชื่อที่แอดมินพิมพ์เอง)
+  const [nbInfoErr, setNbInfoErr] = useState(null); // ค้นหาข้อมูลลูกค้าไม่สำเร็จ (บอกสาเหตุ ไม่ปล่อยให้หน้าเงียบ)
+  const [nbBusy, setNbBusy] = useState(false);
+  const [nbMsg, setNbMsg] = useState(null);
+  const [nbConfirmText, setNbConfirmText] = useState(null); // ข้อความยืนยันนัดเรียนกับโค้ช ให้แอดมินคัดลอกไปส่งในแชท LINE OA
+  const [nbCopied, setNbCopied] = useState(false);
+  const [coachNames, setCoachNames] = useState(() => { try { return JSON.parse(localStorage.getItem("nova_coach_names") || "[]"); } catch { return []; } }); // ชื่อโค้ชที่เคยใช้ (ไว้เลือกเร็ว)
+  const nbAutoUnit = nb.date ? getDurationPrice(Math.floor(nb.startMin / 60), new Date(nb.date + "T00:00:00"), nb.duration).price : 0;
+  const nbUnit = nb.price !== "" ? Number(nb.price) : nbAutoUnit; // ราคาต่อสนาม (ว่าง = ราคาปกติ)
+  const nbNameOk = nb.name.trim().length >= 1 && nb.name.trim().length <= 40;
+  const nbPhoneOk = /^[0-9]{10}$/.test(nb.phone);
+  // ── ตัดสิทธิ์แพ็คเกจ: 60 นาที = 1 ครั้ง / 120 นาที = 2 ครั้ง / 1 สนาม / ทุกชั่วโมงต้องอยู่ในช่วงที่แพ็คครอบคลุม ──
+  const nbPkgs = nbInfo?.packages || [];
+  const nbUsePkg = !!nb.packageId;
+  const nbUnits = nb.duration === 120 ? 2 : 1;
+  const nbPkg = nbPkgs.find(p => String(p.id) === String(nb.packageId)) || null;
+  const nbWeekend = nb.date ? [0, 6].includes(new Date(nb.date + "T00:00:00").getDay()) : false;
+  const inRangeNb = (p) => !p.expiry_date || (nb.date <= String(p.expiry_date).slice(0, 10) && (!p.first_use_date || nb.date >= String(p.first_use_date).slice(0, 10))); // วันเล่นอยู่ภายในอายุแพ็คเกจ (ยังไม่เริ่มนับ = ใช้ได้ วันเล่นนี้จะเป็นวันแรก)
+  const pkgCoversNb = (p) => Array.from({ length: nbUnits }, (_, i) => Math.floor(nb.startMin / 60) + i).every(h => p.tier === "peak" || !(nbWeekend || h >= 16));
+  const pkgProblem = !nbUsePkg ? "" : !nbPkg ? "กรุณาเลือกแพ็คเกจ"
+    : ![60, 120].includes(nb.duration) ? "แพ็คเกจจองได้เฉพาะ 60 หรือ 120 นาที"
+    : nb.courts.length !== 1 ? "แพ็คเกจใช้กับ 1 สนามต่อครั้ง"
+    : !inRangeNb(nbPkg) ? (nbPkg.first_use_date && nb.date < String(nbPkg.first_use_date).slice(0, 10) ? `แพ็คเกจนี้เริ่มนับอายุแล้ว ใช้เล่นได้ ${niceDate(nbPkg.first_use_date)} – ${niceDate(nbPkg.expiry_date)} แต่วันที่เล่นที่เลือกอยู่ก่อนวันเริ่มนับ` : `แพ็คเกจนี้ใช้เล่นได้ถึง ${String(nbPkg.expiry_date).slice(0, 10)} แต่วันที่เล่นที่เลือกเลยจากนั้น`)
+    : !pkgCoversNb(nbPkg) ? "แพ็คเกจนี้ใช้กับช่วงเวลานี้ไม่ได้ (แพ็ค Off Peak: จ.–ศ. ก่อน 16:00 ทุกชั่วโมงที่จอง)"
+    : nbPkg.available < nbUnits ? `สิทธิ์ไม่พอ (ต้องใช้ ${nbUnits} ครั้ง ใช้ได้ ${nbPkg.available} ครั้ง)` : "";
+  // ── ตัดสิทธิ์คอร์สเรียนกับโค้ช: 60 นาที = 1 ครั้ง / 1 สนาม / ต้องลงชื่อโค้ช / ยืนยันทันที ──
+  const nbCoachOrders = nbInfo?.coachOrders || [];
+  const nbCoachIssues = nbInfo?.coachIssues || [];
+  const nbUseCoach = !!nb.coachOrderId;
+  const nbCoach = nbCoachOrders.find(o => String(o.id) === String(nb.coachOrderId)) || null;
+  const nbMode = nbUseCoach ? "coach" : nbUsePkg ? "pkg" : "cash";
+  const nbCoachUnits = Math.max(1, Math.round(nb.duration / 60)); // 60 นาที = ตัด 1 ครั้ง, 120 นาที = ตัด 2 ครั้ง
+  const coachNameClean = nb.coachName.normalize("NFC").replace(/\s+/g, " ").trim();
+  const coachProblem = !nbUseCoach ? "" : !nbCoach ? "กรุณาเลือกคอร์สโค้ช"
+    : ![60, 120].includes(nb.duration) ? "นัดเรียนกับโค้ชเลือกได้ 60 นาที (ตัด 1 ครั้ง) หรือ 120 นาที (ตัด 2 ครั้ง)"
+    : nb.courts.length !== 1 ? "นัดเรียนกับโค้ชใช้ 1 สนาม"
+    : !coachNameClean ? "กรุณาใส่ชื่อโค้ช (ลูกค้าจะเห็นชื่อนี้ในหน้า \"การจองของฉัน\")"
+    : Array.from(coachNameClean).length > 30 ? "ชื่อโค้ชยาวเกิน 30 ตัวอักษร"
+    : nbCoach.remaining < nbCoachUnits ? (nbCoach.remaining < 1 ? "สิทธิ์ครั้งเรียนหมดแล้ว" : `สิทธิ์ไม่พอ: เหลือ ${nbCoach.remaining} ครั้ง แต่ ${nb.duration} นาทีต้องใช้ ${nbCoachUnits} ครั้ง`) : "";
+  const nbCanSubmit = nbPhoneOk && nbNameOk && nb.courts.length > 0 && nb.date && Number.isFinite(nbUnit) && nbUnit >= 0 && !nbBusy && !pkgProblem && !coachProblem;
+  const pickBestPkg = () => (nbPkgs.find(p => pkgCoversNb(p) && inRangeNb(p) && p.available >= nbUnits && p.tier === (nbWeekend || Math.floor(nb.startMin / 60) >= 16 ? "peak" : "offpeak"))
+    || nbPkgs.find(p => pkgCoversNb(p) && inRangeNb(p) && p.available >= nbUnits) || nbPkgs[0]);
+  const setNbMode = (m) => setNb(prev => {
+    if (m === "cash") return { ...prev, packageId: "", coachOrderId: "" };
+    if (m === "coach") { const first = nbCoachOrders[0]; return { ...prev, packageId: "", coachOrderId: first ? String(first.id) : "", duration: [60, 120].includes(prev.duration) ? prev.duration : 60, courts: prev.courts.slice(0, 1) }; }
+    return prev; // pkg ใช้ togglePkg
+  });
+  const togglePkg = (on) => setNb(prev => {
+    if (!on) return { ...prev, packageId: "", coachOrderId: "" };
+    const best = pickBestPkg();
+    return { ...prev, coachOrderId: "", packageId: best ? String(best.id) : "", duration: [60, 120].includes(prev.duration) ? prev.duration : 60, courts: prev.courts.slice(0, 1) };
+  });
+  useEffect(() => {
+    setNbInfo(null); setNbInfoErr(null);
+    setNb(prev => {
+      const clearName = !!nbAutoName.current && prev.name === nbAutoName.current; // ชื่อเดิมถูกเติมโดยระบบ ไม่ใช่ที่แอดมินพิมพ์ → ล้าง
+      if (clearName) nbAutoName.current = "";
+      return (prev.packageId || prev.coachOrderId || clearName) ? { ...prev, packageId: "", coachOrderId: "", ...(clearName ? { name: "" } : {}) } : prev;
+    });
+    if (!/^[0-9]{10}$/.test(nb.phone)) return;
+    let cancelled = false;
+    callAdminAction("lookupCustomer", token, { phone: nb.phone }).then(r => {
+      if (cancelled) return;
+      if (!r || r.error) { setNbInfoErr(`ค้นหาข้อมูลลูกค้าไม่สำเร็จ (${r?.error || "ไม่มีข้อมูลตอบกลับ"}) — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว และดู Vercel → Logs`); return; }
+      setNbInfo(r);
+      if (r.name) setNb(prev => { if (prev.phone !== nb.phone || prev.name) return prev; nbAutoName.current = r.name; return { ...prev, name: r.name }; }); // เบอร์เดิม → เติมชื่อเดิมให้ (แก้ได้)
+    }).catch(() => { if (!cancelled) setNbInfoErr("เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ (deploy ไม่ครบหรือมีข้อผิดพลาดฝั่งเซิร์ฟเวอร์) — ตรวจว่า deploy ทั้ง nova-tennis.jsx และ api/admin-actions.js แล้ว และดู Vercel → Logs"); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nb.phone]);
+  const startNbFromGrid = (courtId, startMin) => { setNb(prev => ({ ...prev, date, courts: [courtId], startMin })); setNbMsg(null); setTab("newbooking"); };
+  const submitNb = async () => {
+    if (!nbCanSubmit) return;
+    const total = Math.round(nbUnit) * nb.courts.length;
+    const ok = window.confirm(
+      `จองให้ ${nb.name.trim()} (${nb.phone})\n` +
+      `${nb.courts.map(c => "Court " + c).join(" + ")} • ${nb.date} • ${minutesToLabel(nb.startMin)}–${minutesToLabel(nb.startMin + nb.duration)}\n` +
+      (nbUseCoach
+        ? `👤 โค้ช: ${coachNameClean}\nตัดสิทธิ์คอร์ส C-${nbCoach.id} ${nbCoachUnits > 1 ? `${nbCoachUnits} ครั้ง (ครั้งที่ ${nbCoach.sessions_used + 1}–${nbCoach.sessions_used + nbCoachUnits}/${nbCoach.sessions}, ${nb.duration} นาที)` : `ครั้งที่ ${nbCoach.sessions_used + 1}/${nbCoach.sessions}`} (เหลือ ${nbCoach.remaining - nbCoachUnits} ครั้งหลังตัด) • ยืนยันทันที\n\nยืนยันการจอง?`
+        : nbUsePkg
+        ? `ตัดสิทธิ์แพ็คเกจ ${nbUnits} ครั้ง (${nbPkg.tier === "peak" ? "Peak" : "Off Peak"}) เหลือ ${nbPkg.remaining_credits - nbUnits} ครั้งหลังตัด • ยืนยันทันที${!nbPkg.expiry_date && nbPkg.expiry_days > 0 ? `\n🗓 เริ่มนับอายุแพ็คเกจวันที่ ${nb.date} (ใช้เล่นได้ ${nbPkg.expiry_days} วัน ถึง ${addDaysIsoClient(nb.date, nbPkg.expiry_days - 1)})` : ""}\n\nยืนยันการจอง?`
+        : `ยอดรวม ฿${total.toLocaleString()} • ${nb.status === "confirmed" ? "ชำระแล้ว (ยืนยันทันที)" : "รอชำระ"}\n\nยืนยันการจอง?`));
+    if (!ok) return;
+    setNbBusy(true); setNbMsg(null); setNbConfirmText(null); setNbCopied(false);
+    let r = null;
+    try { r = await callAdminAction("createAdminBooking", token, {
+      customerId: nb.phone, customerName: nb.name.trim(), courtIds: nb.courts, bookingDate: nb.date,
+      hour: Math.floor(nb.startMin / 60), startMinute: nb.startMin % 60, durationMinutes: nb.duration, price: Math.round(nbUnit), status: nb.status,
+      ...(nbUsePkg ? { packageId: nb.packageId } : {}),
+      ...(nbUseCoach ? { coachOrderId: nb.coachOrderId, coachName: coachNameClean } : {}),
+    }); } catch { r = { error: "network_or_server" }; }
+    setNbBusy(false);
+    if (r?.ok) {
+      setNbMsg({ ok: true, text: `✅ จองให้ ${nb.name.trim()} เรียบร้อย (${nb.courts.map(c => "Court " + c).join(" + ")} ${nb.date} ${minutesToLabel(nb.startMin)})${r.creditsUsed ? ` • ตัดสิทธิ์แพ็คเกจ ${r.creditsUsed} ครั้ง เหลือ ${r.remaining} ครั้ง` : ""}${r.coach ? ` • 👤 โค้ช ${r.coach.coachName} • ตัดสิทธิ์คอร์ส C-${r.coach.orderId} ${(r.coach.units || 1) > 1 ? `${r.coach.units} ครั้ง (ครั้งที่ ${r.coach.sessions_used - r.coach.units + 1}–${r.coach.sessions_used}/${r.coach.sessions})` : `ครั้งที่ ${r.coach.sessions_used}/${r.coach.sessions}`} (เหลือ ${r.coach.remaining} ครั้ง)` : ""}` });
+      if (r.coach) {
+        const when = new Date(nb.date + "T00:00:00").toLocaleDateString("th-TH", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+        setNbConfirmText(`✅ ยืนยันนัดเรียนกับโค้ช\n👤 โค้ช: ${r.coach.coachName}\n📅 ${when}\n🕐 ${minutesToLabel(nb.startMin)}–${minutesToLabel(nb.startMin + nb.duration)}\n🎾 Court ${nb.courts[0]}\n📋 ใช้สิทธิ์คอร์ส C-${r.coach.orderId} ${(r.coach.units || 1) > 1 ? `${r.coach.units} ครั้ง (ครั้งที่ ${r.coach.sessions_used - r.coach.units + 1}–${r.coach.sessions_used}/${r.coach.sessions})` : `ครั้งที่ ${r.coach.sessions_used}/${r.coach.sessions}`} (เหลือ ${r.coach.remaining} ครั้ง)\n\nตรวจสอบนัดหมายได้ที่เว็บ NOVA Tennis → เมนู "การจองของฉัน"`);
+        setCoachNames(list => { const next = [r.coach.coachName, ...list.filter(n => n !== r.coach.coachName)].slice(0, 8); try { localStorage.setItem("nova_coach_names", JSON.stringify(next)); } catch { /* no-op */ } return next; });
+      }
+      setNb(prev => ({ ...prev, phone: "", name: "", price: "", packageId: "", coachOrderId: "" })); setNbInfo(null);
+      loadBookings(); loadQueue();
+    } else {
+      setNbMsg({ ok: false, text: r?.error === "slot_taken" ? `❌ ช่วงเวลานี้มีคนจองแล้ว (Court ${r.court}) — ดูที่แท็บตารางว่าง`
+        : r?.error === "package_no_credits" ? `❌ สิทธิ์แพ็คเกจไม่พอ (ต้องใช้ ${r.needed} ครั้ง ใช้ได้ ${r.available} ครั้ง — ไม่นับสิทธิ์ที่ลูกค้าจองค้างรอยืนยัน)`
+        : r?.error === "package_wrong_tier" ? "❌ แพ็คเกจนี้ใช้กับช่วงเวลานี้ไม่ได้ (แพ็ค Off Peak: จ.–ศ. ก่อน 16:00 ทุกชั่วโมงที่จอง)"
+        : r?.error === "package_duration" ? "❌ แพ็คเกจจองได้เฉพาะ 60 หรือ 120 นาที"
+        : r?.error === "package_one_court" ? "❌ แพ็คเกจใช้กับ 1 สนามต่อครั้ง"
+        : r?.error === "package_expired" ? "❌ แพ็คเกจหมดอายุแล้ว"
+        : r?.error === "package_date_out_of_range" ? `❌ แพ็คเกจนี้ใช้เล่นได้ถึง ${r.expiry_date} แต่วันที่เล่นที่เลือกเลยจากนั้น`
+        : r?.error === "coach_busy" ? `❌ โค้ช ${r.coach} มีนัดเวลาซ้อนกัน (Court ${r.court} ${r.from}–${r.to}) — เลือกเวลาอื่น หรือตรวจชื่อโค้ช`
+        : r?.error === "coach_no_sessions" ? "❌ คอร์สนี้ใช้สิทธิ์ครั้งเรียนครบแล้ว"
+        : r?.error === "coach_order_not_active" ? "❌ คอร์สนี้ใช้ไม่ได้ (ไม่ใช่ของเบอร์นี้ หรือยังไม่ได้ยืนยันรับเงิน/ถูกยกเลิก)"
+        : r?.error === "coach_order_busy" ? "❌ มีการตัดสิทธิ์คอร์สนี้พร้อมกัน กรุณาลองใหม่อีกครั้ง"
+        : r?.error === "coach_name_required" ? "❌ กรุณาใส่ชื่อโค้ช (ไม่เกิน 30 ตัวอักษร)"
+        : r?.error === "coach_duration" ? "❌ นัดเรียนกับโค้ชเลือกได้ 60 หรือ 120 นาที"
+        : r?.error === "coach_not_enough_sessions" ? `❌ สิทธิ์ไม่พอ: เหลือ ${r.available} ครั้ง แต่รายการนี้ต้องใช้ ${r.needed} ครั้ง`
+        : r?.error === "package_date_before_start" ? `❌ แพ็คเกจนี้เริ่มนับอายุแล้ว ใช้เล่นได้ ${r.start_date} – ${r.expiry_date} แต่วันที่เล่นที่เลือกอยู่ก่อนวันเริ่มนับ`
+        : r?.error === "package_columns_missing" ? "❌ ยังไม่ได้รัน SQL — รันไฟล์ add-package-first-use-date.sql ที่ Supabase ก่อน (ยังไม่ได้หักสิทธิ์/ไม่มีการบันทึก)"
+        : r?.error === "coach_one_court" ? "❌ นัดเรียนกับโค้ชใช้ 1 สนาม"
+        : r?.error === "coach_columns_missing" ? "❌ ยังไม่ได้รัน SQL เพิ่มคอลัมน์โค้ช — รันไฟล์ add-coach-booking-columns.sql ที่ Supabase ก่อน (สิทธิ์ที่ตัดไว้ถูกคืนให้แล้ว)"
+        : r?.error === "package_busy" ? "❌ มีการตัดสิทธิ์แพ็คเกจนี้พร้อมกัน กรุณาลองใหม่อีกครั้ง"
+        : r?.error === "package_not_active" ? "❌ แพ็คเกจนี้ใช้ไม่ได้ (ไม่ใช่ของเบอร์นี้ หรือยังไม่เปิดใช้งาน)"
+        : r?.error === "network_or_server" ? "❌ เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว และดู Vercel → Logs"
+        : `❌ บันทึกไม่สำเร็จ (${r?.error || "ไม่ทราบสาเหตุ"}) ตรวจข้อมูลแล้วลองใหม่อีกครั้ง` });
+    }
+  };
+  // ลูกค้า: ค้นหา / แก้ชื่อ / แก้เบอร์ / เบอร์ที่ผูกกับ LINE + ปลดล็อก
+  const [linkedPhones, setLinkedPhones] = useState({});
+  const [custQuery, setCustQuery] = useState("");
+  const editCustomerName = async (c) => {
+    const n = window.prompt(`แก้ชื่อลูกค้า (1–40 ตัวอักษร)\nจะแก้ในข้อมูลลูกค้า แพ็คเกจ และการจองทุกรายการของเบอร์ ${c.customer_id}`, c.customer_name || "");
+    if (n == null) return;
+    const clean = n.trim();
+    if (!clean || Array.from(clean).length > 40) { alert("ชื่อต้องมี 1–40 ตัวอักษร"); return; }
+    const r = await callAdminAction("updateCustomerName", token, { phone: c.customer_id, name: clean });
+    if (r?.ok) loadCustomers();
+    else alert(r?.error === "name_from_line" ? "ลูกค้าคนนี้ผูก LINE แล้ว ใช้ชื่อจาก LINE แก้ที่นี่ไม่ได้" : "แก้ชื่อไม่สำเร็จ ลองใหม่อีกครั้ง");
+  };
+  const changeCustomerPhone = async (c) => {
+    const input = window.prompt(`เปลี่ยนเบอร์ของ ${c.customer_name || "-"}\nเบอร์เดิม ${c.customer_id}\n\nพิมพ์เบอร์ใหม่ 10 หลัก:`, "");
+    if (input == null) return;
+    const np = input.replace(/\D/g, "");
+    if (!/^[0-9]{10}$/.test(np)) { alert("เบอร์ใหม่ต้องเป็นตัวเลข 10 หลัก"); return; }
+    if (!window.confirm(`ย้ายข้อมูลทั้งหมด (ข้อมูลลูกค้า การจอง แพ็คเกจ และการผูก LINE ถ้ามี) จาก ${c.customer_id} ไปเป็น ${np}?\n\nเบอร์ใหม่ต้องยังไม่มีข้อมูลในระบบ ถ้าทำผิดแก้ได้โดยเปลี่ยนเบอร์กลับ`)) return;
+    const r = await callAdminAction("changeCustomerPhone", token, { oldPhone: c.customer_id, newPhone: np });
+    if (r?.ok) { alert("เปลี่ยนเบอร์เรียบร้อย"); loadCustomers(); return; }
+    alert({
+      phone_exists: "เบอร์ใหม่มีข้อมูลในระบบอยู่แล้ว (ยังไม่รองรับการรวมข้อมูลสองเบอร์)",
+      same_phone: "เบอร์ใหม่ซ้ำกับเบอร์เดิม", invalid_phone: "เบอร์ไม่ถูกต้อง",
+      rpc_missing: "ยังไม่ได้รัน SQL ไฟล์ add-change-phone-function.sql ที่ Supabase",
+    }[r?.error] || "เปลี่ยนเบอร์ไม่สำเร็จ ลองใหม่อีกครั้ง");
+  };
+  const unlinkPhone = async (phone) => {
+    if (!window.confirm(`ปลดล็อกเบอร์ ${phone} จากบัญชี LINE?\n\nลูกค้าจะผูกเบอร์ใหม่ (หรือเบอร์เดิม) ได้อีกครั้งตอนจองครั้งถัดไป ประวัติการจองเดิมยังอยู่กับเบอร์เดิม`)) return;
+    const r = await callAdminAction("unlinkLinePhone", token, { phone });
+    if (r?.ok) loadCustomers();
+  };
+
+  // ── คอร์สเรียนกับโค้ช (สนาม+โค้ช): ลูกค้าจ่ายเงินแล้วแอดมินนัดวัน-เวลาทาง LINE OA ──
+  const [coachList, setCoachList] = useState(null);
+  const [coachFilter, setCoachFilter] = useState("open"); // open = รอชำระ/รอตรวจสอบ, confirmed, all
+  const [coachBusy, setCoachBusy] = useState(null);
+  const [coachPushEnabled, setCoachPushEnabled] = useState(false); // เซิร์ฟเวอร์เปิดส่งข้อความ LINE อัตโนมัติอยู่หรือไม่ (COACH_LINE_PUSH)
+  const loadCoach = async () => { const r = await callAdminAction("coachOrders", token, {}); setCoachList(Array.isArray(r?.orders) ? r.orders : []); setCoachPushEnabled(!!r?.pushEnabled); };
+  useEffect(() => { if (tab === "coach") loadCoach(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [tab]);
+  const confirmCoach = async (o) => {
+    if (!window.confirm(`ยืนยันว่าได้รับเงินแล้ว ฿${o.price.toLocaleString()} จาก ${o.customer_name}?${coachPushEnabled ? "\n\nระบบจะส่งข้อความแจ้งลูกค้าใน LINE OA ให้ด้วย" : "\n\nจากนั้นนัดวัน-เวลากับลูกค้าในแชท LINE OA (ลูกค้าทักมาพร้อมรหัส C-" + o.id + ")"}`)) return;
+    setCoachBusy(o.id);
+    const r = await callAdminAction("confirmCoachOrder", token, { id: o.id });
+    setCoachBusy(null);
+    if (!r?.ok) alert("ยืนยันไม่สำเร็จ (อาจถูกยืนยัน/ยกเลิกไปแล้ว)");
+    else if (r.pushEnabled && !r.pushed) alert("ยืนยันแล้ว แต่ส่งข้อความเข้า LINE OA ของลูกค้าไม่สำเร็จ (ลูกค้าอาจบล็อก OA หรือโควตาข้อความหมด) กรุณาทักลูกค้าเอง");
+    loadCoach();
+  };
+  const cancelCoach = async (o) => {
+    if (!window.confirm(`ยกเลิกคำสั่งซื้อ C-${o.id} ของ ${o.customer_name}?`)) return;
+    setCoachBusy(o.id);
+    await callAdminAction("cancelCoachOrder", token, { id: o.id });
+    setCoachBusy(null); loadCoach();
+  };
+  const adjustCoach = async (o, delta) => {
+    setCoachBusy(o.id);
+    const r = await callAdminAction("adjustCoachSessions", token, { id: o.id, delta });
+    setCoachBusy(null);
+    if (r?.ok) setCoachList(list => list.map(x => (x.id === o.id ? { ...x, sessions_used: r.sessions_used } : x)));
+    else loadCoach();
+  };
+
+  // ── ขายแพ็คเกจสนาม/คอร์สโค้ชให้ลูกค้า (แอดมินบันทึกที่ลูกค้าโอนเงินแล้ว) ──
+  const [sl, setSl] = useState({ phone: "", name: "", kind: "package", promo: "ALL-11", tier: "peak", credits: 5, audience: "adult", type: "duo", sessions: 5, price: "", note: "" });
+  const [slCatalog, setSlCatalog] = useState(null);
+  const [slCatFail, setSlCatFail] = useState(false);
+  const [slInfo, setSlInfo] = useState(null);
+  const [slBusy, setSlBusy] = useState(false);
+  const [slMsg, setSlMsg] = useState(null);
+  const slAutoName = useRef("");
+  useEffect(() => {
+    if (tab !== "sell" || slCatalog) return;
+    setSlCatFail(false);
+    callAdminAction("sellCatalog", token, {}).then(r => { if (r?.packages && r?.coach) setSlCatalog(r); else setSlCatFail(true); }).catch(() => setSlCatFail(true));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
+  useEffect(() => {
+    setSlInfo(null);
+    setSl(prev => (slAutoName.current && prev.name === slAutoName.current ? (slAutoName.current = "", { ...prev, name: "" }) : prev)); // ชื่อที่ระบบเติมให้จากเบอร์ก่อนหน้า ไม่ให้ค้างไปเบอร์ใหม่
+    if (!/^[0-9]{10}$/.test(sl.phone)) return;
+    let cancelled = false;
+    callAdminAction("lookupCustomer", token, { phone: sl.phone }).then(r => {
+      if (cancelled || !r || r.error) return;
+      setSlInfo(r);
+      const known = r.lineName || r.name;
+      if (known) setSl(prev => { if (prev.phone !== sl.phone || prev.name) return prev; slAutoName.current = known; return { ...prev, name: known }; });
+    }).catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sl.phone]);
+  const slItem = !slCatalog ? null : sl.kind === "promo"
+    ? (slCatalog.promo?.items || []).find(x => x.code === sl.promo) || null
+    : sl.kind === "package"
+    ? slCatalog.packages.find(x => x.tier === sl.tier && x.credits === sl.credits) || null
+    : slCatalog.coach.find(x => x.audience === sl.audience && x.type === sl.type && x.sessions === sl.sessions) || null;
+  const slList = slItem ? (sl.kind === "coach" ? slItem.total : slItem.price) : 0;
+  const slPrice = sl.price === "" ? slList : Number(sl.price);
+  const slPriceOk = !!slItem && Number.isInteger(slPrice) && slPrice >= 0 && slPrice <= slList;
+  const slNeedNote = !!slItem && slPriceOk && slPrice !== slList;
+  const slNoteOk = !slNeedNote || sl.note.trim().length >= 3;
+  const slLinked = !!slInfo?.linked && !!slInfo?.lineName;
+  const slNameOk = slLinked || (sl.name.trim().length >= 1 && Array.from(sl.name.trim()).length <= 40);
+  const slPhoneOk = /^[0-9]{10}$/.test(sl.phone);
+  const slCanSubmit = slPhoneOk && slNameOk && slPriceOk && slNoteOk && !slBusy;
+  const slLabel = !slItem ? "" : sl.kind === "promo" ? `โปร 11.11 ${slItem.name} (${slItem.tier === "peak" ? "ทุกเวลา" : "จ.–ศ. ก่อน 16:00"}) ${slItem.credits} ครั้ง` : sl.kind === "package"
+    ? `แพ็คเกจสนาม ${sl.tier === "peak" ? "Peak" : "Off Peak"} ${sl.credits} ครั้ง`
+    : `คอร์สโค้ช ${coachLabel(slItem, "th")}`;
+  const submitSell = async () => {
+    if (!slCanSubmit) return;
+    const name = slLinked ? slInfo.lineName : sl.name.trim();
+    if (!window.confirm(`ขาย ${slLabel}\nให้ ${name} (${sl.phone})\nราคา ฿${slPrice.toLocaleString()}${slPrice !== slList ? ` (ราคาป้าย ฿${slList.toLocaleString()} • ลด ฿${(slList - slPrice).toLocaleString()})` : ""} • ${slPrice > 0 ? "รับเงินโอนแล้ว" : "แจกฟรี"}\n${sl.kind !== "coach" ? `อายุ ${slItem.days} วัน (เริ่มนับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ)` : "ใช้งานได้ทันที"}\n\nยืนยันการบันทึกการขาย?`)) return;
+    setSlBusy(true); setSlMsg(null);
+    let r = null;
+    try {
+      r = await callAdminAction("sellToCustomer", token, {
+        kind: sl.kind, customerId: sl.phone, customerName: name, price: slPrice, note: sl.note.trim(),
+        ...(sl.kind === "promo" ? { promo: sl.promo } : sl.kind === "package" ? { tier: sl.tier, credits: sl.credits } : { audience: sl.audience, type: sl.type, sessions: sl.sessions }),
+      });
+    } catch { r = { error: "network_or_server" }; }
+    setSlBusy(false);
+    if (r?.ok) {
+      setSlMsg({ ok: true, phone: sl.phone, text: `✅ บันทึกการขายแล้ว: ${r.label} ให้ ${name} • ฿${r.price.toLocaleString()}${r.price !== r.listPrice ? ` (ราคาป้าย ฿${r.listPrice.toLocaleString()})` : ""} — ใช้งานได้ทันที` });
+      setSl(prev => ({ ...prev, phone: "", name: "", price: "", note: "" })); setSlInfo(null);
+    } else {
+      setSlMsg({ ok: false, text:
+        r?.error === "duplicate_recent" ? "❌ เพิ่งบันทึกรายการเดียวกันให้เบอร์นี้ไปเมื่อสักครู่ (กันกดซ้ำ) — ตรวจที่แท็บ แพ็คเกจ / โค้ช ก่อน"
+        : r?.error === "note_required" ? "❌ ลดราคา/แจกฟรี ต้องใส่หมายเหตุ (อย่างน้อย 3 ตัวอักษร)"
+        : r?.error === "invalid_price" ? "❌ ราคาต้องเป็นจำนวนเต็ม และไม่สูงกว่าราคาป้าย"
+        : r?.error === "invalid_name" ? "❌ กรุณาใส่ชื่อลูกค้า (ไม่เกิน 40 ตัวอักษร)"
+        : r?.error === "invalid_phone" ? "❌ เบอร์โทรต้องเป็นตัวเลข 10 หลัก"
+        : r?.error === "invalid_product" ? "❌ สินค้านี้ไม่มีในรายการขาย"
+        : r?.error === "note_too_long" ? "❌ หมายเหตุยาวเกิน 200 ตัวอักษร"
+        : r?.error === "promo_ended" ? "❌ โปร 11.11 ปิดการขายแล้ว (เลยวันที่ 17 พ.ย. 23:59)"
+        : r?.error === "promo_not_started" ? "❌ โปร 11.11 ยังไม่เปิดขาย (เริ่มขาย 10 พ.ย. เวลา 00:00)"
+        : r?.error === "promo_columns_missing" ? "❌ ยังไม่ได้รัน SQL — รันไฟล์ add-promo-1111-columns.sql ที่ Supabase ก่อน (ยังไม่มีการบันทึกใดๆ)"
+        : r?.error === "sale_columns_missing" ? "❌ ยังไม่ได้รัน SQL — รันไฟล์ add-admin-sale-columns.sql ที่ Supabase ก่อน (ยังไม่มีการบันทึกใดๆ)"
+        : r?.error === "network_or_server" ? "❌ เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว และดู Vercel → Logs"
+        : `❌ บันทึกไม่สำเร็จ (${r?.error || "ไม่ทราบสาเหตุ"}) ลองใหม่อีกครั้ง` });
+    }
+  };
+
+  const [pkgQueue, setPkgQueue] = useState([]);
+  const [pkgQueueLoading, setPkgQueueLoading] = useState(true);
+  const [allPkgs, setAllPkgs] = useState([]);
+  const [allPkgsLoading, setAllPkgsLoading] = useState(true);
+  const loadPkgQueue = async () => {
+    setPkgQueueLoading(true);
+    const { packages: rows } = await callAdminAction("packagesQueue", token, {});
+    setPkgQueue(rows || []);
+    setPkgQueueLoading(false);
+  };
+  const loadAllPkgs = async () => {
+    setAllPkgsLoading(true);
+    const { packages: rows } = await callAdminAction("allPackages", token, {});
+    setAllPkgs(rows || []);
+    setAllPkgsLoading(false);
+  };
+  // ── แพ็คเกจ: ค้นหา / กรอง "เฉพาะที่ยังใช้ได้" / สรุป ──
+  const [pkgQuery, setPkgQuery] = useState("");
+  const [pkgOnlyUsable, setPkgOnlyUsable] = useState(true);
+  const pkgToday = toIso(new Date());
+  const pkgUsable = (pk) => pk.status === "active" && pk.remaining_credits > 0 && !(pk.expiry_date && String(pk.expiry_date).slice(0, 10) < pkgToday);
+  const pkQ = pkgQuery.trim().toLowerCase();
+  const pkDigits = pkQ.replace(/\D/g, "");
+  const visiblePkgs = allPkgs.filter(pk => (!pkgOnlyUsable || pkgUsable(pk)) && (!pkQ || String(pk.customer_name || "").toLowerCase().includes(pkQ) || (pkDigits.length > 0 && String(pk.customer_id).includes(pkDigits))));
+  const usableAll = allPkgs.filter(pkgUsable);
+  const usableCustomers = new Set(usableAll.map(pk => pk.customer_id)).size;
+  const usableCredits = usableAll.reduce((s, pk) => s + pk.remaining_credits, 0);
+
+  // ── ประวัติลูกค้า: แพ็คเกจ + วันเวลาที่ใช้สิทธิ์ + ประวัติการจองทั้งหมดของเบอร์นั้น ──
+  // ── เลื่อนเวลาการจอง (แอดมิน): เปลี่ยนวัน/เวลาเริ่ม/สนาม ระยะเวลาเท่าเดิม ไม่คิดราคาใหม่ — ไม่ต้องยกเลิกแล้วจองใหม่ ──
+  const [mv, setMv] = useState(null);        // { b, date, startMin, court }
+  const [mvBusy, setMvBusy] = useState(false);
+  const [mvErr, setMvErr] = useState(null);
+  const [mvDone, setMvDone] = useState(null); // { text, warn }
+  const bkStartMin = (b) => (b.hour || 0) * 60 + (b.start_minute || 0);
+  const bkIsPast = (b) => { const t = new Date(Date.now() + 7 * 3600e3); const today = t.toISOString().slice(0, 10); const nowMin = t.getUTCHours() * 60 + t.getUTCMinutes(); return b.booking_date < today || (b.booking_date === today && bkStartMin(b) + (b.duration_minutes || 60) <= nowMin); };
+  const canMove = (b) => (b.status === "confirmed" || b.status === "reviewing") && !bkIsPast(b);
+  const openMove = (b) => { setMvErr(null); setMv({ b, date: b.booking_date, startMin: bkStartMin(b), court: b.court_id }); };
+  const tierOfBk = (d, h) => { const dow = new Date(d + "T00:00:00").getDay(); return (dow === 0 || dow === 6 || h >= 16) ? "peak" : "offpeak"; };
+  const grpCourts = (b) => b.group_id ? [...new Set([...bookings, ...queue].filter(x => x.group_id === b.group_id && x.status !== "cancelled").map(x => x.court_id))].sort() : [b.court_id];
+  const movedTag = (b) => { if (!b.moved_from) return null; const m = parseMovedFrom(b.moved_from); return <div style={{fontSize:10.5,fontWeight:700,color:"#2d5f8a",marginTop:2}}>🕐 เลื่อนแล้ว (จาก {m.date === b.booking_date ? m.time : `${niceDate(m.date)} ${m.time}`})</div>; };
+  const submitMove = async () => {
+    if (!mv || mvBusy) return;
+    const { b } = mv;
+    setMvBusy(true); setMvErr(null);
+    let r = null;
+    try { r = await callAdminAction("rescheduleBooking", token, { id: b.id, newDate: mv.date, hour: Math.floor(mv.startMin / 60), startMinute: mv.startMin % 60, ...(b.group_id ? {} : { courtId: mv.court }) }); }
+    catch { r = { error: "network_or_server" }; }
+    setMvBusy(false);
+    if (r?.ok) {
+      const courtsChanged = JSON.stringify(r.from.courts) !== JSON.stringify(r.to.courts);
+      setMvDone({ text: `✅ เลื่อนการจองของ ${b.customer_name || "ลูกค้า"} แล้ว: ${niceDate(r.from.date)} ${r.from.start} → ${niceDate(r.to.date)} ${r.to.start}–${r.to.end}${courtsChanged ? ` • ${r.to.courts.map(c => "Court " + c).join(" + ")}` : ""}`, warn: !!r.priceTierChanged });
+      setMv(null); loadQueue(); loadBookings();
+    } else {
+      setMvErr(
+        r?.error === "slot_taken" ? `❌ ช่วงเวลาใหม่ไม่ว่าง (Court ${r.court}) — เลือกเวลาอื่น`
+        : r?.error === "coach_busy" ? `❌ โค้ช ${r.coach} มีนัดซ้อนเวลาใหม่ (Court ${r.court} ${r.from}–${r.to})`
+        : r?.error === "no_change" ? "ยังไม่ได้เปลี่ยนวัน เวลา หรือสนาม"
+        : r?.error === "outside_hours" ? "❌ ต้องอยู่ในเวลาเปิดสนาม 06:00–23:00 (รวมระยะเวลาที่จอง)"
+        : r?.error === "new_time_past" ? "❌ เลือกเวลาที่ผ่านไปแล้วไม่ได้"
+        : r?.error === "booking_in_past" ? "❌ การจองนี้ผ่านไปแล้ว เลื่อนไม่ได้"
+        : r?.error === "invalid_status" ? "❌ เลื่อนได้เฉพาะการจองที่ยืนยันแล้วหรือรอตรวจสอบ"
+        : r?.error === "package_wrong_tier" ? "❌ แพ็คเกจ Off Peak ใช้กับช่วงเวลานี้ไม่ได้ (Off Peak = จ.–ศ. ก่อน 16:00 ทุกชั่วโมงที่จอง)"
+        : r?.error === "package_start_move" ? "❌ การจองนี้เป็นตัวกำหนดวันเริ่มนับอายุแพ็คเกจ เลื่อนข้ามวันไม่ได้ — ให้ยกเลิกแล้วจองใหม่ (เลื่อนเวลาในวันเดิมได้)"
+        : r?.error === "package_date_out_of_range" ? `❌ วันที่ใหม่เลยอายุแพ็คเกจ (ใช้เล่นได้ถึง ${r.expiry_date})`
+        : r?.error === "package_date_before_start" ? `❌ วันที่ใหม่อยู่ก่อนวันเริ่มนับอายุแพ็คเกจ (เริ่มนับ ${r.start_date})`
+        : r?.error === "package_expired" ? "❌ แพ็คเกจหมดอายุแล้ว"
+        : r?.error === "network_or_server" ? "❌ เซิร์ฟเวอร์ตอบกลับผิดรูปแบบ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว"
+        : `❌ เลื่อนไม่สำเร็จ (${r?.error || "ไม่ทราบสาเหตุ"}) — ไม่มีการเปลี่ยนแปลง ลองใหม่อีกครั้ง`);
+    }
+  };
+
+  const [histPhone, setHistPhone] = useState(null);
+  const [hist, setHist] = useState(null);
+  const [histLoading, setHistLoading] = useState(false);
+  const [histAll, setHistAll] = useState(false);
+  const openHistory = async (phone) => {
+    setHistPhone(phone); setHist(null); setHistAll(false); setHistLoading(true);
+    const r = await callAdminAction("customerHistory", token, { phone });
+    setHist(r && !r.error ? r : { error: true });
+    setHistLoading(false);
+  };
+  const closeHistory = () => { setHistPhone(null); setHist(null); };
+  const fmtDay = (iso) => iso ? new Date(String(iso).slice(0, 10) + "T00:00:00").toLocaleDateString("th-TH", { weekday: "short", day: "numeric", month: "short", year: "2-digit" }) : "-";
+  const fmtRange = (b) => `${minutesToLabel(b.hour * 60 + (b.start_minute || 0))}–${minutesToLabel(b.hour * 60 + (b.start_minute || 0) + (b.duration_minutes || 60))}`;
+  const bookedAt = (b) => b.created_time ? parseUtc(b.created_time).toLocaleDateString("th-TH", { day: "numeric", month: "short", timeZone: "Asia/Bangkok" }) : "";
+  const histStatus = (b) => b.status === "confirmed" ? ["✅ ยืนยันแล้ว", "#2d7a4f"] : b.status === "reviewing" ? ["🔍 รอยืนยัน", "#e67e22"] : b.status === "cancelled" ? ["❌ ยกเลิก", "#c0392b"]
+    : b.status === "pending" ? (Date.now() - new Date(b.created_time).getTime() < 5 * 60 * 1000 ? ["⏳ รอชำระ", "#8a5a00"] : ["⌛ หมดเวลา ไม่ได้ชำระ", "var(--mu)"]) : [b.status, "var(--mu)"];
+
+  const confirmPackage = async (id) => {
+    if (!window.confirm("ยืนยันการซื้อแพ็คเกจนี้ใช่หรือไม่? จะเริ่มนับวันหมดอายุตั้งแต่ตอนนี้")) return;
+    await callAdminAction("confirmPackage", token, { id });
+    setPkgQueue(prev => prev.filter(p => p.id !== id));
+    loadAllPkgs();
+  };
+  const cancelPackage = async (id) => {
+    if (!window.confirm("ยกเลิกรายการซื้อแพ็คเกจนี้ใช่หรือไม่?")) return;
+    await callAdminAction("cancelPackage", token, { id });
+    setPkgQueue(prev => prev.filter(p => p.id !== id));
+    loadAllPkgs();
+  };
+
+  const loadQueue = async () => {
+    setQueueLoading(true);
+    const { bookings: rows } = await callAdminAction("queue", token, {});
+    setQueue(rows || []);
+    setQueueLoading(false);
+  };
+
+  const loadBookings = async () => {
+    setLoading(true);
+    const { bookings: rows } = await callAdminAction("byDate", token, { date });
+    setBookings(rows || []); setLoading(false);
+  };
+  const loadDiscounts = async () => {
+    const { discounts: rows } = await callAdminAction("listDiscounts", token, {});
+    setDiscounts(rows || []);
+  };
+  const loadCustomers = async () => {
+    const { customers: rows, linked } = await callAdminAction("customers", token, {});
+    setCustomers(rows || []);
+    setLinkedPhones(Object.fromEntries((linked || []).map(l => [l.phone, l.display_name || "LINE"])));
+  };
+
+  const loadReport = async () => {
+    setReportLoading(true);
+    setExpandedDay(null);
+    const { bookings: data } = await callAdminAction("report", token, { from: reportFrom, to: reportTo });
+    const map = {};
+    (data || []).forEach(b => {
+      const day = (b.created_time || "").split("T")[0];
+      if (!day) return;
+      if (!map[day]) map[day] = { day, confirmedCount: 0, confirmedTotal: 0, otherCount: 0 };
+      if (b.status === "confirmed") { map[day].confirmedCount++; map[day].confirmedTotal += (b.price||0); }
+      else map[day].otherCount++;
+    });
+    setReportRows(Object.values(map).sort((a,b)=>a.day.localeCompare(b.day)));
+    setReportLoading(false);
+  };
+
+  // ดูรายละเอียดว่าวันนั้น "ใครจอง จองวันไหน เวลาไหน โอนเงินตอนกี่โมง"
+  const toggleDayDetail = async (day) => {
+    if (expandedDay === day) { setExpandedDay(null); return; }
+    setExpandedDay(day);
+    setDayDetailLoading(true);
+    const { bookings: rows } = await callAdminAction("reportDetail", token, { day });
+    setDayDetail(rows || []);
+    setDayDetailLoading(false);
+  };
+
+  const loadBlocks = async () => {
+    setBlocksLoading(true);
+    const { blocks: rows } = await callAdminAction("listBlocks", token, {});
+    setBlocks(rows || []);
+    setBlocksLoading(false);
+  };
+
+  const timeToParts = (hhmm) => {
+    const [h, m] = hhmm.split(":").map(Number);
+    return { hour: h, minute: m };
+  };
+
+  const handleCloseCourt = async () => {
+    if (closing) return;
+    const start = timeToParts(closeStart);
+    const end = timeToParts(closeEnd);
+    const startTotal = start.hour*60 + start.minute;
+    const endTotal = end.hour*60 + end.minute;
+    if (endTotal <= startTotal) {
+      alert("เวลาสิ้นสุดต้องหลังเวลาเริ่มต้น");
+      return;
+    }
+    const durationMinutes = endTotal - startTotal;
+    const courtIds = closeCourt === "both" ? [1, 2] : [Number(closeCourt)];
+    const confirmed = window.confirm(
+      `ยืนยันปิดสนาม ${closeCourt === "both" ? "Court 1 และ Court 2" : `Court ${closeCourt}`}\nวันที่ ${closeDate} เวลา ${closeStart}–${closeEnd}\nลูกค้าจะจองช่วงเวลานี้ไม่ได้จนกว่าจะเปิดใช้งานอีกครั้ง`
+    );
+    if (!confirmed) return;
+    setClosing(true);
+    const errors = [];
+    for (const courtId of courtIds) {
+      const result = await callAdminAction("blockCourt", token, {
+        date: closeDate, courtId, hour: start.hour, startMinute: start.minute, durationMinutes, reason: closeReason.trim() || null,
+      });
+      if (result?.error) errors.push(`Court ${courtId}: ${result.error}${result.detail ? " — " + JSON.stringify(result.detail) : ""}`);
+    }
+    setClosing(false);
+    if (errors.length > 0) {
+      alert("ปิดสนามไม่สำเร็จบางส่วน:\n" + errors.join("\n"));
+    } else {
+      setCloseReason("");
+    }
+    loadBlocks();
+  };
+
+  const handleUnblock = async (id) => {
+    const confirmed = window.confirm("เปิดใช้งานช่วงเวลานี้อีกครั้งใช่หรือไม่? ลูกค้าจะกลับมาจองได้ตามปกติ");
+    if (!confirmed) return;
+    await callAdminAction("unblockCourt", token, { id });
+    setBlocks(prev => prev.filter(b => b.id !== id));
+  };
+
+  useEffect(() => { loadQueue(); }, []);
+  useEffect(() => { loadBookings(); }, [date]);
+  useEffect(() => { if(tab==="discounts") loadDiscounts(); if(tab==="customers") { loadCustomers(); loadCustStats(custPeriod); } if(tab==="report") loadReport(); if(tab==="closures") loadBlocks(); if(tab==="packages") { loadPkgQueue(); loadAllPkgs(); } }, [tab]);
+
+  const updateStatus = async (id, status, packageId, groupId, coachOrderId) => {
+    const msg = status === "confirmed"
+      ? "ยืนยันการจองนี้ใช่หรือไม่? สถานะจะเปลี่ยนเป็น \"การจองสำเร็จ\""
+      : "ยกเลิกการจองนี้ใช่หรือไม่? การกระทำนี้ไม่สามารถย้อนกลับได้ และช่วงเวลานี้จะกลับมาให้ลูกค้าจองได้ใหม่";
+    const confirmed = window.confirm(groupId ? msg + "\n\n(เป็นการจอง 2 สนามพร้อมกัน — จะเปลี่ยนสถานะทั้งคู่)" : msg);
+    if (!confirmed) return;
+    let refundCredit = false;
+    if (status === "cancelled" && packageId) {
+      refundCredit = window.confirm("การจองนี้จ่ายด้วยสิทธิ์แพ็คเกจ\n\nกด OK = คืนสิทธิ์ให้ลูกค้า (ปัญหาจากทางสนาม)\nกด Cancel = ไม่คืนสิทธิ์ (ลูกค้ายกเลิกเอง)");
+    }
+    if (status === "cancelled" && coachOrderId) {
+      refundCredit = window.confirm("การจองนี้ใช้สิทธิ์คอร์สเรียนกับโค้ช\n\nกด OK = คืนสิทธิ์ครั้งเรียนให้ลูกค้า (ปัญหาจากทางสนาม/โค้ช)\nกด Cancel = ไม่คืนสิทธิ์ (ลูกค้ายกเลิกเอง)");
+    }
+    await callAdminAction("updateStatus", token, { id, status, refundCredit });
+    if (groupId) { loadQueue(); loadBookings(); return; } // การจองคู่เปลี่ยนทั้ง 2 แถว — โหลดใหม่ให้ตรงกับเซิร์ฟเวอร์
+    setBookings(prev => prev.map(b => b.id === id ? { ...b, status } : b));
+    setQueue(prev => prev.filter(b => b.id !== id));
+  };
+
+  const createCode = async () => {
+    if (!newCode.trim()) return;
+    const r = await callAdminAction("createDiscount", token, { code: newCode, amount: newAmt, maxUses: newMax, expiresAt: newExp || null });
+    if (!r?.ok) { alert(r?.error === "invalid_date" ? "รูปแบบวันหมดอายุไม่ถูกต้อง" : "สร้างโค้ดไม่สำเร็จ (ถ้าตั้งวันหมดอายุ ต้องรัน SQL เพิ่มคอลัมน์ expires_at ที่ Supabase ก่อน)"); return; }
+    setCpCreated({ code: newCode.trim().toUpperCase(), amount: Number(newAmt) || 0, expiry: newExp || "", maxUses: Number(newMax) || 1, theme: cpTheme, hint: cpHint });
+    setNewCode(""); loadDiscounts();
+    setTimeout(() => document.getElementById("cp-created")?.scrollIntoView({ behavior: "smooth", block: "center" }), 150);
+  };
+
+  const genCode = () => {
+    const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    setNewCode(Array.from({length:8}, () => c[Math.floor(Math.random()*c.length)]).join(""));
+  };
+
+  const resetDiscount = async (c) => {
+    if (!window.confirm(`รีเซ็ตโค้ด ${c.code}? จำนวนครั้งที่ใช้จะกลับเป็น 0 และโค้ดกลับมาใช้ได้ (ใช้เมื่อต้องการคืนโค้ดให้ลูกค้า)`)) return;
+    await callAdminAction("resetDiscountUse", token, { id: c.id });
+    loadDiscounts();
+  };
+
+  const toggleDiscount = async (id, active) => {
+    await callAdminAction("toggleDiscount", token, { id, active });
+    loadDiscounts();
+  };
+
+  const stInfo = (s) => {
+    if(s==="confirmed") return {text:"✅ การจองสำเร็จ", color:"#2d7a4f"};
+    if(s==="cancelled") return {text:"❌ การจองถูกยกเลิกแล้ว", color:"#c0392b"};
+    if(s==="reviewing") return {text:"🔍 รอการยืนยัน", color:"#e67e22"};
+    if(s==="blocked") return {text:"🚫 ปิดสนาม", color:"#663924"};
+    return {text:"⏳ รอชำระ", color:"var(--mu)"};
+  };
+
+  const fmtTime = (b) => {
+    const startMin = (b.hour||0)*60 + (b.start_minute||0);
+    const dur = b.duration_minutes || 60;
+    return `${minutesToLabel(startMin)}–${minutesToLabel(startMin+dur)}`;
+  };
+  const fmtCreatedTime = (iso) => {
+    if (!iso) return "-";
+    const d = parseUtc(iso);
+    return d.toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit",timeZone:"Asia/Bangkok"});
+  };
+
+  const revenue = bookings.filter(b=>b.status==="confirmed").reduce((s,b)=>s+(b.price||0),0);
+  const statusPriority = { pending: 0, reviewing: 0, confirmed: 1, cancelled: 2, blocked: 3 };
+  const sortedBookings = [...bookings].sort((a, b) => {
+    const pa = statusPriority[a.status] ?? 0;
+    const pb = statusPriority[b.status] ?? 0;
+    if (pa !== pb) return pa - pb;
+    return a.hour - b.hour;
+  });
+  const reportGrandTotal = reportRows.reduce((s,r)=>s+r.confirmedTotal,0);
+  const reportGrandCount = reportRows.reduce((s,r)=>s+r.confirmedCount,0);
+
+  const adminCSS = `
+    .adm-table { width:100%; border-collapse:collapse; font-size:13px; }
+    .adm-table th { background:#663924; color:#F47E1F; padding:9px 12px; text-align:left; }
+    .adm-table td { padding:9px 12px; border-bottom:1px solid rgba(102,57,36,.1); }
+    .adm-table tr:hover td { background:rgba(244,126,31,.04); }
+    .adm-table-sub th { background:#8a7060; }
+  `;
+
+  return (
+    <>
+      <style>{adminCSS}</style>
+      <div style={{minHeight:"100vh",background:"#f5f5f5"}}>
+        <header style={{background:"var(--br)",padding:"12px 20px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <p className="bb" style={{fontSize:22,color:"var(--or)",lineHeight:1}}>NOVA TENNIS</p>
+            <p style={{fontSize:11,color:"rgba(255,255,255,.5)"}}>Admin Dashboard</p>
+          </div>
+          <button onClick={onLogout} style={{background:"rgba(255,255,255,.1)",border:"none",color:"rgba(255,255,255,.7)",padding:"7px 14px",borderRadius:8,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+            ออกจากระบบ
+          </button>
+        </header>
+
+        <div style={{background:"#fff",borderBottom:"1px solid var(--dv)",display:"flex",padding:"0 20px",overflowX:"auto"}}>
+          {[["availability","🟢 ตารางว่าง"],["bookings","📋 การจอง"],["newbooking","➕ จองแทน"],["sell","🛒 ขายให้ลูกค้า"],["packages","🎟 แพ็คเกจ"],["coach","👤 โค้ช"],["closures","🚫 ปิดสนาม"],["report","📊 รายงาน"],["discounts","🏷 ส่วนลด"],["customers","👥 ลูกค้า"]].map(([id,label]) => (
+            <button key={id} onClick={() => setTab(id)} style={{padding:"13px 16px",background:"none",border:"none",borderBottom:tab===id?"2.5px solid var(--or)":"2.5px solid transparent",color:tab===id?"var(--or)":"var(--mu)",fontWeight:tab===id?700:400,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif",whiteSpace:"nowrap"}}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{padding:"20px",maxWidth:1000,margin:"0 auto"}}>
+          {tab==="availability" && (
+            <div>
+              <div style={{display:"flex",gap:10,marginBottom:6,alignItems:"center",flexWrap:"wrap"}}>
+                <input type="date" value={date} onChange={e=>setDate(e.target.value)}
+                  style={{padding:"9px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                <button onClick={loadBookings} style={{padding:"9px 16px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
+                <span style={{fontSize:12,color:"var(--mu)"}}>ดูภาพรวมว่าช่วงเวลาไหนว่าง/ไม่ว่างในวันที่เลือก อัปเดตตามข้อมูลจริงล่าสุด</span>
+              </div>
+              <div style={{display:"flex",gap:16,margin:"10px 0 14px",fontSize:12,color:"var(--mu)"}}>
+                <Dot color="#2d7a4f" label="ว่าง" />
+                <Dot color="#c0392b" label="ไม่ว่าง / มีคนจอง" />
+                <Dot color="#663924" label="ปิดสนาม" />
+              </div>
+              <p style={{fontSize:11.5,color:"var(--mu)",margin:"-6px 0 12px"}}>👆 กดช่องที่มีชื่อลูกค้า = ดูรายละเอียดการจอง / กดช่อง "ว่าง" = จองช่วงนั้นให้ลูกค้า (สีแดง = ยืนยันแล้ว / ส้ม = รอตรวจสอบ / เหลือง = รอชำระ)</p>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",padding:0,boxShadow:"var(--sh)",overflow:"auto",maxHeight:640}}>
+                {loading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> : (() => {
+                  const dateObj = new Date(date+"T00:00:00");
+                  const now = Date.now();
+                  const activeBookings = bookings.filter(b => {
+                    if (b.status === "cancelled" || b.status === "blocked") return false;
+                    if (b.status === "pending") {
+                      const created = parseUtc(b.created_time).getTime();
+                      return (now - created) < 5*60*1000;
+                    }
+                    return true;
+                  });
+                  const slots = [];
+                  for (let m = DAY_START_MIN; m < DAY_END_MIN; m += 30) slots.push(m);
+                  return (
+                    <table className="adm-table" style={{tableLayout:"fixed",width:"100%"}}>
+                      <thead><tr><th style={{width:90}}>เวลา</th><th>Court 1</th><th>Court 2</th></tr></thead>
+                      <tbody>
+                        {(() => {
+                          const skip = {}; // ช่องที่ถูกรวมไปกับการจองด้านบนแล้ว (rowSpan) ไม่ต้องวาดซ้ำ
+                          const stLabel = { confirmed: "✅ ยืนยันแล้ว", reviewing: "🔍 รอตรวจสอบ", pending: "⏳ รอชำระ" };
+                          const stBg = { confirmed: "rgba(192,57,43,.12)", reviewing: "rgba(230,126,34,.16)", pending: "rgba(241,196,15,.2)" };
+                          return slots.map(startMin => {
+                            const endMin = startMin + 30;
+                            return (
+                              <tr key={startMin}>
+                                <td style={{fontWeight:600,verticalAlign:"top"}}>{minutesToLabel(startMin)}–{minutesToLabel(endMin)}</td>
+                                {[1,2].map(courtId => {
+                                  if (skip[`${courtId}:${startMin}`]) return null;
+                                  const bk = activeBookings.find(x => {
+                                    if (x.court_id !== courtId) return false;
+                                    const s = (x.hour||0)*60 + (x.start_minute||0);
+                                    const e = s + (x.duration_minutes||60);
+                                    return startMin < e && endMin > s;
+                                  });
+                                  if (bk) {
+                                    const bs = (bk.hour||0)*60 + (bk.start_minute||0);
+                                    const be = bs + (bk.duration_minutes||60);
+                                    const span = Math.max(1, Math.ceil((Math.min(be, DAY_END_MIN) - startMin) / 30));
+                                    for (let k = 1; k < span; k++) skip[`${courtId}:${startMin + 30*k}`] = true;
+                                    return (
+                                      <td key={courtId} rowSpan={span} onClick={() => goToBooking(bk)} title="กดเพื่อดูรายละเอียดการจอง"
+                                        style={{verticalAlign:"top",textAlign:"left",background:stBg[bk.status] || "rgba(192,57,43,.12)",borderLeft:"3px solid #c0392b",cursor:"pointer",padding:"7px 9px"}}>
+                                        <div style={{fontWeight:800,fontSize:13,color:"#8b1e12",lineHeight:1.3}}>
+                                          {bk.customer_name || "-"}
+                                          {bk.group_id && <span style={{marginLeft:5,fontSize:10,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"1px 5px",borderRadius:8}}>🔗 คู่</span>}
+                                          {bk.package_id && <span style={{marginLeft:5,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 5px",borderRadius:8}}>🎟</span>}
+                                        </div>
+                                        <div style={{fontSize:12.5,fontWeight:600,color:"var(--br)",marginTop:2}}>📞 {bk.customer_id}</div>
+                                        {bk.coach_name && <div style={{fontSize:11.5,fontWeight:700,color:"#2d5f8a",marginTop:2}}>👤 โค้ช {bk.coach_name}</div>}
+                                        <div style={{fontSize:10.5,color:"var(--mu)",marginTop:2}}>{stLabel[bk.status] || bk.status} · {minutesToLabel(bs)}–{minutesToLabel(be)}</div>
+                                      </td>
+                                    );
+                                  }
+                                  if (isFullyBookedDate(dateObj) || isManuallyClosed(dateObj, courtId, startMin, endMin)) {
+                                    return <td key={courtId} style={{textAlign:"center",background:"rgba(102,57,36,.08)",color:"#663924",fontWeight:700,fontSize:12.5,verticalAlign:"middle"}}>ปิด</td>;
+                                  }
+                                  return <td key={courtId} onClick={() => startNbFromGrid(courtId, startMin)} title="กดเพื่อจองช่วงนี้ให้ลูกค้า" style={{textAlign:"center",background:"rgba(45,122,79,.08)",color:"#2d7a4f",fontWeight:700,fontSize:12.5,verticalAlign:"middle",cursor:"pointer"}}>ว่าง</td>;
+                                })}
+                              </tr>
+                            );
+                          });
+                        })()}
+                      </tbody>
+                    </table>
+                  );
+                })()}
+              </div>
+            </div>
+          )}
+
+          {tab==="bookings" && (
+            <div>
+              <div style={{marginBottom:24}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                  {mvDone && (
+                    <div style={{background:"rgba(45,122,79,.1)",border:"1.5px solid #2d7a4f",borderRadius:10,padding:"10px 14px",marginBottom:12,fontSize:13,color:"#1b5e3c",lineHeight:1.7,display:"flex",gap:10,alignItems:"flex-start",justifyContent:"space-between"}}>
+                      <div>
+                        <div style={{fontWeight:700}}>{mvDone.text}</div>
+                        {mvDone.warn && <div style={{color:"#8a5a00",fontWeight:600,marginTop:4}}>⚠️ ช่วงเวลาใหม่เป็นคนละช่วงราคา (Peak/Off Peak) ระบบไม่ได้คิดส่วนต่างให้ — ถ้าต้องการเก็บส่วนต่าง แจ้งลูกค้าเอง</div>}
+                      </div>
+                      <button onClick={() => setMvDone(null)} style={{border:"none",background:"transparent",fontSize:16,cursor:"pointer",color:"#1b5e3c"}}>✕</button>
+                    </div>
+                  )}
+                  <p style={{fontWeight:700,color:"var(--br)",fontSize:15}}>🔔 รายการที่ต้องตรวจสอบ/ยืนยัน {queue.length > 0 && `(${queue.length})`}</p>
+                  <button onClick={loadQueue} style={{padding:"6px 12px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontWeight:600,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
+                </div>
+                <div style={{background:"#fff",borderRadius:12,border:"1.5px solid #e67e22",overflow:"auto",boxShadow:"var(--sh)"}}>
+                  {queueLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                  queue.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>✅ ไม่มีรายการค้างตรวจสอบ</p> : (
+                    <table className="adm-table">
+                      <thead><tr><th>วันที่</th><th>สนาม</th><th>เวลา</th><th>ชื่อลูกค้า</th><th>เบอร์</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                      <tbody>
+                        {queue.map(b => {
+                          const st = stInfo(b.status);
+                          return (
+                            <tr key={b.id}>
+                              <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short"})}</td>
+                              <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
+                              <td>{fmtTime(b)}{movedTag(b)}</td>
+                              <td style={{fontWeight:600}}>{b.customer_name || "-"}{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}{b.coach_name && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#2d5f8a",background:"rgba(94,151,174,.22)",padding:"1px 6px",borderRadius:8}}>👤 โค้ช {b.coach_name}</span>}</td>
+                              <td>{b.customer_id}</td>
+                              <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
+                              <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
+                              <td><span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 8px",borderRadius:20}}>{st.text}</span></td>
+                              <td>
+                                <div style={{display:"flex",gap:6}}>
+                                  <button onClick={()=>updateStatus(b.id,"confirmed",null,b.group_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>
+                                  <button onClick={()=>updateStatus(b.id,"cancelled",b.package_id,b.group_id,b.coach_order_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                  {canMove(b) && <button onClick={() => openMove(b)} title="เลื่อนวัน/เวลา/สนามของการจองนี้" style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(94,151,174,.2)",color:"#2d5f8a",fontWeight:700,fontSize:12,cursor:"pointer"}}>🕐</button>}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+
+              <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:10}}>📅 ดูตามวันที่</p>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:20}}>
+                {[
+                  {label:"ทั้งหมด",val:bookings.filter(b=>b.status!=="blocked").length,color:"var(--br)"},
+                  {label:"การจองสำเร็จ",val:bookings.filter(b=>b.status==="confirmed").length,color:"#2d7a4f"},
+                  {label:"รอดำเนินการ",val:bookings.filter(b=>b.status==="reviewing"||b.status==="pending").length,color:"#e67e22"},
+                  {label:"รายได้วันนี้",val:`฿${revenue.toLocaleString()}`,color:"var(--or)"},
+                ].map(({label,val,color}) => (
+                  <div key={label} style={{background:"#fff",borderRadius:12,padding:"14px",textAlign:"center",border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                    <p style={{fontSize:11,color:"var(--mu)",marginBottom:4}}>{label}</p>
+                    <p style={{fontSize:20,fontWeight:800,color}}>{val}</p>
+                  </div>
+                ))}
+              </div>
+              <div style={{display:"flex",gap:10,marginBottom:16}}>
+                <input type="date" value={date} onChange={e=>setDate(e.target.value)}
+                  style={{padding:"9px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                <button onClick={loadBookings} style={{padding:"9px 16px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
+              </div>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                {loading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                bookings.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่มีการจองในวันนี้</p> : (
+                  <table className="adm-table">
+                    <thead><tr><th>สนาม</th><th>เวลา</th><th>ชื่อลูกค้า</th><th>เบอร์</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                    <tbody>
+                      {sortedBookings.map(b => {
+                        const st = stInfo(b.status);
+                        return (
+                          <tr key={b.id} id={`bk-${b.id}`} style={highlightId === b.id ? {background:"rgba(255,213,74,.4)",outline:"2px solid #E8A200"} : undefined}>
+                            <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
+                            <td>{fmtTime(b)}{movedTag(b)}</td>
+                            <td style={{fontWeight:600}}>{b.customer_name || "-"}{b.booked_by === "admin" && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>📞 แอดมิน</span>}{b.coach_name && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#2d5f8a",background:"rgba(94,151,174,.22)",padding:"1px 6px",borderRadius:8}}>👤 โค้ช {b.coach_name}</span>}</td>
+                            <td>{b.customer_id}</td>
+                            <td style={{fontWeight:700,color:"var(--or)"}}>{b.package_id ? "🎟 แพ็คเกจ" : `฿${b.price?.toLocaleString()}`}</td>
+                            <td>{b.slip_url ? <a href={b.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
+                            <td><span style={{fontSize:12,fontWeight:600,color:st.color,background:`${st.color}18`,padding:"3px 8px",borderRadius:20}}>{st.text}</span></td>
+                            <td>
+                              {b.status!=="cancelled" && b.status!=="blocked" && (
+                                <div style={{display:"flex",gap:6}}>
+                                  {b.status!=="confirmed" && <button onClick={()=>updateStatus(b.id,"confirmed",null,b.group_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>}
+                                  <button onClick={()=>updateStatus(b.id,"cancelled",b.package_id,b.group_id,b.coach_order_id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                                  {canMove(b) && <button onClick={() => openMove(b)} title="เลื่อนวัน/เวลา/สนามของการจองนี้" style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(94,151,174,.2)",color:"#2d5f8a",fontWeight:700,fontSize:12,cursor:"pointer"}}>🕐</button>}
+                                </div>
+                              )}
+                              {b.status==="blocked" && <span style={{fontSize:11,color:"var(--mu)"}}>จัดการที่แท็บ "ปิดสนาม"</span>}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab==="sell" && (
+            <div style={{maxWidth:560}}>
+              <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:4}}>🛒 ขายให้ลูกค้า</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginBottom:14,lineHeight:1.6}}>บันทึกการขายแพ็คเกจสนามหรือคอร์สโค้ชที่ลูกค้า <b>โอนเงินแล้ว</b> (ไม่ผ่านเว็บ) — ใช้งานได้ทันที ไม่ต้องรอสลิป จากนั้นไปแท็บ "➕ จองแทน" เพื่อตัดสิทธิ์และลงวัน-เวลา</p>
+              {slCatFail && <p style={{fontSize:13,color:"#c0392b",marginBottom:12}}>โหลดรายการสินค้าไม่สำเร็จ — ตรวจว่า deploy ไฟล์ api/admin-actions.js ล่าสุดแล้ว <button onClick={() => { setSlCatFail(false); callAdminAction("sellCatalog", token, {}).then(r => { if (r?.packages && r?.coach) setSlCatalog(r); else setSlCatFail(true); }).catch(() => setSlCatFail(true)); }} style={{marginLeft:6,padding:"3px 10px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",cursor:"pointer"}}>ลองใหม่</button></p>}
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",padding:18,boxShadow:"var(--sh)",display:"flex",flexDirection:"column",gap:14}}>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>เบอร์โทรลูกค้า</label>
+                  <input value={sl.phone} onChange={e => setSl(p => ({ ...p, phone: e.target.value.replace(/\D/g, "").slice(0, 10) }))} inputMode="numeric" placeholder="0812345678"
+                    style={{width:"100%",padding:"11px 12px",borderRadius:8,border:`1.5px solid ${sl.phone && !slPhoneOk ? "#c0392b" : "var(--dv)"}`,fontSize:15,outline:"none"}} />
+                  {slInfo && <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"var(--mu)"}}>{slInfo.bookingsCount > 0 ? `เคยจอง ${slInfo.bookingsCount} รายการ` : "ลูกค้าใหม่ (ยังไม่เคยจอง)"} • {slInfo.linked ? `🔗 ผูก LINE แล้ว (${slInfo.lineName || "LINE"})` : "ยังไม่ผูก LINE (ลูกค้าไม่ต้องล็อกอินก็ใช้สิทธิ์ผ่านแอดมินได้)"}</p>}
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ชื่อลูกค้า {slLinked ? "(ใช้ชื่อจาก LINE)" : "(ไม่เกิน 40 ตัวอักษร)"}</label>
+                  <input value={slLinked ? slInfo.lineName : sl.name} readOnly={slLinked} maxLength={40} onChange={e => setSl(p => ({ ...p, name: e.target.value }))} placeholder="ชื่อลูกค้า"
+                    style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,outline:"none",background:slLinked ? "var(--cr2)" : "#fff",color:slLinked ? "var(--mu)" : "var(--tx)"}} />
+                </div>
+
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>สินค้า</label>
+                  <div style={{display:"flex",gap:8}}>
+                    {[["package", "🎟 แพ็คเกจสนาม"], ["coach", "👤 คอร์สโค้ช"], ...(slCatalog?.promo?.open ? [["promo", "🔥 โปร 11.11"]] : [])].map(([v, label]) => (
+                      <button key={v} onClick={() => setSl(p => ({ ...p, kind: v, price: "", note: "" }))} style={{flex:1,padding:"10px 6px",borderRadius:8,border:`2px solid ${sl.kind === v ? "var(--or)" : "var(--dv)"}`,background:sl.kind === v ? "var(--or-bg)" : "#fff",color:sl.kind === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13.5,cursor:"pointer"}}>{label}</button>
+                    ))}
+                  </div>
+                </div>
+
+                {!slCatalog && !slCatFail && <p style={{fontSize:13,color:"var(--mu)"}}>⏳ กำลังโหลดรายการสินค้า...</p>}
+                {slCatalog && sl.kind === "promo" && (
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {[["all", "ALL TIME — ใช้ได้ทุกเวลา"], ["day", "DAY — จ.–ศ. ก่อน 16:00"]].map(([g, gl]) => (
+                      <div key={g}>
+                        <p style={{fontSize:12,fontWeight:700,color:"var(--br)",marginBottom:6}}>{gl}</p>
+                        <div style={{display:"flex",gap:8}}>
+                          {(slCatalog.promo.items || []).filter(x => (x.tier === "peak" ? "all" : "day") === g).map(it => (
+                            <button key={it.code} onClick={() => setSl(p => ({ ...p, promo: it.code, price: "" }))} style={{flex:1,padding:"9px 4px",borderRadius:8,border:`2px solid ${sl.promo === it.code ? "var(--or)" : "var(--dv)"}`,background:sl.promo === it.code ? "var(--or-bg)" : "#fff",color:sl.promo === it.code ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>{it.credits} ครั้ง<br /><span style={{fontWeight:600}}>฿{it.price.toLocaleString()}</span></button>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {slCatalog && sl.kind === "package" && (
+                  <>
+                    <div style={{display:"flex",gap:8}}>
+                      {[["peak", "Peak (ทุกช่วงเวลา)"], ["offpeak", "Off Peak (จ.–ศ. ก่อน 16:00)"]].map(([v, label]) => (
+                        <button key={v} onClick={() => setSl(p => ({ ...p, tier: v, price: "" }))} style={{flex:1,padding:"9px 6px",borderRadius:8,border:`2px solid ${sl.tier === v ? "var(--or)" : "var(--dv)"}`,background:sl.tier === v ? "var(--or-bg)" : "#fff",color:sl.tier === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>{label}</button>
+                      ))}
+                    </div>
+                    <div style={{display:"flex",gap:8}}>
+                      {[2, 5, 10].map(c => { const it = slCatalog.packages.find(x => x.tier === sl.tier && x.credits === c); return (
+                        <button key={c} onClick={() => setSl(p => ({ ...p, credits: c, price: "" }))} style={{flex:1,padding:"9px 4px",borderRadius:8,border:`2px solid ${sl.credits === c ? "var(--or)" : "var(--dv)"}`,background:sl.credits === c ? "var(--or-bg)" : "#fff",color:sl.credits === c ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>{c} ครั้ง<br /><span style={{fontWeight:600}}>฿{it?.price.toLocaleString()}</span></button>
+                      ); })}
+                    </div>
+                  </>
+                )}
+                {slCatalog && sl.kind === "coach" && (
+                  <>
+                    <div style={{display:"flex",gap:8}}>
+                      {[["adult", "🧑 ผู้ใหญ่"], ["kid", "🧒 เด็ก"]].map(([v, label]) => (
+                        <button key={v} onClick={() => setSl(p => ({ ...p, audience: v, price: "" }))} style={{flex:1,padding:"9px 6px",borderRadius:8,border:`2px solid ${sl.audience === v ? "var(--or)" : "var(--dv)"}`,background:sl.audience === v ? "var(--or-bg)" : "#fff",color:sl.audience === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer"}}>{label}</button>
+                      ))}
+                      {[["duo", "Private Duo (2 คน)"], ["private", "Private (1 คน)"]].map(([v, label]) => (
+                        <button key={v} onClick={() => setSl(p => ({ ...p, type: v, price: "" }))} style={{flex:1,padding:"9px 6px",borderRadius:8,border:`2px solid ${sl.type === v ? "var(--or)" : "var(--dv)"}`,background:sl.type === v ? "var(--or-bg)" : "#fff",color:sl.type === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>{label}</button>
+                      ))}
+                    </div>
+                    <div style={{display:"flex",gap:8}}>
+                      {[1, 5, 10].map(s => { const it = slCatalog.coach.find(x => x.audience === sl.audience && x.type === sl.type && x.sessions === s); return (
+                        <button key={s} onClick={() => setSl(p => ({ ...p, sessions: s, price: "" }))} style={{flex:1,padding:"9px 4px",borderRadius:8,border:`2px solid ${sl.sessions === s ? "var(--or)" : "var(--dv)"}`,background:sl.sessions === s ? "var(--or-bg)" : "#fff",color:sl.sessions === s ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>{s === 1 ? "ครั้งเดียว" : `แพ็ค ${s} ครั้ง`}<br /><span style={{fontWeight:600}}>฿{it?.total.toLocaleString()}{it?.people > 1 ? ` (${it.people} คน)` : ""}</span></button>
+                      ); })}
+                    </div>
+                  </>
+                )}
+
+                {slItem && (
+                  <div style={{background:"var(--or-bg)",border:"1px solid var(--dv)",borderRadius:10,padding:"10px 12px",fontSize:13,color:"var(--br)",lineHeight:1.7}}>
+                    <b>{slLabel}</b><br />
+                    ราคาตามป้าย <b style={{color:"var(--or)"}}>฿{slList.toLocaleString()}</b>
+                    {sl.kind !== "coach" ? <> • อายุ {slItem.days} วัน — <b>ยังไม่เริ่มนับ</b> จะเริ่มนับจากวันเล่นครั้งแรกที่จองด้วยแพ็คเกจ (วันเล่นวันแรกนับเป็นวันที่ 1)</> : <> • ใช้สิทธิ์ 60 นาที = 1 ครั้ง (จอง 120 นาที = ตัด 2 ครั้ง) • รวม {sl.sessions} ครั้ง</>}
+                  </div>
+                )}
+
+                {slItem && (
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ราคาที่รับจริง (บาท) — เว้นว่าง = ตามราคาป้าย</label>
+                    <input value={sl.price} onChange={e => setSl(p => ({ ...p, price: e.target.value.replace(/\D/g, "").slice(0, 6) }))} inputMode="numeric" placeholder={String(slList)}
+                      style={{width:"100%",padding:"11px 12px",borderRadius:8,border:`1.5px solid ${sl.price !== "" && !slPriceOk ? "#c0392b" : "var(--dv)"}`,fontSize:15,outline:"none"}} />
+                    {sl.price !== "" && !slPriceOk && <p style={{fontSize:12,color:"#c0392b",fontWeight:600,marginTop:6}}>⚠️ ราคาสูงกว่าราคาป้าย (฿{slList.toLocaleString()}) ไม่ได้</p>}
+                    {slNeedNote && <p style={{fontSize:12,color:"#2d7a4f",fontWeight:600,marginTop:6}}>{slPrice === 0 ? "🎁 แจกฟรี" : `ลด ฿${(slList - slPrice).toLocaleString()} จากราคาป้าย`} — ต้องใส่หมายเหตุด้านล่าง</p>}
+                  </div>
+                )}
+                {slItem && (
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>หมายเหตุ {slNeedNote ? <span style={{color:"#c0392b"}}>(จำเป็น — ลดราคา/แจกฟรี)</span> : "(ไม่บังคับ เช่น โอนเข้าบัญชีไหน เวลาเท่าไร)"}</label>
+                    <input value={sl.note} maxLength={200} onChange={e => setSl(p => ({ ...p, note: e.target.value }))} placeholder="เช่น ส่วนลดพนักงาน / โอน 14:20 เข้าบัญชีบริษัท"
+                      style={{width:"100%",padding:"11px 12px",borderRadius:8,border:`1.5px solid ${slNeedNote && !slNoteOk ? "#c0392b" : "var(--dv)"}`,fontSize:14.5,outline:"none"}} />
+                  </div>
+                )}
+                {slItem && <p style={{fontSize:12.5,color:"var(--br)",background:"var(--cr)",borderRadius:8,padding:"8px 12px",margin:0}}>{slPrice === 0 && slPriceOk ? "🎁 แจกฟรี (ไม่มีการรับเงิน)" : "💳 รับเงินโอน — ใช้ได้เฉพาะกรณีลูกค้าโอนมาแล้ว"} • ใช้งานได้ทันที ไม่ต้องรอสลิป</p>}
+
+                {slMsg && <p style={{fontSize:13,fontWeight:600,color:slMsg.ok ? "#2d7a4f" : "#c0392b",lineHeight:1.6,margin:0}}>{slMsg.text}</p>}
+                {slMsg?.ok && (
+                  <button onClick={() => { setNb(p => ({ ...p, phone: slMsg.phone })); setTab("newbooking"); }} style={{padding:"11px",borderRadius:10,border:"1.5px solid var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:800,fontSize:14,cursor:"pointer"}}>➕ ไปจองแทน / ตัดสิทธิ์ให้ลูกค้ารายนี้</button>
+                )}
+                <button onClick={submitSell} disabled={!slCanSubmit} style={{padding:"14px",borderRadius:10,border:"none",background:slCanSubmit ? "linear-gradient(90deg,var(--or),var(--or2))" : "var(--cr2)",color:slCanSubmit ? "#fff" : "var(--mu)",fontWeight:800,fontSize:15,cursor:slCanSubmit ? "pointer" : "not-allowed"}}>
+                  {slBusy ? "กำลังบันทึก..." : "บันทึกการขาย"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {tab==="newbooking" && (
+            <div style={{maxWidth:560}}>
+              <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:4}}>➕ จองแทนลูกค้า</p>
+              <p style={{fontSize:12,color:"var(--mu)",marginBottom:14,lineHeight:1.6}}>สำหรับลูกค้าที่โทรมาจอง หรือไม่มี LINE ไม่ต้องล็อกอิน LINE ไม่มีโปรอัตโนมัติ (กำหนดราคาเองได้) ถ้าลูกค้าล็อกอิน LINE และผูกเบอร์นี้ภายหลัง ชื่อ LINE จะมาแทนชื่อที่ใส่ไว้ตรงนี้</p>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",padding:18,boxShadow:"var(--sh)",display:"flex",flexDirection:"column",gap:14}}>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>เบอร์โทรลูกค้า</label>
+                  <input value={nb.phone} onChange={e => setNb(p => ({ ...p, phone: e.target.value.replace(/\D/g, "").slice(0, 10) }))} inputMode="numeric" placeholder="0812345678"
+                    style={{width:"100%",padding:"11px 12px",borderRadius:8,border:`1.5px solid ${nb.phone && !nbPhoneOk ? "#c0392b" : "var(--dv)"}`,fontSize:15,outline:"none"}} />
+                  {nbInfo && (
+                    <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"var(--mu)"}}>
+                      {nbInfo.bookingsCount > 0 ? `เคยจอง ${nbInfo.bookingsCount} รายการ` : "ลูกค้าใหม่ (ยังไม่เคยจอง) — โปรจองครั้งแรก ฿450 จ.–ศ. / ฿490 ส.–อา. (60 นาที) ให้ใส่ราคาเองด้านล่าง"}
+                      {" • "}{nbInfo.linked ? `🔗 ผูก LINE แล้ว (${nbInfo.lineName || "LINE"})` : "ยังไม่ผูก LINE"}
+                    </p>
+                  )}
+                  {nbInfoErr && <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"#c0392b",fontWeight:600}}>⚠️ {nbInfoErr}</p>}
+                  {nbInfo && !Array.isArray(nbInfo.packages) && (
+                    <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"#c0392b",fontWeight:600}}>⚠️ เซิร์ฟเวอร์ยังเป็นเวอร์ชันเก่า (ยังไม่ได้อัปเดตไฟล์ api/admin-actions.js) จึงยังตัดแพ็คเกจไม่ได้</p>
+                  )}
+                  {nbInfo?.packagesError && (
+                    <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"#c0392b",fontWeight:600}}>⚠️ ดึงข้อมูลแพ็คเกจของเบอร์นี้ไม่สำเร็จ (ดู Vercel → Logs) — ตัดแพ็คเกจไม่ได้ในตอนนี้</p>
+                  )}
+                  {nbInfo && Array.isArray(nbInfo.packages) && !nbInfo.packagesError && nbInfo.packages.length === 0 && (
+                    (nbInfo.packageIssues || []).length > 0 ? (
+                      <div style={{fontSize:12,marginTop:8,lineHeight:1.7,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:8,padding:"8px 10px"}}>
+                        <b>🎟 ลูกค้ามีแพ็คเกจ แต่ตัดสิทธิ์ไม่ได้ตอนนี้:</b>
+                        {nbInfo.packageIssues.map(i => <div key={i.id}>• {i.label} — {i.issue}</div>)}
+                      </div>
+                    ) : (
+                      <p style={{fontSize:12,marginTop:6,lineHeight:1.6,color:"var(--mu)"}}>🎟 ไม่พบแพ็คเกจของเบอร์นี้ (ตรวจว่าเป็นเบอร์เดียวกับที่ซื้อแพ็คเกจ — ดูที่แท็บ 🎟 แพ็คเกจ)</p>
+                    )
+                  )}
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ชื่อลูกค้า (ไม่เกิน 40 ตัวอักษร)</label>
+                  <input value={nb.name} onChange={e => setNb(p => ({ ...p, name: e.target.value }))} maxLength={40} placeholder="ชื่อลูกค้า"
+                    style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,outline:"none"}} />
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>วันที่เล่น</label>
+                    <input type="date" value={nb.date} onChange={e => setNb(p => ({ ...p, date: e.target.value }))} style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>เวลาเริ่ม</label>
+                    <select value={nb.startMin} onChange={e => setNb(p => ({ ...p, startMin: Number(e.target.value) }))} style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,background:"#fff"}}>
+                      {START_OPTS.map(m => <option key={m} value={m}>{minutesToLabel(m)}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ระยะเวลา</label>
+                    <select value={nb.duration} onChange={e => setNb(p => ({ ...p, duration: Number(e.target.value) }))} style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,background:"#fff"}}>
+                      {[30, 60, 90, 120].map(d => <option key={d} value={d} disabled={nbUsePkg && d !== 60 && d !== 120}>{d} นาที{nbUsePkg && (d === 60 || d === 120) ? ` (ตัด ${d / 60} ครั้ง)` : ""}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>สนาม</label>
+                    <div style={{display:"flex",gap:8}}>
+                      {[1, 2].map(c => {
+                        const on = nb.courts.includes(c);
+                        return <button key={c} onClick={() => setNb(p => ({ ...p, courts: p.packageId ? [c] : (on ? p.courts.filter(x => x !== c) : [...p.courts, c].sort()) }))}
+                          style={{flex:1,padding:"10px 6px",borderRadius:8,border:`2px solid ${on ? "var(--or)" : "var(--dv)"}`,background:on ? "var(--or-bg)" : "#fff",color:on ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer"}}>{on ? "✓ " : ""}Court {c}</button>;
+                      })}
+                    </div>
+                  </div>
+                </div>
+                {(nbPkgs.length > 0 || nbCoachOrders.length > 0 || nbCoachIssues.length > 0) && (
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>วิธีชำระ</label>
+                    <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                      {[["cash", "💵 ชำระเงิน", true], ["pkg", "🎟 ตัดสิทธิ์แพ็คเกจสนาม", nbPkgs.length > 0], ["coach", "👤 ตัดสิทธิ์คอร์สโค้ช", nbCoachOrders.length > 0]].filter(x => x[2]).map(([v, label]) => {
+                        const on = nbMode === v;
+                        return (
+                          <button key={v} onClick={() => (v === "pkg" ? togglePkg(true) : setNbMode(v))}
+                            style={{flex:1,minWidth:108,padding:"10px 6px",borderRadius:8,border:`2px solid ${on ? "var(--or)" : "var(--dv)"}`,background:on ? "var(--or-bg)" : "#fff",color:on ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer"}}>{label}</button>
+                        );
+                      })}
+                    </div>
+                    <p style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>
+                      {nbPkgs.length > 0 ? `ลูกค้ามีแพ็คเกจสนามที่ใช้ได้ ${nbPkgs.length} รายการ` : ""}{nbPkgs.length > 0 && nbCoachOrders.length > 0 ? " • " : ""}{nbCoachOrders.length > 0 ? `มีคอร์สโค้ชที่ใช้ได้ ${nbCoachOrders.length} รายการ` : ""}
+                    </p>
+                    {nbCoachIssues.length > 0 && (
+                      <div style={{fontSize:12,marginTop:6,lineHeight:1.7,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:8,padding:"8px 10px"}}>
+                        <b>👤 คอร์สโค้ชที่ยังตัดสิทธิ์ไม่ได้:</b>
+                        {nbCoachIssues.map(i => <div key={i.id}>• {i.label} — {i.issue}</div>)}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {nbUsePkg && (
+                  <div style={{background:"var(--or-bg)",border:"1px solid var(--dv)",borderRadius:10,padding:12}}>
+                    {nbPkgs.length > 1 && (
+                      <select value={nb.packageId} onChange={e => setNb(p => ({ ...p, packageId: e.target.value }))} style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,background:"#fff",marginBottom:10}}>
+                        {nbPkgs.map(p => <option key={p.id} value={p.id}>{p.tier === "peak" ? "Peak" : "Off Peak"} • เหลือ {p.remaining_credits}/{p.total_credits}{p.reserved_credits > 0 ? ` (จองค้าง ${p.reserved_credits})` : ""}{p.expiry_date ? ` • หมดอายุ ${p.expiry_date}` : ""}</option>)}
+                      </select>
+                    )}
+                    {nbPkg && (
+                      <p style={{fontSize:13,color:"var(--br)",lineHeight:1.7,margin:0}}>
+                        🎟 <b>{nbPkg.tier === "peak" ? "แพ็ค Peak" : "แพ็ค Off Peak"}</b> • เหลือ {nbPkg.remaining_credits}/{nbPkg.total_credits} ครั้ง{nbPkg.reserved_credits > 0 ? ` (ลูกค้าจองค้างรอยืนยัน ${nbPkg.reserved_credits} → ใช้ได้ ${nbPkg.available})` : ""}{nbPkg.expiry_date ? ` • หมดอายุ ${nbPkg.expiry_date}` : ""}<br />
+                        รายการนี้ใช้ <b style={{color:"var(--or)"}}>{nbUnits} ครั้ง</b> ({nb.duration} นาที) → เหลือ {Math.max(0, nbPkg.remaining_credits - nbUnits)} ครั้งหลังตัด • ยืนยันทันที ไม่มียอดชำระ
+                      </p>
+                    )}
+                    {nbPkg && !nbPkg.expiry_date && nbPkg.expiry_days > 0 && !pkgProblem && <p style={{fontSize:12,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:8,padding:"7px 10px",marginTop:8,lineHeight:1.6}}>🗓 แพ็คเกจนี้ยังไม่เริ่มนับอายุ — การจองนี้ (วันเล่น {niceDate(nb.date)}) จะเป็นวันแรก ใช้เล่นได้ {nbPkg.expiry_days} วัน ถึง {niceDate(addDaysIsoClient(nb.date, nbPkg.expiry_days - 1))}</p>}
+                    {pkgProblem && <p style={{fontSize:12.5,color:"#c0392b",fontWeight:600,marginTop:8,lineHeight:1.6}}>⚠️ {pkgProblem}</p>}
+                  </div>
+                )}
+                {nbUseCoach && (
+                  <div style={{background:"var(--or-bg)",border:"1px solid var(--dv)",borderRadius:10,padding:12,display:"flex",flexDirection:"column",gap:10}}>
+                    {nbCoachOrders.length > 1 && (
+                      <select value={nb.coachOrderId} onChange={e => setNb(p => ({ ...p, coachOrderId: e.target.value }))} style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,background:"#fff"}}>
+                        {nbCoachOrders.map(o => <option key={o.id} value={o.id}>C-{o.id} • {coachLabel(o, "th")} • เหลือ {o.remaining}/{o.sessions} ครั้ง</option>)}
+                      </select>
+                    )}
+                    {nbCoach && (
+                      <p style={{fontSize:13,color:"var(--br)",lineHeight:1.7,margin:0}}>
+                        👤 <b>C-{nbCoach.id}</b> {coachLabel(nbCoach, "th")} • ใช้สิทธิ์แล้ว {nbCoach.sessions_used}/{nbCoach.sessions}<br />
+                        รายการนี้ใช้ <b style={{color:"var(--or)"}}>{nbCoachUnits} ครั้ง</b> ({nb.duration} นาที) → เหลือ {Math.max(0, nbCoach.remaining - nbCoachUnits)} ครั้งหลังตัด • ยืนยันทันที ไม่มียอดชำระ
+                      </p>
+                    )}
+                    <div>
+                      <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ชื่อโค้ช (ลูกค้าจะเห็นในหน้า "การจองของฉัน")</label>
+                      <input list="coach-names" value={nb.coachName} maxLength={30} onChange={e => setNb(p => ({ ...p, coachName: e.target.value }))} placeholder="เช่น โค้ชเอ"
+                        style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,outline:"none",background:"#fff"}} />
+                      <datalist id="coach-names">{coachNames.map(n => <option key={n} value={n} />)}</datalist>
+                    </div>
+                    {coachProblem && <p style={{fontSize:12.5,color:"#c0392b",fontWeight:600,margin:0,lineHeight:1.6}}>⚠️ {coachProblem}</p>}
+                  </div>
+                )}
+                {nbMode === "cash" && (
+                  <>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>ราคาต่อสนาม (บาท) — เว้นว่าง = ราคาปกติ ฿{nbAutoUnit.toLocaleString()}</label>
+                  <input type="number" inputMode="numeric" value={nb.price} onChange={e => setNb(p => ({ ...p, price: e.target.value }))} placeholder={String(nbAutoUnit)}
+                    style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,outline:"none"}} />
+                  <p style={{fontSize:12,color:"var(--mu)",marginTop:6}}>ยอดรวม <b style={{color:"var(--or)"}}>฿{(Math.round(nbUnit || 0) * nb.courts.length).toLocaleString()}</b> ({nb.courts.length} สนาม)</p>
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>สถานะ</label>
+                  <div style={{display:"flex",gap:8}}>
+                    {[["reviewing", "⏳ รอชำระ (ค้างไว้ ไม่หมดอายุ)"], ["confirmed", "✅ ชำระแล้ว (ยืนยันทันที)"]].map(([v, label]) => (
+                      <button key={v} onClick={() => setNb(p => ({ ...p, status: v }))}
+                        style={{flex:1,padding:"10px 6px",borderRadius:8,border:`2px solid ${nb.status === v ? "var(--or)" : "var(--dv)"}`,background:nb.status === v ? "var(--or-bg)" : "#fff",color:nb.status === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+                    ))}
+                  </div>
+                </div>
+                  </>
+                )}
+                <button onClick={submitNb} disabled={!nbCanSubmit}
+                  style={{padding:"13px",borderRadius:10,border:"none",background:nbCanSubmit ? "linear-gradient(90deg,var(--or),var(--or2))" : "var(--cr2)",color:nbCanSubmit ? "#fff" : "var(--mu)",fontWeight:800,fontSize:15,cursor:nbCanSubmit ? "pointer" : "not-allowed",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                  {nbBusy ? "⏳ กำลังบันทึก..." : "บันทึกการจอง"}
+                </button>
+                {nbMsg && <p style={{fontSize:13,fontWeight:600,color:nbMsg.ok ? "#2d7a4f" : "#c0392b",lineHeight:1.6}}>{nbMsg.text}</p>}
+                {nbConfirmText && (
+                  <div style={{background:"#fff",border:"1.5px solid #2d7a4f",borderRadius:10,padding:"12px 14px"}}>
+                    <p style={{fontSize:12,color:"var(--mu)",marginBottom:6}}>ข้อความยืนยันสำหรับส่งให้ลูกค้าในแชท LINE OA:</p>
+                    <pre style={{whiteSpace:"pre-wrap",fontFamily:"'Noto Sans Thai',sans-serif",fontSize:13,color:"var(--tx)",lineHeight:1.7,margin:"0 0 10px"}}>{nbConfirmText}</pre>
+                    <button onClick={async () => {
+                      try { await navigator.clipboard.writeText(nbConfirmText); }
+                      catch { const ta = document.createElement("textarea"); ta.value = nbConfirmText; document.body.appendChild(ta); ta.select(); try { document.execCommand("copy"); } catch { /* no-op */ } document.body.removeChild(ta); }
+                      setNbCopied(true);
+                    }} style={{padding:"9px 16px",borderRadius:8,border:"none",background:"#2d7a4f",color:"#fff",fontWeight:800,fontSize:13,cursor:"pointer"}}>{nbCopied ? "คัดลอกแล้ว ✓" : "📋 คัดลอกข้อความ"}</button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab==="coach" && (() => {
+            const all = coachList || [];
+            const openN = all.filter(o => o.status === "pending" || o.status === "reviewing").length;
+            const shown = all.filter(o => coachFilter === "all" ? true : coachFilter === "confirmed" ? o.status === "confirmed" : (o.status === "pending" || o.status === "reviewing"));
+            const stBadge = (s) => ({ confirmed: ["ยืนยันแล้ว", "#2d7a4f"], reviewing: ["รอตรวจสอบสลิป", "#e67e22"], pending: ["รอชำระเงิน", "#8a7060"], cancelled: ["ยกเลิกแล้ว", "#c0392b"] }[s] || [s, "#8a7060"]);
+            const when = (t) => { try { return parseUtc(t).toLocaleString("th-TH", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }); } catch { return ""; } };
+            return (
+              <div>
+                <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:4}}>👤 คอร์สเรียนกับโค้ช</p>
+                <p style={{fontSize:12,color:"var(--mu)",marginBottom:12,lineHeight:1.6}}>ลูกค้าเลือกคอร์สและโอนเงินในเว็บ {coachPushEnabled ? "ระบบส่งข้อความเข้า LINE OA ของลูกค้าให้แล้ว" : "แล้วกดปุ่มทักไลน์ OA มาเอง (ข้อความมีรหัส C-xx / ชื่อ / เบอร์)"} — ตรวจสลิปแล้วกด ✅ → คุยนัดวัน-เวลากับลูกค้าในแชท LINE OA → ไปแท็บ <b>➕ จองแทน</b> ใส่เบอร์ลูกค้า เลือก "👤 ตัดสิทธิ์คอร์สโค้ช" ลงวัน-เวลาและชื่อโค้ช (ระบบตัดสิทธิ์ให้เอง ลูกค้าเห็นนัดใน "การจองของฉัน")</p>
+                <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+                  {[["open", `รอดำเนินการ (${openN})`], ["confirmed", "ยืนยันแล้ว"], ["all", "ทั้งหมด"]].map(([v, label]) => (
+                    <button key={v} onClick={() => setCoachFilter(v)} style={{padding:"8px 14px",borderRadius:20,border:`1.5px solid ${coachFilter === v ? "var(--or)" : "var(--dv)"}`,background:coachFilter === v ? "var(--or-bg)" : "#fff",color:coachFilter === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+                  ))}
+                  <button onClick={loadCoach} style={{padding:"8px 14px",borderRadius:20,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--br)",fontWeight:700,fontSize:12.5,cursor:"pointer"}}>🔄 รีเฟรช</button>
+                </div>
+                {coachList === null && <p style={{color:"var(--mu)",fontSize:13}}>กำลังโหลด...</p>}
+                {coachList !== null && shown.length === 0 && <div style={{background:"#fff",borderRadius:12,padding:24,textAlign:"center",border:"1px solid var(--dv)",color:"var(--mu)"}}>ไม่มีรายการ</div>}
+                <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                  {shown.map(o => {
+                    const [stTxt, stCol] = stBadge(o.status);
+                    const busy = coachBusy === o.id;
+                    return (
+                      <div key={o.id} style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",boxShadow:"var(--sh)",padding:"14px 16px"}}>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:8}}>
+                          <div>
+                            <p style={{fontWeight:800,color:"var(--br)",fontSize:14.5}}>C-{o.id} • {o.customer_name}</p>
+                            <p style={{fontSize:12,color:"var(--mu)",marginTop:2}}>📞 <a href={`tel:${o.customer_id}`} style={{color:"var(--br)"}}>{o.customer_id}</a> • {when(o.created_time)} {o.line_pushed ? " • 💬 ส่งข้อความ LINE แล้ว" : coachPushEnabled ? <span> • 💬 <span style={{color:"#c0392b",fontWeight:700}}>ส่ง LINE ไม่สำเร็จ — ทักลูกค้าเอง</span></span> : null}</p>
+                          </div>
+                          <span style={{fontSize:11.5,fontWeight:700,color:stCol,background:`${stCol}18`,padding:"3px 10px",borderRadius:20,whiteSpace:"nowrap"}}>{stTxt}</span>
+                        </div>
+                        <p style={{fontSize:13.5,color:"var(--tx)",lineHeight:1.6}}>{coachLabel(o, "th")}{o.sold_by === "admin" && <span style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>📞 แอดมินขาย{o.list_price != null && o.price < o.list_price ? " (ลดราคา)" : ""}</span>}</p>
+                        {o.sold_by === "admin" && o.admin_note && <p style={{fontSize:12,color:"var(--mu)"}}>📝 {o.admin_note}</p>}
+                        <p style={{fontSize:15,fontWeight:800,color:"var(--or)",margin:"2px 0 4px"}}>฿{o.price.toLocaleString()}{o.people > 1 ? <span style={{fontSize:11.5,fontWeight:500,color:"var(--mu)"}}> ({(o.price / o.people).toLocaleString()} × {o.people} คน)</span> : null}</p>
+                        {o.learner_note && <p style={{fontSize:12.5,color:"var(--mu)"}}>📝 ผู้เรียน: {o.learner_note}</p>}
+                        {o.slip_url && <a href={o.slip_url} target="_blank" rel="noopener noreferrer" style={{display:"inline-block",marginTop:6,fontSize:12.5,fontWeight:700,color:"var(--br)"}}>🧾 ดูสลิป</a>}
+                        <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap",alignItems:"center"}}>
+                          {(o.status === "pending" || o.status === "reviewing") && (
+                            <>
+                              <button disabled={busy} onClick={() => confirmCoach(o)} style={{padding:"9px 16px",borderRadius:10,border:"none",background:"#2d7a4f",color:"#fff",fontWeight:800,fontSize:13,cursor:"pointer",opacity:busy ? .6 : 1}}>✅ ยืนยันรับเงิน</button>
+                              <button disabled={busy} onClick={() => cancelCoach(o)} style={{padding:"9px 16px",borderRadius:10,border:"1.5px solid #c0392b",background:"#fff",color:"#c0392b",fontWeight:700,fontSize:13,cursor:"pointer",opacity:busy ? .6 : 1}}>❌ ยกเลิก</button>
+                            </>
+                          )}
+                          {o.status === "confirmed" && (
+                            <>
+                              <span style={{fontSize:13,fontWeight:700,color:"var(--br)"}} title="ระบบตัดให้อัตโนมัติเมื่อนัดผ่านแท็บ จองแทน — ปุ่ม + / − ใช้แก้จำนวนด้วยมือเท่านั้น">ใช้สิทธิ์แล้ว {o.sessions_used || 0} / {o.sessions} ครั้ง</span>
+                              <button disabled={busy || (o.sessions_used || 0) <= 0} onClick={() => adjustCoach(o, -1)} style={{width:34,height:34,borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",fontWeight:800,fontSize:16,cursor:"pointer"}}>−</button>
+                              <button disabled={busy || (o.sessions_used || 0) >= o.sessions} onClick={() => adjustCoach(o, 1)} style={{width:34,height:34,borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:800,fontSize:16,cursor:"pointer"}}>+</button>
+                              <button disabled={busy} onClick={() => cancelCoach(o)} style={{marginLeft:"auto",padding:"7px 12px",borderRadius:8,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:12,cursor:"pointer"}}>ยกเลิกคำสั่งซื้อ</button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
+
+          {tab==="packages" && (
+            <div>
+              <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:10}}>🔔 รายการรอตรวจสอบ/ยืนยัน {pkgQueue.length > 0 && `(${pkgQueue.length})`}</p>
+              <div style={{background:"#fff",borderRadius:12,border:"1.5px solid #e67e22",overflow:"auto",boxShadow:"var(--sh)",marginBottom:24}}>
+                {pkgQueueLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                pkgQueue.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>✅ ไม่มีรายการค้างตรวจสอบ</p> : (
+                  <table className="adm-table">
+                    <thead><tr><th>ชื่อลูกค้า</th><th>เบอร์</th><th>แพ็คเกจ</th><th>ราคา</th><th>สลิป</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                    <tbody>
+                      {pkgQueue.map(pk => (
+                        <tr key={pk.id}>
+                          <td style={{fontWeight:600}}>{pk.customer_name || "-"}</td>
+                          <td>{pk.customer_id}</td>
+                          <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits} ครั้ง{pk.promo_code && <span style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#fff",background:"#E8690F",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>🔥 11.11</span>}{pk.sold_by === "admin" && <span title={pk.admin_note || ""} style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>📞 แอดมินขาย{pk.price < pk.list_price ? " (ลดราคา)" : ""}</span>}</td>
+                          <td style={{fontWeight:700,color:"var(--or)"}}>฿{pk.price?.toLocaleString()}</td>
+                          <td>{pk.slip_url ? <a href={pk.slip_url} target="_blank" rel="noreferrer" style={{color:"var(--bl)",fontWeight:600}}>ดูสลิป 🔗</a> : <span style={{color:"var(--mu)"}}>-</span>}</td>
+                          <td><span style={{fontSize:12,fontWeight:600,color:pk.status==="reviewing"?"#e67e22":"var(--mu)"}}>{pk.status==="reviewing"?"🔍 รอการยืนยัน":"⏳ รอชำระ"}</span></td>
+                          <td>
+                            <div style={{display:"flex",gap:6}}>
+                              <button onClick={()=>confirmPackage(pk.id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>✅</button>
+                              <button onClick={()=>cancelPackage(pk.id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(192,57,43,.1)",color:"#c0392b",fontWeight:700,fontSize:12,cursor:"pointer"}}>❌</button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                <p style={{fontWeight:700,color:"var(--br)",fontSize:15}}>📋 แพ็คเกจทั้งหมด (ล่าสุด 200 รายการ)</p>
+                <button onClick={loadAllPkgs} style={{padding:"6px 12px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontWeight:600,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 รีเฟรช</button>
+              </div>
+              <div style={{background:"var(--or-bg)",border:"1px solid var(--dv)",borderRadius:10,padding:"10px 14px",marginBottom:12,fontSize:13,color:"var(--br)",lineHeight:1.7}}>
+                ตอนนี้มีแพ็คเกจที่ <b>ยังใช้ได้ {usableAll.length} แพ็คเกจ</b> ({usableCustomers} คน) • สิทธิ์คงเหลือรวม <b style={{color:"var(--or)"}}>{usableCredits} ครั้ง</b>
+              </div>
+              <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",marginBottom:12}}>
+                <input value={pkgQuery} onChange={e => setPkgQuery(e.target.value)} placeholder="🔍 ค้นหาชื่อหรือเบอร์โทร..."
+                  style={{flex:1,minWidth:200,padding:"10px 14px",borderRadius:10,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}} />
+                <label style={{display:"flex",alignItems:"center",gap:6,fontSize:13,color:"var(--br)",cursor:"pointer",whiteSpace:"nowrap"}}>
+                  <input type="checkbox" checked={pkgOnlyUsable} onChange={e => setPkgOnlyUsable(e.target.checked)} /> เฉพาะที่ยังใช้ได้
+                </label>
+                <span style={{fontSize:12,color:"var(--mu)"}}>แสดง {visiblePkgs.length} จาก {allPkgs.length}</span>
+              </div>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                {allPkgsLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                allPkgs.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ยังไม่มีแพ็คเกจ</p> : visiblePkgs.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่พบแพ็คเกจที่ตรงกับเงื่อนไข (ลองปิด "เฉพาะที่ยังใช้ได้")</p> : (
+                  <table className="adm-table">
+                    <thead><tr><th>ชื่อลูกค้า</th><th>เบอร์</th><th>แพ็คเกจ</th><th>ใช้ไป</th><th>คงเหลือ</th><th>ซื้อสำเร็จเมื่อ</th><th>หมดอายุ</th><th>สถานะ</th><th>ประวัติ</th></tr></thead>
+                    <tbody>
+                      {visiblePkgs.map(pk => {
+                        const expired = pk.status==="active" && pk.expiry_date && new Date(pk.expiry_date+"T23:59:59") < new Date();
+                        const used = pk.status==="active" || pk.status==="cancelled" ? (pk.total_credits - pk.remaining_credits) : null;
+                        return (
+                          <tr key={pk.id}>
+                            <td style={{fontWeight:600}}>{pk.customer_name || "-"}</td>
+                            <td>{pk.customer_id}</td>
+                            <td>{pk.tier==="peak"?"Peak":"Off Peak"} × {pk.total_credits}{pk.promo_code && <span style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#fff",background:"#E8690F",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>🔥 11.11</span>}{pk.sold_by === "admin" && <span title={pk.admin_note || ""} style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8,whiteSpace:"nowrap"}}>📞 แอดมินขาย{pk.list_price != null && pk.price < pk.list_price ? " (ลดราคา)" : ""}</span>}</td>
+                            <td>{used!=null ? `${used} ครั้ง` : "-"}</td>
+                            <td>{pk.status==="active" ? `${pk.remaining_credits} / ${pk.total_credits}` : "-"}</td>
+                            <td>{pk.activated_at ? parseUtc(pk.activated_at).toLocaleDateString("th-TH",{day:"2-digit",month:"short",year:"numeric",timeZone:"Asia/Bangkok"}) : "-"}</td>
+                            <td>{pk.expiry_date ? new Date(pk.expiry_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short",year:"numeric"}) : (pk.status === "active" ? <span style={{color:"var(--mu)",fontSize:12}}>ยังไม่เริ่มนับ</span> : "-")}</td>
+                            <td>
+                              <span style={{fontSize:11.5,fontWeight:600,color:expired?"#c0392b":pk.status==="active"?"#2d7a4f":pk.status==="cancelled"?"#c0392b":"var(--mu)"}}>
+                                {expired ? "หมดอายุแล้ว" : pk.status==="active" ? "ใช้งานได้" : pk.status==="cancelled" ? "ยกเลิกแล้ว" : pk.status==="reviewing" ? "รอการยืนยัน" : "รอชำระ"}
+                              </span>
+                            </td>
+                            <td><button onClick={() => openHistory(pk.customer_id)} title="ดูวันเวลาที่ใช้สิทธิ์ และประวัติการจอง" style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:700,fontSize:11.5,cursor:"pointer",whiteSpace:"nowrap"}}>📋 ดู</button></td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab==="closures" && (
+            <div>
+              <div style={{background:"#fff",borderRadius:12,padding:20,marginBottom:20,border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                <p style={{fontWeight:700,color:"var(--br)",marginBottom:6}}>🚫 ปิดสนาม</p>
+                <p style={{fontSize:12,color:"var(--mu)",marginBottom:16}}>เลือกวันที่ สนาม และช่วงเวลาที่ต้องการปิด (เช่น ปิดซ่อมบำรุง) ลูกค้าจะไม่สามารถจองช่วงเวลานี้ได้จนกว่าจะกดเปิดใช้งานอีกครั้ง</p>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:14}}>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>วันที่</label>
+                    <input type="date" value={closeDate} onChange={e=>setCloseDate(e.target.value)}
+                      style={{width:"100%",padding:"9px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>สนาม</label>
+                    <select value={closeCourt} onChange={e=>setCloseCourt(e.target.value)}
+                      style={{width:"100%",padding:"9px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}}>
+                      <option value="both">Court 1 และ 2</option>
+                      <option value="1">Court 1</option>
+                      <option value="2">Court 2</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>เวลาเริ่ม</label>
+                    <select value={closeStart} onChange={e=>setCloseStart(e.target.value)}
+                      style={{width:"100%",padding:"9px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}}>
+                      {CLOSE_TIME_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>เวลาสิ้นสุด</label>
+                    <select value={closeEnd} onChange={e=>setCloseEnd(e.target.value)}
+                      style={{width:"100%",padding:"9px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}}>
+                      {CLOSE_TIME_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div style={{marginBottom:14}}>
+                  <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>เหตุผล (ไม่บังคับ)</label>
+                  <input value={closeReason} onChange={e=>setCloseReason(e.target.value)} placeholder="เช่น ซ่อมบำรุง, ทำความสะอาด"
+                    style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                </div>
+                <button onClick={handleCloseCourt} disabled={closing} style={{padding:"11px 20px",borderRadius:8,border:"none",background:"#c0392b",color:"#fff",fontWeight:700,fontSize:14,cursor:closing?"not-allowed":"pointer",opacity:closing?0.7:1,fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                  {closing ? "⏳ กำลังปิด..." : "🚫 ปิดสนามตามที่เลือก"}
+                </button>
+              </div>
+
+              <p style={{fontWeight:700,color:"var(--br)",fontSize:15,marginBottom:10}}>รายการที่ปิดอยู่ตอนนี้ (จากวันนี้เป็นต้นไป)</p>
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                {blocksLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                blocks.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่มีรายการปิดสนามที่กำลังจะมาถึง</p> : (
+                  <table className="adm-table">
+                    <thead><tr><th>วันที่</th><th>สนาม</th><th>เวลา</th><th>เหตุผล</th><th>จัดการ</th></tr></thead>
+                    <tbody>
+                      {blocks.map(b => (
+                        <tr key={b.id}>
+                          <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short",year:"numeric"})}</td>
+                          <td style={{fontWeight:700}}>Court {b.court_id}{b.group_id && <span title="จอง 2 สนามพร้อมกัน โอนครั้งเดียว" style={{marginLeft:6,fontSize:10.5,fontWeight:700,color:"var(--bl)",background:"var(--bl-bg)",padding:"2px 6px",borderRadius:10}}>🔗 คู่</span>}</td>
+                          <td>{fmtTime(b)}</td>
+                          <td style={{color:"var(--mu)"}}>{(b.customer_name||"").replace("🚫 ปิดสนาม","").replace(/[()]/g,"").trim() || "-"}</td>
+                          <td>
+                            <button onClick={()=>handleUnblock(b.id)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:"rgba(45,122,79,.15)",color:"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer"}}>
+                              เปิดใช้งาน
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab==="report" && (
+            <div>
+              <div style={{background:"#fff",borderRadius:12,padding:20,marginBottom:20,border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                <p style={{fontWeight:700,color:"var(--br)",marginBottom:6}}>📊 รายงานสรุปรายรับต่อวัน</p>
+                <p style={{fontSize:12,color:"var(--mu)",marginBottom:14}}>นับตามวันที่ลูกค้าทำรายการโอนเงินจริง (ไม่ใช่วันที่จองล่วงหน้า) — กดที่แถววันที่เพื่อดูรายละเอียดว่าใครจองบ้าง</p>
+                <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:4}}>จากวันที่</label>
+                    <input type="date" value={reportFrom} onChange={e=>setReportFrom(e.target.value)}
+                      style={{padding:"9px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:4}}>ถึงวันที่</label>
+                    <input type="date" value={reportTo} onChange={e=>setReportTo(e.target.value)}
+                      style={{padding:"9px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                  <button onClick={loadReport} style={{marginTop:18,padding:"9px 16px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🔄 ดึงรายงาน</button>
+                </div>
+              </div>
+
+              <div style={{background:"#fff",borderRadius:12,padding:20,marginBottom:20,border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                <p style={{fontWeight:700,color:"var(--br)",marginBottom:6}}>📣 แหล่งที่มาของลูกค้า (โฆษณา)</p>
+                <p style={{fontSize:12,color:"var(--mu)",marginBottom:12,lineHeight:1.6}}>ใช้ช่วงวันที่ด้านบน นับตามวันที่ลูกค้ากดจอง/กดซื้อ เฉพาะรายการที่ส่งสลิปแล้วหรือยืนยันแล้ว ลูกค้าที่ไม่ได้มาจากลิงก์ที่ติด UTM จะอยู่ในแถว "ไม่ทราบ / เข้าตรง"</p>
+                <button onClick={loadSourceReport} style={{padding:"9px 16px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{sourceLoading ? "⏳ กำลังโหลด..." : "📣 ดูแหล่งที่มา"}</button>
+                {sourceMsg && <p style={{fontSize:12.5,color:"#c0392b",marginTop:10}}>{sourceMsg}</p>}
+                {sourceRows && sourceRows.length === 0 && <p style={{fontSize:13,color:"var(--mu)",marginTop:12}}>ไม่มีข้อมูลในช่วงนี้</p>}
+                {sourceRows && sourceRows.length > 0 && (() => {
+                  const adRows = sourceRows.filter(r => !r.source.startsWith("(ไม่ทราบ"));
+                  const adCustomers = adRows.reduce((s, r) => s + r.customers, 0);
+                  const adBookings = adRows.reduce((s, r) => s + r.bookings, 0);
+                  const adRevenue = adRows.reduce((s, r) => s + r.bookingRevenue + r.packageRevenue, 0);
+                  const spend = Number(adSpend) || 0;
+                  const mc = Number(marginalCost) || 0;
+                  const profit = adRevenue - adBookings * mc - spend;
+                  return (
+                    <>
+                      <div style={{overflow:"auto",marginTop:12}}>
+                        <table className="adm-table">
+                          <thead><tr><th>แหล่งที่มา (source / campaign / ad)</th><th>ลูกค้า</th><th>จอง</th><th>รายได้จอง</th><th>แพ็คเกจ</th><th>รายได้แพ็ค</th></tr></thead>
+                          <tbody>
+                            {sourceRows.map(r => (
+                              <tr key={r.source}>
+                                <td style={{fontWeight:600}}>{r.source}</td>
+                                <td>{r.customers}</td>
+                                <td>{r.bookings}</td>
+                                <td>฿{r.bookingRevenue.toLocaleString()}</td>
+                                <td>{r.packages}</td>
+                                <td>฿{r.packageRevenue.toLocaleString()}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div style={{marginTop:16,padding:14,borderRadius:10,background:"var(--cr)",border:"1px solid var(--dv)"}}>
+                        <p style={{fontWeight:700,color:"var(--br)",fontSize:13.5,marginBottom:10}}>💰 ความคุ้มค่าของโฆษณา (เฉพาะแถวที่มาจากแอด)</p>
+                        <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:12}}>
+                          <div>
+                            <label style={{fontSize:11.5,color:"var(--mu)",display:"block",marginBottom:4}}>ค่าโฆษณาที่ใช้ในช่วงนี้ (บาท)</label>
+                            <input type="number" inputMode="numeric" value={adSpend} onChange={e=>setAdSpend(e.target.value)} placeholder="เช่น 3000"
+                              style={{padding:"8px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,width:140,outline:"none"}} />
+                          </div>
+                          <div>
+                            <label style={{fontSize:11.5,color:"var(--mu)",display:"block",marginBottom:4}}>ต้นทุนส่วนเพิ่มต่อการจอง (บาท)</label>
+                            <input type="number" inputMode="numeric" value={marginalCost} onChange={e=>setMarginalCost(e.target.value)}
+                              style={{padding:"8px 10px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,width:140,outline:"none"}} />
+                          </div>
+                        </div>
+                        <Row label="ลูกค้าจากแอด (นับตามแหล่ง)" val={`${adCustomers} คน`} />
+                        <Row label="รายได้รวมจากแอด" val={`฿${adRevenue.toLocaleString()}`} />
+                        <Row label="ค่าโฆษณาต่อลูกค้า 1 คน" val={spend > 0 && adCustomers > 0 ? `฿${Math.round(spend / adCustomers).toLocaleString()}` : "-"} />
+                        <Row label="กำไรหลังหักต้นทุนส่วนเพิ่ม + ค่าแอด" val={spend > 0 ? `${profit >= 0 ? "" : "-"}฿${Math.abs(Math.round(profit)).toLocaleString()}` : "-"} />
+                        <p style={{fontSize:11,color:"var(--mu)",marginTop:8,lineHeight:1.6}}>* ประมาณการเท่านั้น: ต้นทุนส่วนเพิ่มคิดจากจำนวนการจองคูณค่าที่กรอก (สมมติครั้งละ 60 นาที) รายได้แพ็คเกจนับตอนซื้อ แต่ต้นทุนเกิดตอนลูกค้ามาใช้ ช่วงสั้นๆ ตัวเลขจึงอาจเอียง ลูกค้าที่กลับมาจองซ้ำทีหลังจะไม่อยู่ในแถวนี้ ถ้าไม่ได้เข้าผ่านลิงก์แอดอีก</p>
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+
+              <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12,marginBottom:20}}>
+                <div style={{background:"#fff",borderRadius:12,padding:"14px",textAlign:"center",border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                  <p style={{fontSize:11,color:"var(--mu)",marginBottom:4}}>จำนวนรายการที่สำเร็จ (ช่วงที่เลือก)</p>
+                  <p style={{fontSize:22,fontWeight:800,color:"var(--br)"}}>{reportGrandCount}</p>
+                </div>
+                <div style={{background:"#fff",borderRadius:12,padding:"14px",textAlign:"center",border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                  <p style={{fontSize:11,color:"var(--mu)",marginBottom:4}}>รายรับรวม (ช่วงที่เลือก)</p>
+                  <p style={{fontSize:22,fontWeight:800,color:"var(--or)"}}>฿{reportGrandTotal.toLocaleString()}</p>
+                </div>
+              </div>
+
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                {reportLoading ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p> :
+                reportRows.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>ไม่มีข้อมูลในช่วงวันที่เลือก</p> : (
+                  <table className="adm-table">
+                    <thead><tr><th></th><th>วันที่</th><th>รายการสำเร็จ</th><th>รายรับ</th><th>รายการอื่นๆ (รอ/ยกเลิก)</th></tr></thead>
+                    <tbody>
+                      {reportRows.map(r => (
+                        <Fragment key={r.day}>
+                          <tr onClick={()=>toggleDayDetail(r.day)} style={{cursor:"pointer"}}>
+                            <td style={{width:20,color:"var(--mu)"}}>{expandedDay===r.day?"▾":"▸"}</td>
+                            <td style={{fontWeight:700}}>{new Date(r.day).toLocaleDateString("th-TH",{year:"numeric",month:"short",day:"numeric"})}</td>
+                            <td>{r.confirmedCount}</td>
+                            <td style={{fontWeight:700,color:"var(--or)"}}>฿{r.confirmedTotal.toLocaleString()}</td>
+                            <td style={{color:"var(--mu)"}}>{r.otherCount}</td>
+                          </tr>
+                          {expandedDay===r.day && (
+                            <tr>
+                              <td colSpan={5} style={{padding:0,background:"#faf7f2"}}>
+                                {dayDetailLoading ? (
+                                  <p style={{padding:16,textAlign:"center",color:"var(--mu)"}}>⏳ กำลังโหลด...</p>
+                                ) : (
+                                  <table className="adm-table adm-table-sub" style={{margin:"8px 12px",width:"calc(100% - 24px)"}}>
+                                    <thead><tr><th>โอนเงินตอน</th><th>ชื่อลูกค้า</th><th>สนาม</th><th>วันที่จอง</th><th>เวลาที่จอง</th><th>สถานะ</th></tr></thead>
+                                    <tbody>
+                                      {dayDetail.map(b => {
+                                        const st = stInfo(b.status);
+                                        return (
+                                          <tr key={b.id}>
+                                            <td>{fmtCreatedTime(b.created_time)}</td>
+                                            <td style={{fontWeight:600}}>{b.customer_name || "-"}</td>
+                                            <td>Court {b.court_id}</td>
+                                            <td>{new Date(b.booking_date).toLocaleDateString("th-TH",{day:"2-digit",month:"short"})}</td>
+                                            <td>{fmtTime(b)}</td>
+                                            <td><span style={{fontSize:11,fontWeight:600,color:st.color}}>{st.text}</span></td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                )}
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab==="discounts" && (
+            <div>
+              <div style={{background:"#fff",borderRadius:12,padding:20,marginBottom:20,border:"1px solid var(--dv)",boxShadow:"var(--sh)"}}>
+                <p style={{fontWeight:700,color:"var(--br)",marginBottom:14}}>➕ สร้างรหัสส่วนลดใหม่</p>
+                <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:8,marginBottom:10}}>
+                  <input value={newCode} onChange={e=>setNewCode(e.target.value.toUpperCase())} placeholder="รหัส เช่น NOVA50"
+                    style={{padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  <button onClick={genCode} style={{padding:"0 14px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:13,cursor:"pointer"}}>🎲 สุ่ม</button>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>ส่วนลด (บาท)</label>
+                    <input type="number" value={newAmt} onChange={e=>{ setNewAmt(e.target.value); if (!cpHintTouched) setCpHint(CP_PRESET_HINTS[+e.target.value] || ""); }} min="1"
+                      style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                  <div>
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>ใช้ได้กี่ครั้ง</label>
+                    <input type="number" value={newMax} onChange={e=>setNewMax(e.target.value)} min="1"
+                      style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                  </div>
+                </div>
+                <div style={{marginBottom:14}}>
+                  <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>วันหมดอายุ (เว้นว่าง = ไม่หมดอายุ — ใช้ได้ถึงสิ้นวันที่เลือก)</label>
+                  <input type="date" value={newExp} onChange={e=>setNewExp(e.target.value)}
+                    style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                </div>
+                <div style={{marginBottom:14}}>
+                  <p style={{fontSize:12.5,fontWeight:700,color:"var(--br)",marginBottom:8}}>🎟 รูปคูปอง (ตัวอย่างเปลี่ยนตามที่กรอก — ได้รูปพร้อมส่งหลังกด "สร้างรหัส")</p>
+                  <CouponImage code={newCode || "XXXXXXXX"} amount={Number(newAmt) || 0} expiry={newExp} theme={cpTheme} hint={cpHint} maxUses={Number(newMax) || 1} />
+                  <div style={{display:"flex",gap:8,margin:"12px 0 10px",flexWrap:"wrap",alignItems:"center"}}>
+                    <span style={{fontSize:12,color:"var(--mu)"}}>สีคูปอง:</span>
+                    {Object.entries(CP_THEMES).map(([k, t]) => (
+                      <button key={k} onClick={() => setCpTheme(k)} aria-label={`สี${t.label}`} style={{padding:"6px 14px",borderRadius:20,border:`2px solid ${cpTheme === k ? t.stub : "var(--dv)"}`,background:cpTheme === k ? `${t.stub}22` : "#fff",color:cpTheme === k ? t.ink : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}><span style={{display:"inline-block",width:10,height:10,borderRadius:5,background:t.stub,marginRight:6}} />{t.label}</button>
+                    ))}
+                  </div>
+                  <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>ข้อความอธิบายมูลค่าบนคูปอง (ไม่บังคับ) — ใส่ ฿490 / ฿590 จะเติมให้เอง</label>
+                  <input value={cpHint} onChange={e => { setCpHint(e.target.value); setCpHintTouched(true); }} placeholder="เช่น เท่ากับค่าสนาม Off Peak 1 ชม." maxLength={80}
+                    style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
+                </div>
+                <button onClick={createCode} disabled={!newCode.trim()} style={{width:"100%",padding:"12px",borderRadius:8,border:"none",background:"var(--br)",color:"var(--or)",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+                  สร้างรหัส
+                </button>
+              </div>
+              {cpCreated && (
+                <div id="cp-created" style={{background:"#fff",borderRadius:12,padding:18,marginBottom:20,border:"2px solid #2d7a4f",boxShadow:"var(--sh)"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,marginBottom:12}}>
+                    <p style={{fontWeight:800,color:"#1b5e3c",fontSize:14.5,lineHeight:1.6,margin:0}}>✅ สร้างรหัส <span style={{fontFamily:"monospace"}}>{cpCreated.code}</span> แล้ว — รูปคูปองพร้อมส่งให้ลูกค้า</p>
+                    <button onClick={() => setCpCreated(null)} aria-label="ปิด" style={{border:"none",background:"transparent",fontSize:18,cursor:"pointer",color:"var(--mu)"}}>✕</button>
+                  </div>
+                  <CouponImage code={cpCreated.code} amount={cpCreated.amount} expiry={cpCreated.expiry} theme={cpCreated.theme} hint={cpCreated.hint} maxUses={cpCreated.maxUses} showActions />
+                </div>
+              )}
+              <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                <table className="adm-table">
+                  <thead><tr><th>รหัส</th><th>ส่วนลด</th><th>ใช้แล้ว/ทั้งหมด</th><th>หมดอายุ</th><th>สถานะ</th><th>จัดการ</th></tr></thead>
+                  <tbody>
+                    {discounts.map(c => (
+                      <tr key={c.id}>
+                        <td style={{fontWeight:700,fontFamily:"monospace"}}>{c.code}</td>
+                        <td style={{fontWeight:700,color:"var(--or)"}}>฿{c.discount_amount||`${c.discount_percent}%`}</td>
+                        <td>{c.used_count}/{c.max_uses}</td>
+                        <td style={{fontSize:12}}>{c.expires_at ? new Date(c.expires_at+"T00:00:00").toLocaleDateString("th-TH",{day:"numeric",month:"short",year:"2-digit"}) : "ไม่หมดอายุ"}</td>
+                        <td>{(() => {
+                          const expired = !!c.expires_at && c.expires_at.slice(0,10) < toIso(new Date());
+                          const used = c.used_count >= c.max_uses;
+                          const [txt, col] = !c.active ? ["ปิดใช้งาน","#c0392b"] : expired ? ["หมดอายุแล้ว","#c0392b"] : used ? ["ใช้ครบแล้ว","#8a5a00"] : ["ใช้งานได้","#2d7a4f"];
+                          return <span style={{fontSize:12,fontWeight:600,color:col,background:`${col}1a`,padding:"3px 8px",borderRadius:20}}>{txt}</span>;
+                        })()}</td>
+                        <td><button onClick={() => setCpView(c)} title="ดู/ดาวน์โหลดรูปคูปองของโค้ดนี้" style={{marginRight:6,padding:"5px 10px",borderRadius:6,border:"1px solid var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>🎟 คูปอง</button><button onClick={()=>toggleDiscount(c.id,!c.active)} style={{padding:"5px 10px",borderRadius:6,border:"none",background:c.active?"rgba(192,57,43,.1)":"rgba(45,122,79,.1)",color:c.active?"#c0392b":"#2d7a4f",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{c.active?"ปิด":"เปิด"}</button>{c.used_count > 0 && <button onClick={()=>resetDiscount(c)} title="รีเซ็ตจำนวนที่ใช้เป็น 0" style={{marginLeft:6,padding:"5px 10px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:12,cursor:"pointer"}}>รีเซ็ต</button>}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {tab==="customers" && (() => {
+            const q = custQuery.trim().toLowerCase();
+            const digits = q.replace(/\D/g, "");
+            const st = custStats?.stats || null;
+            const sm = custStats?.summary || null;
+            const S = (c) => st?.[c.customer_id] || null;
+            const fmtD = (iso) => { try { return parseUtc(iso).toLocaleDateString("th-TH", { day: "numeric", month: "short", year: "2-digit" }); } catch { return "-"; } };
+            const bySearch = (c) => !q || String(c.customer_name || "").toLowerCase().includes(q) || String(linkedPhones[c.customer_id] || "").toLowerCase().includes(q) || (digits.length > 0 && String(c.customer_id).includes(digits));
+            const vp = (c) => S(c)?.visitsInPeriod || 0;
+            let rows = customers.filter(bySearch);
+            if (custView === "new") rows = rows.filter(c => S(c) && S(c).isNew).sort((x, y) => String(S(y).firstCreated).localeCompare(String(S(x).firstCreated)));
+            else if (custView === "repeat") rows = rows.filter(c => vp(c) >= 2).sort((x, y) => vp(y) - vp(x) || (S(y).spentInPeriod - S(x).spentInPeriod));
+            else if (custView === "top") rows = rows.filter(c => vp(c) >= 1).sort((x, y) => vp(y) - vp(x) || (S(y).spentInPeriod - S(x).spentInPeriod)).slice(0, 20);
+            else rows = [...rows].sort((x, y) => String(S(y)?.lastCreated || "").localeCompare(String(S(x)?.lastCreated || "")));
+            const periodLabel = custPeriod === 0 ? "ทั้งหมด" : `${custPeriod} วันล่าสุด`;
+            const VIEWS = [["all", "👥 ทั้งหมด"], ["new", "🆕 ลูกค้าใหม่"], ["repeat", "🔁 จองซ้ำ"], ["top", "🏆 จองเยอะสุด"]];
+            const emptyMsg = custStats === null ? "⏳ กำลังโหลดสถิติ..." : custStats.error ? "โหลดสถิติไม่สำเร็จ — กด \"ลองใหม่\" ด้านบน (ยังดูรายชื่อทั้งหมดได้ที่มุมมอง \"ทั้งหมด\")" : custView === "new" ? "ไม่มีลูกค้าใหม่ในช่วงนี้" : custView === "repeat" ? "ยังไม่มีลูกค้าที่จองซ้ำ (2 ครั้งขึ้นไป) ในช่วงนี้" : custView === "top" ? "ยังไม่มีการจองในช่วงนี้" : "ไม่พบลูกค้าที่ตรงกับคำค้นหา";
+            const Kpi = ({ label, value, sub, onClick, on }) => (
+              <button onClick={onClick} style={{textAlign:"left",background:on ? "var(--or-bg)" : "#fff",border:`1.5px solid ${on ? "var(--or)" : "var(--dv)"}`,borderRadius:12,padding:"10px 12px",cursor:onClick ? "pointer" : "default",fontFamily:"'Noto Sans Thai',sans-serif",boxShadow:"var(--sh)"}}>
+                <span style={{display:"block",fontSize:11.5,color:"var(--mu)",fontWeight:600}}>{label}</span>
+                <span style={{display:"block",fontSize:24,fontWeight:800,color:"var(--br)",lineHeight:1.2}}>{value}</span>
+                {sub && <span style={{display:"block",fontSize:11,color:"var(--mu)"}}>{sub}</span>}
+              </button>
+            );
+            return (
+              <div>
+                <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:12,flexWrap:"wrap"}}>
+                  <span style={{fontSize:12.5,fontWeight:700,color:"var(--br)"}}>ช่วงเวลา (นับตามวันที่ลูกค้าจอง):</span>
+                  {[[7, "7 วัน"], [30, "30 วัน"], [90, "90 วัน"], [0, "ทั้งหมด"]].map(([d, label]) => (
+                    <button key={d} onClick={() => { setCustPeriod(d); loadCustStats(d); }} style={{padding:"6px 14px",borderRadius:20,border:`1.5px solid ${custPeriod === d ? "var(--or)" : "var(--dv)"}`,background:custPeriod === d ? "var(--or-bg)" : "#fff",color:custPeriod === d ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+                  ))}
+                </div>
+
+                {custStats?.error && <p style={{fontSize:13,color:"#c0392b",marginBottom:12}}>โหลดสถิติลูกค้าไม่สำเร็จ <button onClick={() => loadCustStats(custPeriod)} style={{marginLeft:6,padding:"3px 10px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",cursor:"pointer"}}>ลองใหม่</button></p>}
+                {sm && (
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,marginBottom:14}}>
+                    <Kpi label={`ลูกค้าที่จอง (${periodLabel})`} value={sm.active} sub={`จอง ${sm.visits} ครั้ง • ฿${sm.revenue.toLocaleString()}`} onClick={() => setCustView("top")} on={custView === "top"} />
+                    <Kpi label="🆕 ลูกค้าใหม่" value={sm.newCustomers} sub={custPeriod === 0 ? "ทุกคนที่เคยจอง" : "จองครั้งแรกในช่วงนี้"} onClick={() => setCustView("new")} on={custView === "new"} />
+                    <Kpi label="🔁 จองซ้ำ (2 ครั้งขึ้นไป)" value={sm.repeat} sub={`${sm.repeatRate}% ของลูกค้าที่จอง`} onClick={() => setCustView("repeat")} on={custView === "repeat"} />
+                    <Kpi label="↩️ ลูกค้าเก่ากลับมาจอง" value={custPeriod === 0 ? "-" : sm.returning} sub={custPeriod === 0 ? "ดูได้เมื่อเลือกช่วงเวลา" : "เริ่มจองก่อนช่วงนี้"} />
+                  </div>
+                )}
+
+                <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+                  {VIEWS.map(([v, label]) => (
+                    <button key={v} onClick={() => setCustView(v)} style={{padding:"8px 14px",borderRadius:20,border:`1.5px solid ${custView === v ? "var(--or)" : "var(--dv)"}`,background:custView === v ? "var(--or-bg)" : "#fff",color:custView === v ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+                  ))}
+                </div>
+                <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:12,flexWrap:"wrap"}}>
+                  <input value={custQuery} onChange={e => setCustQuery(e.target.value)} placeholder="🔍 ค้นหาชื่อหรือเบอร์โทร..."
+                    style={{flex:1,minWidth:200,padding:"10px 14px",borderRadius:10,border:"1.5px solid var(--dv)",fontSize:14,outline:"none",background:"#fff"}} />
+                  <span style={{fontSize:12,color:"var(--mu)"}}>
+                    {custView === "all" ? `แสดง ${rows.length} จาก ${customers.length} คน` : custView === "top" ? `20 อันดับแรก (${periodLabel}) • แสดง ${rows.length} คน` : `${rows.length} คน (${periodLabel})`}
+                  </span>
+                </div>
+                <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
+                  {rows.length === 0 ? <p style={{padding:24,textAlign:"center",color:"var(--mu)"}}>{emptyMsg}</p> : (
+                    <table className="adm-table">
+                      <thead><tr style={{whiteSpace:"nowrap"}}><th>#</th><th>ชื่อ</th><th>เบอร์โทร</th><th>{custPeriod === 0 ? "จอง (ครั้ง)" : `จอง (${custPeriod} วัน / ทั้งหมด)`}</th><th>ยอดรวม</th><th>จองครั้งแรก</th><th>จองล่าสุด</th><th>LINE</th><th>จัดการ</th></tr></thead>
+                      <tbody>
+                        {rows.map((c,i) => {
+                          const lineName = linkedPhones[c.customer_id];
+                          const s = S(c);
+                          const medal = custView === "top" ? (["🥇", "🥈", "🥉"][i] || null) : null;
+                          return (
+                            <tr key={c.customer_id}>
+                              <td style={{color:"var(--mu)",whiteSpace:"nowrap"}}>{medal || i+1}</td>
+                              <td style={{fontWeight:600,minWidth:170}}>
+                                {c.customer_name}
+                                {s?.isNew && custPeriod !== 0 && <span style={{marginLeft:6,fontSize:10,fontWeight:700,color:"#1b5e3c",background:"#DFF0E5",padding:"1px 6px",borderRadius:8}}>ใหม่</span>}
+                                {s && s.visitsInPeriod >= 2 && <span style={{marginLeft:4,fontSize:10,fontWeight:700,color:"#7a4a00",background:"rgba(255,213,74,.5)",padding:"1px 6px",borderRadius:8}}>จองซ้ำ</span>}
+                              </td>
+                              <td style={{fontFamily:"monospace"}}>{c.customer_id}</td>
+                              <td style={{whiteSpace:"nowrap",fontWeight:700}}>{s ? (custPeriod === 0 ? s.visits : <>{s.visitsInPeriod} <span style={{fontWeight:400,color:"var(--mu)"}}>/ {s.visits}</span></>) : <span style={{color:"var(--mu)",fontWeight:400}}>0</span>}</td>
+                              <td style={{whiteSpace:"nowrap"}} title={s ? `ยอดทั้งหมด ฿${s.spent.toLocaleString()}` : ""}>{s ? `฿${(custPeriod === 0 ? s.spent : s.spentInPeriod).toLocaleString()}` : "-"}</td>
+                              <td style={{whiteSpace:"nowrap",fontSize:12.5}}>{s ? fmtD(s.firstCreated) : "-"}</td>
+                              <td style={{whiteSpace:"nowrap",fontSize:12.5}}>{s ? fmtD(s.lastCreated) : "-"}</td>
+                              <td>{lineName
+                                ? <span style={{fontSize:12}}>🔗 {lineName} <button onClick={() => unlinkPhone(c.customer_id)} style={{marginLeft:6,padding:"3px 8px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:11,cursor:"pointer"}}>ปลดล็อกเบอร์</button></span>
+                                : <span style={{fontSize:12,color:"var(--mu)"}}>ยังไม่ผูก</span>}</td>
+                              <td>
+                                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                                  <button onClick={() => openHistory(c.customer_id)} title="ดูแพ็คเกจ การใช้สิทธิ์ และประวัติการจอง" style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--or)",background:"var(--or-bg)",color:"var(--or)",fontWeight:700,fontSize:11.5,cursor:"pointer"}}>📋 ประวัติ</button>
+                                  <button onClick={() => editCustomerName(c)} disabled={!!lineName} title={lineName ? "ผูก LINE แล้ว ใช้ชื่อจาก LINE" : "แก้ชื่อ"} style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:lineName?"var(--cr2)":"var(--br)",fontSize:11.5,cursor:lineName?"not-allowed":"pointer"}}>✏️ ชื่อ</button>
+                                  <button onClick={() => changeCustomerPhone(c)} title="เปลี่ยนเบอร์ (ย้ายการจอง/แพ็คเกจ/การผูก LINE ไปเบอร์ใหม่)" style={{padding:"4px 9px",borderRadius:6,border:"1px solid var(--dv)",background:"#fff",color:"var(--br)",fontSize:11.5,cursor:"pointer"}}>✏️ เบอร์</button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      </div>
+
+      {mv && (() => {
+        const b = mv.b;
+        const dur = b.duration_minutes || 60;
+        const courts = grpCourts(b);
+        const opts = []; for (let m = 6 * 60; m + dur <= 23 * 60; m += 30) opts.push(m);
+        const changed = mv.date !== b.booking_date || mv.startMin !== bkStartMin(b) || (!b.group_id && mv.court !== b.court_id);
+        const tierChanged = !b.package_id && !b.coach_order_id && tierOfBk(b.booking_date, b.hour || 0) !== tierOfBk(mv.date, Math.floor(mv.startMin / 60));
+        const today = toIso(new Date());
+        return (
+          <div onClick={() => !mvBusy && setMv(null)} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(40,22,12,.55)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"20px 10px",overflowY:"auto"}}>
+            <div onClick={e => e.stopPropagation()} style={{background:"#fff",borderRadius:16,width:"100%",maxWidth:460,boxShadow:"0 12px 48px rgba(0,0,0,.35)",overflow:"hidden"}}>
+              <div style={{background:"var(--br)",color:"#fff",padding:"14px 18px",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+                <div style={{minWidth:0}}>
+                  <p style={{fontWeight:800,fontSize:16,margin:0}}>🕐 เลื่อนเวลาการจอง</p>
+                  <p style={{fontSize:12,opacity:.85,margin:"2px 0 0"}}>{b.customer_name || "-"} • 📞 {b.customer_id}</p>
+                </div>
+                <button onClick={() => !mvBusy && setMv(null)} style={{border:"none",background:"rgba(255,255,255,.18)",color:"#fff",width:34,height:34,borderRadius:17,fontSize:16,cursor:"pointer"}}>✕</button>
+              </div>
+              <div style={{padding:16,display:"flex",flexDirection:"column",gap:14}}>
+                <div style={{background:"var(--cr)",borderRadius:10,padding:"10px 12px",fontSize:13,color:"var(--br)",lineHeight:1.7}}>
+                  <b>เวลาเดิม:</b> {niceDate(b.booking_date)} • {minutesToLabel(bkStartMin(b))}–{minutesToLabel(bkStartMin(b) + dur)} • {courts.map(c => "Court " + c).join(" + ")}<br />
+                  ระยะเวลา {dur} นาที (เท่าเดิม){b.group_id ? " • จอง 2 สนาม ย้ายพร้อมกัน" : ""}{b.package_id ? " • 🎟 ใช้สิทธิ์แพ็คเกจ" : ""}{b.coach_name ? ` • 👤 โค้ช ${b.coach_name}` : ""}
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>วันที่เล่นใหม่</label>
+                  <input type="date" value={mv.date} min={today} onChange={e => setMv(p => ({ ...p, date: e.target.value }))} style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,outline:"none"}} />
+                </div>
+                <div>
+                  <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>เวลาเริ่มใหม่</label>
+                  <select value={mv.startMin} onChange={e => setMv(p => ({ ...p, startMin: Number(e.target.value) }))} style={{width:"100%",padding:"11px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:15,background:"#fff"}}>
+                    {opts.map(m => <option key={m} value={m}>{minutesToLabel(m)} – {minutesToLabel(m + dur)}</option>)}
+                  </select>
+                </div>
+                {!b.group_id && (
+                  <div>
+                    <label style={{fontSize:12.5,fontWeight:600,color:"var(--br)",display:"block",marginBottom:6}}>สนาม</label>
+                    <div style={{display:"flex",gap:8}}>
+                      {[1, 2].map(c => <button key={c} onClick={() => setMv(p => ({ ...p, court: c }))} style={{flex:1,padding:"10px",borderRadius:8,border:`2px solid ${mv.court === c ? "var(--or)" : "var(--dv)"}`,background:mv.court === c ? "var(--or-bg)" : "#fff",color:mv.court === c ? "var(--or)" : "var(--mu)",fontWeight:700,fontSize:14,cursor:"pointer"}}>{mv.court === c ? "✓ " : ""}Court {c}</button>)}
+                    </div>
+                  </div>
+                )}
+                <div style={{fontSize:13,color:"var(--br)",lineHeight:1.7}}>
+                  <b>เวลาใหม่:</b> {niceDate(mv.date)} • {minutesToLabel(mv.startMin)}–{minutesToLabel(mv.startMin + dur)} • {(b.group_id ? courts : [mv.court]).map(c => "Court " + c).join(" + ")}
+                </div>
+                {tierChanged && <p style={{fontSize:12.5,color:"#8a5a00",background:"rgba(255,213,74,.28)",borderRadius:8,padding:"8px 10px",margin:0,lineHeight:1.6}}>⚠️ ช่วงเวลาใหม่เป็นคนละช่วงราคา ({tierOfBk(b.booking_date, b.hour || 0) === "peak" ? "Peak" : "Off Peak"} → {tierOfBk(mv.date, Math.floor(mv.startMin / 60)) === "peak" ? "Peak" : "Off Peak"}) ระบบ <b>ไม่คิดส่วนต่างราคา</b> ให้ — ราคาเดิม ฿{(b.price || 0).toLocaleString()} ยังคงเดิม ถ้าต้องการเก็บส่วนต่าง แจ้งลูกค้าเอง</p>}
+                {(b.package_id || b.coach_name) && <p style={{fontSize:12,color:"var(--mu)",margin:0,lineHeight:1.6}}>การจองนี้ใช้สิทธิ์แพ็คเกจ/คอร์สโค้ช — ระบบตรวจกติกาให้เอง (ประเภทแพ็คเกจ วันในอายุแพ็คเกจ โค้ชไม่ซ้อนเวลา) สิทธิ์ที่ใช้ไปไม่เปลี่ยน</p>}
+                {mvErr && <p style={{fontSize:13,color:"#c0392b",fontWeight:600,margin:0,lineHeight:1.6}}>{mvErr}</p>}
+                <div style={{display:"flex",gap:10}}>
+                  <button onClick={() => setMv(null)} disabled={mvBusy} style={{flex:1,padding:"13px",borderRadius:10,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontWeight:700,fontSize:14.5,cursor:"pointer"}}>ยกเลิก</button>
+                  <button onClick={submitMove} disabled={!changed || mvBusy || !mv.date} style={{flex:2,padding:"13px",borderRadius:10,border:"none",background:(changed && !mvBusy && mv.date) ? "linear-gradient(90deg,var(--or),var(--or2))" : "var(--cr2)",color:(changed && !mvBusy && mv.date) ? "#fff" : "var(--mu)",fontWeight:800,fontSize:15,cursor:(changed && !mvBusy && mv.date) ? "pointer" : "not-allowed"}}>{mvBusy ? "กำลังเลื่อน..." : "ยืนยันเลื่อนเวลา"}</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {cpView && (
+        <div onClick={() => setCpView(null)} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(40,22,12,.55)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"20px 10px",overflowY:"auto"}}>
+          <div onClick={e => e.stopPropagation()} style={{background:"#fff",borderRadius:16,width:"100%",maxWidth:620,boxShadow:"0 12px 48px rgba(0,0,0,.35)",overflow:"hidden"}}>
+            <div style={{background:"var(--br)",color:"#fff",padding:"14px 18px",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+              <p style={{fontWeight:800,fontSize:16,margin:0}}>🎟 คูปอง <span style={{fontFamily:"monospace"}}>{cpView.code}</span></p>
+              <button onClick={() => setCpView(null)} aria-label="ปิด" style={{border:"none",background:"rgba(255,255,255,.18)",color:"#fff",width:34,height:34,borderRadius:17,fontSize:16,cursor:"pointer"}}>✕</button>
+            </div>
+            <div style={{padding:16}}>
+              <CouponImage code={cpView.code} amount={cpView.discount_amount || 0} percent={cpView.discount_amount ? 0 : (cpView.discount_percent || 0)} expiry={cpView.expires_at ? String(cpView.expires_at).slice(0, 10) : ""} theme={cpTheme} hint={cpView.discount_amount ? (CP_PRESET_HINTS[cpView.discount_amount] || "") : ""} maxUses={cpView.max_uses || 1} showActions />
+              <div style={{display:"flex",gap:8,margin:"14px 0 0",flexWrap:"wrap",alignItems:"center"}}>
+                <span style={{fontSize:12,color:"var(--mu)"}}>สีคูปอง:</span>
+                {Object.entries(CP_THEMES).map(([k, t]) => (
+                  <button key={k} onClick={() => setCpTheme(k)} style={{padding:"6px 14px",borderRadius:20,border:`2px solid ${cpTheme === k ? t.stub : "var(--dv)"}`,background:cpTheme === k ? `${t.stub}22` : "#fff",color:cpTheme === k ? t.ink : "var(--mu)",fontWeight:700,fontSize:12.5,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}><span style={{display:"inline-block",width:10,height:10,borderRadius:5,background:t.stub,marginRight:6}} />{t.label}</button>
+                ))}
+              </div>
+              <p style={{fontSize:12,color:"var(--mu)",margin:"12px 0 0",lineHeight:1.6}}>สถานะตอนนี้: ใช้แล้ว {cpView.used_count}/{cpView.max_uses} ครั้ง{cpView.active ? "" : " • ปิดใช้งานอยู่ (ลูกค้าจะใช้โค้ดนี้ไม่ได้)"}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {histPhone && (
+        <div onClick={closeHistory} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(40,22,12,.55)",zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"20px 10px",overflowY:"auto"}}>
+          <div onClick={e => e.stopPropagation()} style={{background:"#fff",borderRadius:16,width:"100%",maxWidth:760,boxShadow:"0 12px 48px rgba(0,0,0,.35)",overflow:"hidden"}}>
+            <div style={{background:"var(--br)",color:"#fff",padding:"14px 18px",display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+              <div style={{minWidth:0}}>
+                <p style={{fontWeight:800,fontSize:16,margin:0,overflow:"hidden",textOverflow:"ellipsis"}}>{hist?.name || "ลูกค้า"}</p>
+                <p style={{fontSize:12,opacity:.85,margin:"2px 0 0"}}>📞 {histPhone}{hist?.lineName ? ` • 🔗 LINE: ${hist.lineName}` : ""}</p>
+              </div>
+              <button onClick={closeHistory} style={{border:"none",background:"rgba(255,255,255,.18)",color:"#fff",width:34,height:34,borderRadius:17,fontSize:16,cursor:"pointer"}}>✕</button>
+            </div>
+            <div style={{padding:16}}>
+              {histLoading ? <p style={{textAlign:"center",color:"var(--mu)",padding:24}}>⏳ กำลังโหลด...</p>
+              : !hist || hist.error ? <p style={{textAlign:"center",color:"#c0392b",padding:24}}>โหลดข้อมูลไม่สำเร็จ ลองใหม่อีกครั้ง</p>
+              : (() => {
+                const bks = hist.bookings || [];
+                const shown = histAll ? bks : bks.slice(0, 30);
+                const cnt = (st) => bks.filter(b => b.status === st).length;
+                return (
+                  <>
+                    <p style={{fontWeight:700,color:"var(--br)",fontSize:14,margin:"0 0 10px"}}>🎟 แพ็คเกจ ({(hist.packages || []).length})</p>
+                    {(hist.packages || []).length === 0 && <p style={{fontSize:13,color:"var(--mu)",margin:"0 0 16px"}}>ลูกค้าคนนี้ไม่เคยซื้อแพ็คเกจ</p>}
+                    {(hist.packages || []).map(pk => {
+                      const expired = pk.status === "active" && pk.expiry_date && String(pk.expiry_date).slice(0, 10) < pkgToday;
+                      const [stTxt, stCol] = expired ? ["หมดอายุแล้ว", "#c0392b"] : pk.status === "active" ? ["ใช้งานได้", "#2d7a4f"] : pk.status === "cancelled" ? ["ยกเลิกแล้ว", "#c0392b"] : pk.status === "reviewing" ? ["รอการยืนยัน", "#e67e22"] : ["รอชำระ", "var(--mu)"];
+                      return (
+                        <div key={pk.id} style={{border:"1px solid var(--dv)",borderRadius:12,padding:12,marginBottom:12}}>
+                          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                            <p style={{fontWeight:800,color:"var(--br)",margin:0}}>{pk.tier === "peak" ? "Peak" : "Off Peak"} × {pk.total_credits} ครั้ง</p>
+                            <span style={{fontSize:12,fontWeight:700,color:stCol}}>{stTxt}</span>
+                          </div>
+                          <p style={{fontSize:12,color:"var(--mu)",margin:"4px 0 8px",lineHeight:1.6}}>
+                            ราคา ฿{(pk.price || 0).toLocaleString()} • เปิดใช้ {pk.activated_at ? parseUtc(pk.activated_at).toLocaleDateString("th-TH", { day: "numeric", month: "short", year: "2-digit", timeZone: "Asia/Bangkok" }) : "-"} • {pk.expiry_date ? `${pk.first_use_date ? `เริ่มนับ ${fmtDay(pk.first_use_date)} • ` : ""}หมดอายุ ${fmtDay(pk.expiry_date)}` : (pk.status === "active" ? "ยังไม่เริ่มนับอายุ (เริ่มนับจากวันเล่นครั้งแรกที่จอง)" : "หมดอายุ -")}
+                          </p>
+                          {pk.status === "active" && (
+                            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+                              <span style={{background:"rgba(45,122,79,.12)",color:"#2d7a4f",fontWeight:700,fontSize:12.5,padding:"4px 10px",borderRadius:20}}>คงเหลือ {pk.remaining_credits} / {pk.total_credits}</span>
+                              <span style={{background:"var(--or-bg)",color:"var(--or)",fontWeight:700,fontSize:12.5,padding:"4px 10px",borderRadius:20}}>ตัดไปแล้ว {pk.usedByCredits} ครั้ง</span>
+                              {pk.pendingUnits > 0 && <span style={{background:"rgba(230,126,34,.14)",color:"#c0651a",fontWeight:700,fontSize:12.5,padding:"4px 10px",borderRadius:20}}>จองรอยืนยัน {pk.pendingUnits} ครั้ง (ยังไม่ตัด)</span>}
+                            </div>
+                          )}
+                          {pk.mismatch && <p style={{fontSize:12,color:"#c0392b",fontWeight:600,margin:"0 0 8px",lineHeight:1.6}}>⚠️ จำนวนที่ตัด ({pk.usedByCredits}) ไม่ตรงกับรายการที่ใช้สิทธิ์ที่ยืนยันแล้ว ({pk.usedConfirmed}) — อาจมีการแก้สิทธิ์ด้วยมือ ควรตรวจสอบ</p>}
+                          {(pk.uses || []).length === 0 ? <p style={{fontSize:12.5,color:"var(--mu)",margin:0}}>ยังไม่มีการใช้สิทธิ์</p> : (
+                            <div style={{borderTop:"1px solid var(--dv)"}}>
+                              {pk.uses.map(u => { const [t, c] = histStatus(u); return (
+                                <div key={u.id} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,padding:"9px 2px",borderBottom:"1px solid var(--dv)"}}>
+                                  <div style={{minWidth:0}}>
+                                    <div style={{fontWeight:700,fontSize:13.5,color:"var(--br)"}}>{fmtDay(u.booking_date)} • {fmtRange(u)}</div>
+                                    <div style={{fontSize:11.5,color:"var(--mu)",marginTop:2}}>Court {u.court_id} • จองเมื่อ {bookedAt(u)}</div>
+                                  </div>
+                                  <div style={{textAlign:"right",flexShrink:0}}>
+                                    <div style={{fontSize:12.5,fontWeight:700,color:c}}>{u.status === "confirmed" ? "✅ ตัดสิทธิ์แล้ว" : u.status === "reviewing" ? "🔍 รอยืนยัน" : t}</div>
+                                    <div style={{fontSize:11.5,color:"var(--mu)",marginTop:2}}>{u.status === "confirmed" ? "ตัด " : u.status === "reviewing" ? "จะตัด " : ""}{u.units} ครั้ง{u.status === "reviewing" ? " (ยังไม่ตัด)" : ""}</div>
+                                  </div>
+                                </div>
+                              ); })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+
+                    <p style={{fontWeight:700,color:"var(--br)",fontSize:14,margin:"18px 0 4px"}}>📅 ประวัติการจอง ({bks.length} รายการ)</p>
+                    <p style={{fontSize:12,color:"var(--mu)",margin:"0 0 10px"}}>ยืนยันแล้ว {cnt("confirmed")} • รอยืนยัน {cnt("reviewing")} • ยกเลิก {cnt("cancelled")} • เรียงจากวันที่เล่นล่าสุดก่อน</p>
+                    {bks.length === 0 ? <p style={{fontSize:13,color:"var(--mu)"}}>ยังไม่มีประวัติการจอง</p> : (
+                      <div>
+                        <div style={{borderTop:"1px solid var(--dv)"}}>
+                          {shown.map(b => { const [t, c] = histStatus(b); const units = Math.max(1, Math.round((b.duration_minutes || 60) / 60)); return (
+                            <div key={b.id} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,padding:"9px 2px",borderBottom:"1px solid var(--dv)"}}>
+                              <div style={{minWidth:0}}>
+                                <div style={{fontWeight:700,fontSize:13.5,color:"var(--br)"}}>{fmtDay(b.booking_date)} • {fmtRange(b)}</div>
+                                <div style={{fontSize:11.5,color:"var(--mu)",marginTop:2}}>Court {b.court_id}{b.group_id ? " 🔗 คู่" : ""} • จองเมื่อ {bookedAt(b)}{b.booked_by === "admin" ? " • 📞 แอดมินจอง" : ""}{b.coach_name ? ` • 👤 โค้ช ${b.coach_name}` : ""}</div>
+                              </div>
+                              <div style={{textAlign:"right",flexShrink:0}}>
+                                <div style={{fontSize:12.5,fontWeight:700,color:c}}>{t}</div>
+                                <div style={{fontSize:11.5,color:"var(--mu)",marginTop:2}}>{b.package_id ? `🎟 แพ็คเกจ ${units} ครั้ง` : `฿${(b.price || 0).toLocaleString()}`}{b.discount_code ? ` • 🏷 ${b.discount_code}` : ""}</div>
+                              </div>
+                            </div>
+                          ); })}
+                        </div>
+                        {bks.length > 30 && !histAll && <button onClick={() => setHistAll(true)} style={{marginTop:10,width:"100%",padding:"9px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--br)",fontWeight:700,fontSize:13,cursor:"pointer"}}>แสดงทั้งหมด ({bks.length} รายการ)</button>}
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
