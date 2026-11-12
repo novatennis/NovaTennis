@@ -402,6 +402,17 @@ const graphemeList = (s) => {
 const toFormName = (s) => graphemeList(String(s || "").trim()).slice(0, 20).join("").trim();
 
 // pendingCheckout = ข้อมูลที่ลูกค้าเลือกไว้ (วัน/สนาม/เวลา) เก็บไว้ก่อนเด้งไปหน้า LINE แล้วคืนให้ตอนกลับมา
+// เปิดหน้าล็อกอิน LINE ด้วยการ "คลิกลิงก์" (สร้าง <a> แล้วคลิกในจังหวะที่ลูกค้ากดปุ่ม) แทนการสั่งเปลี่ยนหน้าด้วยสคริปต์
+// เหตุผล: เบราว์เซอร์มือถือ (iOS/Android) จะเปิดแอป LINE ให้อัตโนมัติ (Universal Link / App Link) เฉพาะเมื่อเป็น "ลิงก์ที่ผู้ใช้กด" — ถ้าไม่มีแอปจะได้หน้าล็อกอินด้วยอีเมล/รหัสผ่านของ LINE ตามเดิม
+// หมายเหตุ: ว่าจะเปิดแอปหรือหน้าอีเมล LINE เป็นผู้ตัดสินเองตามเครื่อง/เบราว์เซอร์ของลูกค้า (เบราว์เซอร์ในแอป Facebook/Instagram เปิดแอป LINE ให้ไม่ได้)
+function openLineAuth(url) {
+  try {
+    const a = document.createElement("a");
+    a.href = url; a.rel = "noopener"; a.style.display = "none";
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { try { a.remove(); } catch { /* no-op */ } }, 1000);
+  } catch { window.location.href = url; }
+}
 function startLineLogin(returnTarget = "home", pendingCheckout = null) {
   const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
   try {
@@ -420,7 +431,7 @@ function startLineLogin(returnTarget = "home", pendingCheckout = null) {
     + `&state=${encodeURIComponent(state)}`
     + `&scope=${encodeURIComponent("profile")}`
     + (LINE_BOT_PROMPT ? `&bot_prompt=${LINE_BOT_PROMPT}` : "");
-  window.location.href = url;
+  openLineAuth(url);
 }
 
 // บวก/ลบวันกับวันที่รูปแบบ YYYY-MM-DD (คิดแบบ UTC ไม่ผูกเขตเวลาของเครื่อง) + แสดงวันที่อ่านง่าย — ใช้แสดงอายุแพ็คเกจ (ต้องตรงกับเซิร์ฟเวอร์: วันเล่นวันแรกนับเป็นวันที่ 1)
@@ -567,6 +578,36 @@ function NovaLogo({ width }) {
   return <img src="/nova-logo.png" alt="NOVA Tennis" style={{ width, height: "auto", display: "block", margin: "0 auto" }} />;
 }
 
+// เบราว์เซอร์ในแอป Facebook / Instagram / TikTok เปิดแอป LINE ให้ไม่ได้ ลูกค้าจะเจอหน้าล็อกอินด้วยอีเมลเสมอ → แนะนำให้เปิดใน Chrome/Safari ก่อน (Android มีปุ่มเปิด Chrome ให้, ทุกเครื่องคัดลอกลิงก์ได้)
+function LineInAppNotice({ lang = "th" }) {
+  const th = lang === "th";
+  const [copied, setCopied] = useState(false);
+  if (!isInAppBrowser()) return null;
+  const isAndroid = /Android/i.test(navigator.userAgent || "");
+  const here = window.location.origin + "/";
+  const intent = `intent://${window.location.host}/#Intent;scheme=${window.location.protocol.replace(":", "")};package=com.android.chrome;end`;
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(here); }
+    catch { try { const t = document.createElement("textarea"); t.value = here; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); } catch { /* no-op */ } }
+    setCopied(true); setTimeout(() => setCopied(false), 2500);
+  };
+  const btn = { display: "block", width: "100%", textAlign: "center", padding: "10px 12px", borderRadius: 10, border: "1.5px solid #E0A800", background: "#fff", color: "#6b4a00", fontWeight: 800, fontSize: 13.5, textDecoration: "none", cursor: "pointer", fontFamily: "'Noto Sans Thai',sans-serif" };
+  return (
+    <div data-testid="gate-inapp" style={{marginTop:12,textAlign:"left",background:"rgba(255,213,74,.28)",borderRadius:12,padding:"12px 14px"}}>
+      <p style={{fontSize:13,fontWeight:800,color:"#6b4a00"}}>💡 {th ? "คุณเปิดจากแอป Facebook / Instagram" : "You opened this from Facebook / Instagram"}</p>
+      <p style={{fontSize:12,color:"#6b4a00",lineHeight:1.65,marginTop:4}}>
+        {th ? "แอปเหล่านี้เปิดแอป LINE ให้ไม่ได้ คุณจะเห็นหน้าเข้าสู่ระบบด้วยอีเมล/รหัสผ่านแทน — ให้เปิดหน้านี้ใน Chrome / Safari ก่อน แล้วกดเข้าสู่ระบบด้วย LINE อีกครั้ง" : "These apps can't open the LINE app, so you'd get the email/password sign-in instead. Open this page in Chrome / Safari first, then tap sign in with LINE again."}
+      </p>
+      <div style={{display:"flex",flexDirection:"column",gap:8,marginTop:10}}>
+        {isAndroid
+          ? <a href={intent} data-testid="gate-open-chrome" style={btn}>🌐 {th ? "เปิดใน Chrome" : "Open in Chrome"}</a>
+          : <p data-testid="gate-ios-steps" style={{fontSize:12,color:"#6b4a00",lineHeight:1.65}}>{th ? "กด ⋯ (หรือไอคอนแชร์) ที่มุมจอ แล้วเลือก “เปิดใน Safari”" : "Tap ⋯ (or the share icon) in the corner and choose “Open in Safari”."}</p>}
+        <button onClick={copy} data-testid="gate-copy-link" style={btn}>{copied ? (th ? "✓ คัดลอกลิงก์แล้ว" : "✓ Link copied") : (th ? "📋 คัดลอกลิงก์เว็บ" : "📋 Copy website link")}</button>
+      </div>
+    </div>
+  );
+}
+
 // ปุ่มขอความช่วยเหลือ: ทักแอดมินทาง LINE OA (เปิดหน้าเพิ่มเพื่อน/แชท) + โทรหาแอดมิน — ใช้ในหน้าล็อกอินและหน้าข้อผิดพลาด
 function LineHelpLinks({ lang = "th" }) {
   const th = lang === "th";
@@ -616,6 +657,10 @@ function LineLoginGate({ lang="th", setLang, onLogin, compact=false }) {
         <span style={{background:"#fff",color:"#06C755",fontWeight:900,fontSize:11,padding:"3px 7px",borderRadius:6}}>LINE</span>
         {lang==="th" ? "เข้าสู่ระบบด้วย LINE" : "Sign in with LINE"}
       </button>
+      <p data-testid="gate-expect" style={{fontSize:11.5,color:"var(--mu)",marginTop:10,lineHeight:1.6}}>
+        {lang==="th" ? "ถ้ามีแอป LINE ในเครื่อง ระบบจะพยายามเปิดแอป LINE ให้กดยืนยันก่อน • ถ้าไม่มีแอป จะเป็นหน้าเข้าสู่ระบบด้วยอีเมล/รหัสผ่านของ LINE" : "If you have the LINE app, we'll try to open it for you to confirm. If not, you'll see LINE's email/password sign-in page."}
+      </p>
+      <LineInAppNotice lang={lang} />
       {(LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && (
         <p style={{fontSize:12,color:"var(--br)",marginTop:14,lineHeight:1.6,background:"var(--or-bg)",borderRadius:10,padding:"8px 10px"}}>
           {lang==="th" ? "ระหว่างล็อกอิน LINE จะชวนให้เพิ่มเพื่อน LINE OA ของร้าน — ต้องเพิ่มเพื่อนด้วยจึงจะจองได้" : "During sign-in, LINE will ask you to add our LINE OA — adding it is required to book."}
