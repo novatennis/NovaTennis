@@ -405,10 +405,20 @@ const toFormName = (s) => graphemeList(String(s || "").trim()).slice(0, 20).join
 // เปิดหน้าล็อกอิน LINE ด้วยการ "คลิกลิงก์" (สร้าง <a> แล้วคลิกในจังหวะที่ลูกค้ากดปุ่ม) แทนการสั่งเปลี่ยนหน้าด้วยสคริปต์
 // เหตุผล: เบราว์เซอร์มือถือ (iOS/Android) จะเปิดแอป LINE ให้อัตโนมัติ (Universal Link / App Link) เฉพาะเมื่อเป็น "ลิงก์ที่ผู้ใช้กด" — ถ้าไม่มีแอปจะได้หน้าล็อกอินด้วยอีเมล/รหัสผ่านของ LINE ตามเดิม
 // หมายเหตุ: ว่าจะเปิดแอปหรือหน้าอีเมล LINE เป็นผู้ตัดสินเองตามเครื่อง/เบราว์เซอร์ของลูกค้า (เบราว์เซอร์ในแอป Facebook/Instagram เปิดแอป LINE ให้ไม่ได้)
+// Android: ใช้ลิงก์แบบ intent:// ระบุแอป LINE (jp.naver.line.android) → ถ้ามีแอปจะเปิดแอปให้ยืนยันทันที / ถ้าไม่มีแอป Chrome จะพาไปที่ S.browser_fallback_url (หน้าล็อกอินเว็บด้วยอีเมล/รหัสผ่าน) เอง
+// ถ้าเปิดอยู่ในเบราว์เซอร์ของแอป LINE เอง (UA มี "Line/") หรือเป็น iOS/คอมพิวเตอร์ → ใช้ลิงก์ https ปกติ (iOS ใช้ Universal Link)
+const lineAppTarget = (url) => {
+  try {
+    const ua = navigator.userAgent || "";
+    if (!/Android/i.test(ua) || /\bLine\//i.test(ua)) return url;
+    const u = new URL(url);
+    return `intent://${u.host}${u.pathname}${u.search}#Intent;scheme=https;package=jp.naver.line.android;S.browser_fallback_url=${encodeURIComponent(url)};end`;
+  } catch { return url; }
+};
 function openLineAuth(url) {
   try {
     const a = document.createElement("a");
-    a.href = url; a.rel = "noopener"; a.style.display = "none";
+    a.href = lineAppTarget(url); a.rel = "noopener"; a.style.display = "none";
     document.body.appendChild(a); a.click();
     setTimeout(() => { try { a.remove(); } catch { /* no-op */ } }, 1000);
   } catch { window.location.href = url; }
@@ -647,25 +657,11 @@ function LineLoginGate({ lang="th", setLang, onLogin, compact=false }) {
   const body = (
     <div style={{width:"100%",maxWidth:380,background:"#fff",borderRadius:18,padding:"26px 22px",boxShadow:"0 10px 40px rgba(102,57,36,.15)",border:"1px solid var(--dv)",textAlign:"center"}}>
       {!compact && <NovaLogo width={130} />}
-      <p style={{fontSize:18,fontWeight:800,color:"var(--br)",marginTop:compact?0:18}}>{lang==="th" ? "เข้าสู่ระบบด้วย LINE" : "Sign in with LINE"}</p>
-      <p style={{fontSize:13,color:"var(--mu)",lineHeight:1.7,marginTop:8}}>
-        {lang==="th"
-          ? "เพื่อเริ่มใช้งานระบบจอง NOVA Tennis กรุณาเข้าสู่ระบบด้วยบัญชี LINE ของคุณ ระบบจะกรอกชื่อ-เบอร์ให้อัตโนมัติ และดูการจอง/แพ็คเกจของคุณได้ทันที"
-          : "Please sign in with your LINE account to use NOVA Tennis booking. Your name and phone will be filled in automatically, and you can see your bookings and packages instantly."}
-      </p>
-      <button onClick={onLogin} style={{width:"100%",marginTop:18,padding:"14px",borderRadius:12,border:"none",background:"#06C755",color:"#fff",fontWeight:800,fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:10,fontFamily:"'Noto Sans Thai',sans-serif",boxShadow:"0 4px 14px rgba(6,199,85,.35)"}}>
+      <button onClick={onLogin} style={{width:"100%",marginTop:compact?0:22,padding:"15px",borderRadius:12,border:"none",background:"#06C755",color:"#fff",fontWeight:800,fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:10,fontFamily:"'Noto Sans Thai',sans-serif",boxShadow:"0 4px 14px rgba(6,199,85,.35)"}}>
         <span style={{background:"#fff",color:"#06C755",fontWeight:900,fontSize:11,padding:"3px 7px",borderRadius:6}}>LINE</span>
         {lang==="th" ? "เข้าสู่ระบบด้วย LINE" : "Sign in with LINE"}
       </button>
-      <p data-testid="gate-expect" style={{fontSize:11.5,color:"var(--mu)",marginTop:10,lineHeight:1.6}}>
-        {lang==="th" ? "ถ้ามีแอป LINE ในเครื่อง ระบบจะพยายามเปิดแอป LINE ให้กดยืนยันก่อน • ถ้าไม่มีแอป จะเป็นหน้าเข้าสู่ระบบด้วยอีเมล/รหัสผ่านของ LINE" : "If you have the LINE app, we'll try to open it for you to confirm. If not, you'll see LINE's email/password sign-in page."}
-      </p>
       <LineInAppNotice lang={lang} />
-      {(LINE_GATE_MODE === "gate" || LINE_GATE_MODE === "booking") && (
-        <p style={{fontSize:12,color:"var(--br)",marginTop:14,lineHeight:1.6,background:"var(--or-bg)",borderRadius:10,padding:"8px 10px"}}>
-          {lang==="th" ? "ระหว่างล็อกอิน LINE จะชวนให้เพิ่มเพื่อน LINE OA ของร้าน — ต้องเพิ่มเพื่อนด้วยจึงจะจองได้" : "During sign-in, LINE will ask you to add our LINE OA — adding it is required to book."}
-        </p>
-      )}
       <div style={{marginTop:16,display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
         <p style={{fontSize:12.5,fontWeight:700,color:"var(--br)"}}>{lang==="th" ? "ไม่มี LINE หรือเข้าสู่ระบบไม่ได้? ให้แอดมินช่วยจองได้" : "No LINE, or can't sign in? Our admin can book for you."}</p>
         <LineHelpLinks lang={lang} />
