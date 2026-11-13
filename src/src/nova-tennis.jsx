@@ -59,6 +59,11 @@ const LINE_ERR_TEXT = (() => {
   };
 })();
 
+// ข้อความเมื่อเซิร์ฟเวอร์ปฏิเสธโค้ดส่วนลดตอนสร้างการจอง (reason: expired/used/invalid/no_effect)
+const discountInvalidMsg = (reason, lang) => reason === "no_effect"
+  ? (lang==="th" ? "โค้ดนี้ใช้กับรายการจองนี้ไม่ได้ (ราคาปกติต่ำกว่าหรือเท่ากับราคาของโค้ดอยู่แล้ว) กรุณาตรวจสอบโค้ดอีกครั้ง" : "This code can't be used for this booking (the regular price is already at or below the code's price).")
+  : (lang==="th" ? "โค้ดส่วนลดนี้ใช้ไม่ได้แล้ว (หมดอายุหรือถูกใช้ไปแล้ว) กรุณากลับไปตรวจสอบโค้ดอีกครั้ง" : "This discount code can no longer be used (expired or already used).");
+
 const db = {
   // ดึงเวลาที่ถูกจองแล้ว ผ่านเซิร์ฟเวอร์ (ไม่เปิดตารางให้เบราว์เซอร์อ่านตรง)
   async getBookings(date, courtId) {
@@ -72,10 +77,10 @@ const db = {
   },
   // สร้างการจอง — เซิร์ฟเวอร์เป็นคนคำนวณราคาสุดท้ายเองทั้งหมด (กันการแก้ไขราคาจากฝั่ง client)
   async createBooking({ courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId }) {
-    const { booking, error } = await callBookingAction("createBooking", {
+    const { booking, error, reason } = await callBookingAction("createBooking", {
       courtId, customerId, customerName, bookingDate, hour, startMinute, durationMinutes, discountCodeId,
     });
-    if (error) return { error };
+    if (error) return { error, reason };
     return { booking };
   },
   async createBookingMulti({ courtIds, customerId, customerName, bookingDate, hour, startMinute, durationMinutes }) {
@@ -1470,6 +1475,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
   const basePrice = (firstTimeEligible) ? Math.min(slot.price, firstTimePrice) : slot.price;
   const calcDiscount = (d) => {
     if (!d) return 0;
+    if (d.fixed_price != null) return Math.max(0, basePrice - d.fixed_price);   // โค้ด "ราคาสุดท้าย": เหลือเท่าที่ตั้ง (ไม่ทำให้แพงขึ้น)
     if (d.discount_amount > 0) return d.discount_amount;
     return Math.round(basePrice * d.discount_percent / 100);
   };
@@ -1482,9 +1488,15 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
     setDiscountMsg("");
     const result = await db.checkDiscount(discountCode.trim());
     if (result && !result.error) {
+      const isFixed = result.fixed_price != null;
+      if (isFixed && slot.price <= result.fixed_price) { // โค้ดราคาสุดท้ายไม่ทำให้แพงขึ้น: ถ้าราคาปกติของรายการนี้ต่ำกว่า/เท่ากับอยู่แล้ว → ไม่ใช้โค้ดนี้
+        setDiscount(null);
+        setDiscountMsg(lang==="th" ? `โค้ดนี้ใช้กับรายการนี้ไม่ได้ — ราคาปกติ ฿${slot.price.toLocaleString()} ต่ำกว่าหรือเท่ากับราคาของโค้ด (฿${result.fixed_price.toLocaleString()}) อยู่แล้ว` : `This code can't be used here — the regular price (฿${slot.price.toLocaleString()}) is already at or below the code's price (฿${result.fixed_price.toLocaleString()}).`);
+        setCheckingCode(false); return;
+      }
       setDiscount(result);
-      const saved = result.discount_amount > 0 ? result.discount_amount : Math.round(slot.price * result.discount_percent / 100);
-      const label = result.discount_amount > 0
+      const saved = isFixed ? slot.price - result.fixed_price : (result.discount_amount > 0 ? result.discount_amount : Math.round(slot.price * result.discount_percent / 100));
+      const label = isFixed ? (lang==="th" ? `ราคาพิเศษ เหลือ ฿${result.fixed_price.toLocaleString()}` : `Special price ฿${result.fixed_price.toLocaleString()}`) : result.discount_amount > 0
         ? (lang==="th" ? `ส่วนลด ฿${result.discount_amount}` : `฿${result.discount_amount} off`)
         : (lang==="th" ? `ส่วนลด ${result.discount_percent}%` : `${result.discount_percent}% off`);
       const expTxt = result.expires_at ? (lang==="th" ? ` • ใช้ได้ถึง ${new Date(result.expires_at+"T00:00:00").toLocaleDateString("th-TH",{day:"numeric",month:"short",year:"numeric"})}` : ` • valid until ${new Date(result.expires_at+"T00:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`) : "";
@@ -1682,10 +1694,10 @@ function PaymentPage({ booking, customer, onDone, lang="th", resumeBooking, onCr
             durationMinutes: slot.durationMinutes || 60,
             discountCodeId: discount?.id || null,
           });
-      const { booking: b, error } = result;
+      const { booking: b, error, reason } = result;
       if (error) {
         // บัญชี/เบอร์มีปัญหา → บอกสาเหตุ / นอกนั้นคือช่วงเวลาเพิ่งถูกจองไปโดยคนอื่น (แข่งกันจองพร้อมกัน)
-        alert(error === "discount_invalid" ? (lang==="th" ? "โค้ดส่วนลดนี้ใช้ไม่ได้แล้ว (หมดอายุหรือถูกใช้ไปแล้ว) กรุณากลับไปตรวจสอบโค้ดอีกครั้ง" : "This discount code can no longer be used (expired or already used).")
+        alert(error === "discount_invalid" ? discountInvalidMsg(reason, lang)
           : (accountErrMsg(error, lang) || (lang==="th" ? "ขออภัย ช่วงเวลานี้เพิ่งถูกจองไปแล้ว กรุณาเลือกช่วงเวลาใหม่" : "Sorry, this time slot was just booked. Please choose another time.")));
         onDone(customer.phone);
         return;
@@ -2798,9 +2810,31 @@ function CancelPage({ lang="th", initialPhone="", lockedPhone="" }) {
   );
 }
 
+// ─── ลิงก์ลัดไปหน้าที่ต้องการ ──────────────────────────────────────────────────────
+// https://nova-tennis.vercel.app/?tab=coach     → เรียนโค้ช
+// https://nova-tennis.vercel.app/?tab=package   → แพ็คเกจ (ช่วงโปร 11.11 เลื่อนลงไปที่รายการโปรให้เอง)
+// https://nova-tennis.vercel.app/?tab=book      → จองสนาม   |   ?tab=cancel → การจองของฉัน   |   ?tab=home → หน้าแรก
+// แบบสั้น /coach /package /book /mybookings ก็ใช้ได้ (ถ้า Vercel ส่งทุกเส้นทางมาที่แอป เหมือนที่ /line-callback ใช้อยู่) — อ่านตอนเปิดเว็บครั้งเดียวแล้วล้างออกจาก URL (utm_* ยังอยู่)
+// ลูกค้าที่ยังไม่ล็อกอินจะเจอหน้าล็อกอิน LINE ก่อน แล้วกลับมาที่หน้านั้นเอง (ระบบจำหน้าที่กดมาไว้อยู่แล้ว)
+const DEEPLINK_TABS = { home: "home", book: "book", booking: "book", court: "book", package: "package", packages: "package", pkg: "package", coach: "coach", coaching: "coach", cancel: "cancel", mybookings: "cancel", "my-bookings": "cancel" };
+const DEEPLINK_PATHS = { "/coach": "coach", "/coaching": "coach", "/package": "package", "/packages": "package", "/book": "book", "/mybookings": "cancel" };
+const deepPick = (map, key) => (Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null); // ค้นเฉพาะชื่อที่เรากำหนด (กัน ?tab=constructor / __proto__ หยิบค่าภายในของ JS มาใช้)
+function readDeepLinkTab() {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const byQuery = deepPick(DEEPLINK_TABS, String(q.get("tab") || "").toLowerCase().trim());
+    const byPath = deepPick(DEEPLINK_PATHS, window.location.pathname.replace(/\/$/, "").toLowerCase());
+    return byQuery || byPath || null;
+  } catch { return null; }
+}
+
 // ─── App V2 with Cancel Tab + Admin ──────────────────────────────────────────
 export default function AppV2() {
-  const [tab, setTab] = useState("home");
+  const [tab, setTab] = useState(() => {
+    const t = readDeepLinkTab() || "home";
+    if (t === "package") { try { window.__promoScroll = true; } catch { /* no-op */ } }   // ลิงก์ไปหน้าแพ็คเกจ: ช่วงโปรให้เลื่อนไปที่รายการโปรเหมือนกดจากแบนเนอร์
+    return t;
+  });
   const [page, setPage] = useState("booking");
   const [booking, setBooking] = useState(null);
   const [customer, setCustomer] = useState(null);
@@ -2902,6 +2936,15 @@ export default function AppV2() {
     let isAdminPath = false;
     try { isAdminPath = window.location.pathname.replace(/\/$/, "") === "/admin"; } catch { /* no-op */ }
     if (!isAdminPath) initMetaPixel();
+  }, []);
+  useEffect(() => { // ลิงก์ลัดใช้แล้วล้างทิ้ง กันรีเฟรชแล้วเด้งกลับหน้าเดิมทั้งที่ลูกค้าเปลี่ยนแท็บไปแล้ว (utm_* ยังอยู่ — captureUtm เก็บไปแล้ว)
+    try {
+      const url = new URL(window.location.href);
+      let changed = false;
+      if (url.searchParams.has("tab")) { url.searchParams.delete("tab"); changed = true; }
+      if (deepPick(DEEPLINK_PATHS, url.pathname.replace(/\/$/, "").toLowerCase())) { url.pathname = "/"; changed = true; }
+      if (changed) window.history.replaceState(null, "", url.toString());
+    } catch { /* no-op */ }
   }, []);
   useEffect(() => {
     if (tab === "book" || tab === "package" || tab === "coach") trackFb("ViewContent", { content_name: tab === "book" ? "booking" : tab === "coach" ? "coach" : "packages" });
@@ -3016,13 +3059,13 @@ export default function AppV2() {
     if (!booking || pkgBookingBusy) return;
     setPkgBookingBusy(true);
     const { slot, court, date } = booking;
-    const { booking: b, error } = await db.createBooking({
+    const { booking: b, error, reason } = await db.createBooking({
       courtId: court.courtId, customerId: phone, customerName: name, bookingDate: toIso(date),
       hour: slot.hour, startMinute: slot.startMinute, durationMinutes: slot.durationMinutes, discountCodeId: discount.id,
     });
     setPkgBookingBusy(false);
     if (error || !b) {
-      alert(error === "discount_invalid" ? (lang==="th" ? "โค้ดส่วนลดนี้ใช้ไม่ได้แล้ว (หมดอายุหรือถูกใช้ไปแล้ว) กรุณาตรวจสอบโค้ด" : "This discount code can no longer be used (expired or already used).")
+      alert(error === "discount_invalid" ? discountInvalidMsg(reason, lang)
         : error === "slot_taken" ? (lang==="th" ? "ช่วงเวลานี้เพิ่งถูกจองไปก่อนหน้าแล้ว กรุณาเลือกช่วงเวลาใหม่" : "This slot was just booked by someone else. Please choose another time.")
         : (accountErrMsg(error, lang) || (lang==="th" ? "จองไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" : "Booking failed, please try again")));
       return;
@@ -3285,9 +3328,11 @@ async function drawCouponImage(cv, o) {
   const pill = "คูปองส่วนลด"; ctx.font = `800 26px ${CP_FONT}`; const pw = ctx.measureText(pill).width + 40;
   cpRound(ctx, 86 + lw + 28, 92, pw, 42, 21); ctx.fillStyle = cpHexA(T.accent, .13); ctx.fill();
   ctx.fillStyle = T.accent; ctx.fillText(pill, 86 + lw + 48, 122);
-  ctx.fillStyle = T.ink; ctx.font = `800 30px ${CP_FONT}`; ctx.fillText("ส่วนลดค่าสนามเทนนิส", 90, 196);
-  const isPct = !!o.percent;
-  const amt = String(Math.max(0, Math.round(+(isPct ? o.percent : o.amount) || 0)));
+  const isFixed = o.fixedPrice !== null && o.fixedPrice !== undefined && o.fixedPrice !== "";   // โค้ดแบบ "กำหนดราคาสุดท้าย" → รูปเขียนว่า "ราคาพิเศษ จ่ายเพียง ฿…"
+  const title = isFixed ? "ราคาพิเศษค่าสนามเทนนิส จ่ายเพียง" : "ส่วนลดค่าสนามเทนนิส";
+  const tPx = cpFit(ctx, title, 690, 30, "800", CP_FONT); ctx.fillStyle = T.ink; ctx.font = `800 ${tPx}px ${CP_FONT}`; ctx.fillText(title, 90, 196);
+  const isPct = !isFixed && !!o.percent;
+  const amt = String(Math.max(0, Math.round(+(isPct ? o.percent : isFixed ? o.fixedPrice : o.amount) || 0)));
   if (isPct) {
     ctx.font = `900 84px ${CP_FONT}`; const sw = ctx.measureText("%").width;
     const aPx = cpFit(ctx, amt, 470 - sw, 214, "900", CP_FONT);
@@ -3310,7 +3355,7 @@ async function drawCouponImage(cv, o) {
 
   // ── แถบโค้ดด้านขวา ──
   const cx = SX + (X0 + TW - SX) / 2; ctx.textAlign = "center"; ctx.fillStyle = "#fff";
-  ctx.font = `800 28px ${CP_FONT}`; ctx.fillText("โค้ดส่วนลดของคุณ", cx, 128);
+  ctx.font = `800 28px ${CP_FONT}`; ctx.fillText(isFixed ? "โค้ดราคาพิเศษของคุณ" : "โค้ดส่วนลดของคุณ", cx, 128);
   const bx = cx - 150, by = 152, bW = 300, bH = 112;
   cpRound(ctx, bx, by, bW, bH, 18); ctx.fillStyle = "#fff"; ctx.fill();
   ctx.save(); ctx.strokeStyle = cpHexA(T.ink, .5); ctx.lineWidth = 3; ctx.setLineDash([9, 8]); cpRound(ctx, bx + 9, by + 9, bW - 18, bH - 18, 12); ctx.stroke(); ctx.restore();
@@ -3324,17 +3369,17 @@ async function drawCouponImage(cv, o) {
   const label = ed || "ไม่มีวันหมดอายุ"; const ep = cpFit(ctx, label, 290, ed ? 50 : 40, "900", CP_FONT); ctx.fillStyle = "#fff"; ctx.font = `900 ${ep}px ${CP_FONT}`; ctx.fillText(label, cx, 380 + 56);
   ctx.fillStyle = "rgba(255,255,255,.95)"; ctx.font = `800 23px ${CP_FONT}`; ctx.fillText("nova-tennis.vercel.app", cx, 530);
   ctx.fillStyle = "rgba(255,255,255,.8)"; ctx.font = `600 21px ${CP_FONT}`; ctx.fillText("LINE @347mlhra", cx, 500);
-  cv.dataset.coupon = JSON.stringify({ code, amount: isPct ? null : +amt, percent: isPct ? +amt : null, expiry: o.expiry || "", theme: o.theme || "orange", hint: o.hint || "", uses, logo: !!logo });
+  cv.dataset.coupon = JSON.stringify({ code, amount: (isPct || isFixed) ? null : +amt, percent: isPct ? +amt : null, fixedPrice: isFixed ? +amt : null, expiry: o.expiry || "", theme: o.theme || "orange", hint: o.hint || "", uses, logo: !!logo });
 }
-function CouponImage({ code, amount, percent, expiry, theme = "orange", hint = "", maxUses = 1, showActions = false }) {
+function CouponImage({ code, amount, percent, fixedPrice = null, expiry, theme = "orange", hint = "", maxUses = 1, showActions = false }) {
   const ref = useRef(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     let alive = true;
     setFailed(false);
-    drawCouponImage(ref.current, { code, amount, percent, expiry, theme, hint, maxUses }).catch(() => { if (alive) setFailed(true); });
+    drawCouponImage(ref.current, { code, amount, percent, fixedPrice, expiry, theme, hint, maxUses }).catch(() => { if (alive) setFailed(true); });
     return () => { alive = false; };
-  }, [code, amount, percent, expiry, theme, hint, maxUses]);
+  }, [code, amount, percent, fixedPrice, expiry, theme, hint, maxUses]);
   const fileName = `NOVA-coupon-${String(code || "code").toUpperCase()}.png`;
   const toBlob = () => new Promise((resolve) => { try { ref.current.toBlob(b => resolve(b), "image/png"); } catch { resolve(null); } });
   const download = async () => {
@@ -3382,6 +3427,8 @@ function AdminDashboard({ token, onLogout }) {
   const [date, setDate] = useState(toIso(new Date()));
   const [newCode, setNewCode] = useState("");
   const [newAmt, setNewAmt] = useState("50");
+  const [newMode, setNewMode] = useState("amount");   // "amount" = ลดเป็นจำนวนเงิน (หักออก) / "fixed" = กำหนดราคาสุดท้าย (เหลือเท่านี้)
+  const [newFixed, setNewFixed] = useState("300");
   const [newMax, setNewMax] = useState("1");
   const [newExp, setNewExp] = useState(""); // วันหมดอายุ (เว้นว่าง = ไม่หมดอายุ)
   // รูปคูปองส่วนลด: สี / ข้อความอธิบายมูลค่า (เติมให้อัตโนมัติสำหรับ ฿490 / ฿590 จนกว่าแอดมินจะแก้เอง) / คูปองที่เพิ่งสร้าง / คูปองที่เปิดดูจากตาราง
@@ -3942,11 +3989,23 @@ function AdminDashboard({ token, onLogout }) {
     setQueue(prev => prev.filter(b => b.id !== id));
   };
 
+  const FIXED_HINT = "ไม่ว่าราคาปกติเท่าไร จ่ายเพียงเท่านี้ต่อการจอง";
+  const switchMode = (k) => { setNewMode(k); if (!cpHintTouched) setCpHint(k === "fixed" ? FIXED_HINT : (CP_PRESET_HINTS[+newAmt] || "")); };
   const createCode = async () => {
     if (!newCode.trim()) return;
-    const r = await callAdminAction("createDiscount", token, { code: newCode, amount: newAmt, maxUses: newMax, expiresAt: newExp || null });
-    if (!r?.ok) { alert(r?.error === "invalid_date" ? "รูปแบบวันหมดอายุไม่ถูกต้อง" : "สร้างโค้ดไม่สำเร็จ (ถ้าตั้งวันหมดอายุ ต้องรัน SQL เพิ่มคอลัมน์ expires_at ที่ Supabase ก่อน)"); return; }
-    setCpCreated({ code: newCode.trim().toUpperCase(), amount: Number(newAmt) || 0, expiry: newExp || "", maxUses: Number(newMax) || 1, theme: cpTheme, hint: cpHint });
+    const fixed = newMode === "fixed";
+    const r = await callAdminAction("createDiscount", token, fixed
+      ? { code: newCode, mode: "fixed_price", fixedPrice: Number(newFixed), maxUses: newMax, expiresAt: newExp || null }
+      : { code: newCode, amount: newAmt, maxUses: newMax, expiresAt: newExp || null });
+    if (!r?.ok) {
+      alert(r?.error === "invalid_date" ? "รูปแบบวันหมดอายุไม่ถูกต้อง"
+        : r?.error === "invalid_fixed_price" ? "ราคาสุดท้ายต้องเป็นจำนวนเต็มตั้งแต่ 1 ถึง 50,000 บาท"
+        : r?.error === "invalid_max_uses" ? "จำนวนครั้งที่ใช้ได้ต้องเป็นจำนวนเต็มตั้งแต่ 1 ขึ้นไป"
+        : r?.error === "fixed_price_column_missing" ? "ยังไม่ได้รัน SQL — ให้รันไฟล์ add-discount-fixed-price-column.sql ที่ Supabase (SQL Editor) ก่อน แล้วสร้างใหม่อีกครั้ง"
+        : "สร้างโค้ดไม่สำเร็จ (ถ้าตั้งวันหมดอายุ ต้องรัน SQL เพิ่มคอลัมน์ expires_at ที่ Supabase ก่อน)");
+      return;
+    }
+    setCpCreated({ code: newCode.trim().toUpperCase(), amount: fixed ? 0 : (Number(newAmt) || 0), fixedPrice: fixed ? Number(newFixed) : null, expiry: newExp || "", maxUses: Number(newMax) || 1, theme: cpTheme, hint: cpHint });
     setNewCode(""); loadDiscounts();
     setTimeout(() => document.getElementById("cp-created")?.scrollIntoView({ behavior: "smooth", block: "center" }), 150);
   };
@@ -4858,10 +4917,20 @@ function AdminDashboard({ token, onLogout }) {
                     style={{padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
                   <button onClick={genCode} style={{padding:"0 14px",borderRadius:8,border:"1.5px solid var(--dv)",background:"#fff",color:"var(--mu)",fontSize:13,cursor:"pointer"}}>🎲 สุ่ม</button>
                 </div>
+                <div style={{marginBottom:12}}>
+                  <div style={{display:"flex",gap:8}}>
+                    {[["amount","💰 ลดเป็นจำนวนเงิน"],["fixed","🎯 กำหนดราคาสุดท้าย"]].map(([k, label]) => (
+                      <button key={k} data-testid={`cp-mode-${k}`} onClick={() => switchMode(k)} style={{flex:1,padding:"9px 6px",borderRadius:10,border:`2px solid ${newMode===k?"var(--or)":"var(--dv)"}`,background:newMode===k?"var(--or-bg)":"#fff",color:newMode===k?"var(--or)":"var(--mu)",fontWeight:800,fontSize:13,cursor:"pointer",fontFamily:"'Noto Sans Thai',sans-serif"}}>{label}</button>
+                    ))}
+                  </div>
+                  <p data-testid="cp-mode-note" style={{fontSize:11.5,color:"var(--mu)",marginTop:6,lineHeight:1.6}}>
+                    {newMode==="fixed" ? "ลูกค้าใส่โค้ดนี้แล้วจ่ายเท่ากับราคาที่ตั้ง ไม่ว่าราคาปกติเท่าไร (เช่น ตั้ง ฿300 → ฿490 ก็จ่าย ฿300, ฿980 ก็จ่าย ฿300) — ถ้าราคาปกติต่ำกว่าหรือเท่ากับอยู่แล้ว โค้ดจะไม่ทำให้แพงขึ้นและไม่ถูกตัดสิทธิ์" : "หักออกจากราคาปกติเป็นจำนวนเงินที่ตั้ง (เช่น ตั้ง ฿100 → ฿490 เหลือ ฿390)"}
+                  </p>
+                </div>
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
                   <div>
-                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>ส่วนลด (บาท)</label>
-                    <input type="number" value={newAmt} onChange={e=>{ setNewAmt(e.target.value); if (!cpHintTouched) setCpHint(CP_PRESET_HINTS[+e.target.value] || ""); }} min="1"
+                    <label style={{fontSize:12,color:"var(--mu)",display:"block",marginBottom:5}}>{newMode==="fixed" ? "ราคาสุดท้ายที่ลูกค้าจ่าย (บาท)" : "ส่วนลด (บาท)"}</label>
+                    <input type="number" data-testid="cp-amount" value={newMode==="fixed" ? newFixed : newAmt} onChange={e=>{ if (newMode==="fixed") setNewFixed(e.target.value); else { setNewAmt(e.target.value); if (!cpHintTouched) setCpHint(CP_PRESET_HINTS[+e.target.value] || ""); } }} min="1"
                       style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1.5px solid var(--dv)",fontSize:14,outline:"none"}} />
                   </div>
                   <div>
@@ -4877,7 +4946,7 @@ function AdminDashboard({ token, onLogout }) {
                 </div>
                 <div style={{marginBottom:14}}>
                   <p style={{fontSize:12.5,fontWeight:700,color:"var(--br)",marginBottom:8}}>🎟 รูปคูปอง (ตัวอย่างเปลี่ยนตามที่กรอก — ได้รูปพร้อมส่งหลังกด "สร้างรหัส")</p>
-                  <CouponImage code={newCode || "XXXXXXXX"} amount={Number(newAmt) || 0} expiry={newExp} theme={cpTheme} hint={cpHint} maxUses={Number(newMax) || 1} />
+                  <CouponImage code={newCode || "XXXXXXXX"} amount={newMode==="fixed" ? 0 : (Number(newAmt) || 0)} fixedPrice={newMode==="fixed" ? (Number(newFixed) || 0) : null} expiry={newExp} theme={cpTheme} hint={cpHint} maxUses={Number(newMax) || 1} />
                   <div style={{display:"flex",gap:8,margin:"12px 0 10px",flexWrap:"wrap",alignItems:"center"}}>
                     <span style={{fontSize:12,color:"var(--mu)"}}>สีคูปอง:</span>
                     {Object.entries(CP_THEMES).map(([k, t]) => (
@@ -4898,7 +4967,7 @@ function AdminDashboard({ token, onLogout }) {
                     <p style={{fontWeight:800,color:"#1b5e3c",fontSize:14.5,lineHeight:1.6,margin:0}}>✅ สร้างรหัส <span style={{fontFamily:"monospace"}}>{cpCreated.code}</span> แล้ว — รูปคูปองพร้อมส่งให้ลูกค้า</p>
                     <button onClick={() => setCpCreated(null)} aria-label="ปิด" style={{border:"none",background:"transparent",fontSize:18,cursor:"pointer",color:"var(--mu)"}}>✕</button>
                   </div>
-                  <CouponImage code={cpCreated.code} amount={cpCreated.amount} expiry={cpCreated.expiry} theme={cpCreated.theme} hint={cpCreated.hint} maxUses={cpCreated.maxUses} showActions />
+                  <CouponImage code={cpCreated.code} amount={cpCreated.amount} fixedPrice={cpCreated.fixedPrice} expiry={cpCreated.expiry} theme={cpCreated.theme} hint={cpCreated.hint} maxUses={cpCreated.maxUses} showActions />
                 </div>
               )}
               <div style={{background:"#fff",borderRadius:12,border:"1px solid var(--dv)",overflow:"auto",boxShadow:"var(--sh)"}}>
@@ -4908,7 +4977,7 @@ function AdminDashboard({ token, onLogout }) {
                     {discounts.map(c => (
                       <tr key={c.id}>
                         <td style={{fontWeight:700,fontFamily:"monospace"}}>{c.code}</td>
-                        <td style={{fontWeight:700,color:"var(--or)"}}>฿{c.discount_amount||`${c.discount_percent}%`}</td>
+                        <td style={{fontWeight:700,color:"var(--or)"}}>{c.fixed_price != null ? <span data-testid={`fixed-${c.code}`}>🎯 เหลือ ฿{Number(c.fixed_price).toLocaleString()}</span> : <>฿{c.discount_amount||`${c.discount_percent}%`}</>}</td>
                         <td>{c.used_count}/{c.max_uses}</td>
                         <td style={{fontSize:12}}>{c.expires_at ? new Date(c.expires_at+"T00:00:00").toLocaleDateString("th-TH",{day:"numeric",month:"short",year:"2-digit"}) : "ไม่หมดอายุ"}</td>
                         <td>{(() => {
@@ -5091,7 +5160,7 @@ function AdminDashboard({ token, onLogout }) {
               <button onClick={() => setCpView(null)} aria-label="ปิด" style={{border:"none",background:"rgba(255,255,255,.18)",color:"#fff",width:34,height:34,borderRadius:17,fontSize:16,cursor:"pointer"}}>✕</button>
             </div>
             <div style={{padding:16}}>
-              <CouponImage code={cpView.code} amount={cpView.discount_amount || 0} percent={cpView.discount_amount ? 0 : (cpView.discount_percent || 0)} expiry={cpView.expires_at ? String(cpView.expires_at).slice(0, 10) : ""} theme={cpTheme} hint={cpView.discount_amount ? (CP_PRESET_HINTS[cpView.discount_amount] || "") : ""} maxUses={cpView.max_uses || 1} showActions />
+              <CouponImage code={cpView.code} amount={cpView.fixed_price != null ? 0 : (cpView.discount_amount || 0)} fixedPrice={cpView.fixed_price != null ? cpView.fixed_price : null} percent={(cpView.fixed_price != null || cpView.discount_amount) ? 0 : (cpView.discount_percent || 0)} expiry={cpView.expires_at ? String(cpView.expires_at).slice(0, 10) : ""} theme={cpTheme} hint={cpView.fixed_price != null ? "ไม่ว่าราคาปกติเท่าไร จ่ายเพียงเท่านี้ต่อการจอง" : (cpView.discount_amount ? (CP_PRESET_HINTS[cpView.discount_amount] || "") : "")} maxUses={cpView.max_uses || 1} showActions />
               <div style={{display:"flex",gap:8,margin:"14px 0 0",flexWrap:"wrap",alignItems:"center"}}>
                 <span style={{fontSize:12,color:"var(--mu)"}}>สีคูปอง:</span>
                 {Object.entries(CP_THEMES).map(([k, t]) => (
