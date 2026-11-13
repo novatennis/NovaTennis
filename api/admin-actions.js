@@ -942,12 +942,19 @@ export default async function handler(req, res) {
         return;
       }
       case "createDiscount": {
-        const { code, amount, maxUses, expiresAt } = p;
+        const { code, amount, maxUses, expiresAt, mode, fixedPrice } = p;
         if (expiresAt && !/^\d{4}-\d{2}-\d{2}$/.test(expiresAt)) { res.status(400).json({ error: "invalid_date" }); return; }
         const row = { code: String(code).toUpperCase(), discount_amount: parseInt(amount), discount_percent: 0, max_uses: parseInt(maxUses), active: true };
+        if (mode === "fixed_price") {
+          // โค้ดแบบ "กำหนดราคาสุดท้าย": ลูกค้าใส่โค้ดแล้วจ่ายเท่ากับ fixed_price ไม่ว่าราคาปกติเท่าไร (ไม่ทำให้แพงขึ้น — ดู discountAmountFor ที่ booking-actions.js)
+          const fp = Number(fixedPrice);
+          if (!Number.isInteger(fp) || fp < 1 || fp > 50000) { res.status(400).json({ error: "invalid_fixed_price" }); return; }
+          if (!Number.isInteger(row.max_uses) || row.max_uses < 1) { res.status(400).json({ error: "invalid_max_uses" }); return; }
+          row.discount_amount = 0; row.fixed_price = fp;
+        }
         if (expiresAt) row.expires_at = expiresAt;
         const ins = await sb(`discount_codes`, { method: "POST", body: JSON.stringify(row) });
-        if (!ins.ok) { res.status(500).json({ error: "insert_failed" }); return; } // เช่นยังไม่ได้รัน SQL เพิ่มคอลัมน์ expires_at
+        if (!ins.ok) { res.status(500).json({ error: mode === "fixed_price" && /fixed_price/.test(JSON.stringify(ins.body || "")) ? "fixed_price_column_missing" : "insert_failed" }); return; } // เช่นยังไม่ได้รัน SQL เพิ่มคอลัมน์ expires_at / fixed_price
         res.status(200).json({ ok: true });
         return;
       }
