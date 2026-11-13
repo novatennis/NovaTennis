@@ -170,6 +170,10 @@ async function releasePackageStartIfUnused(packageId) {
 }
 
 const isDiscountExpired = (d) => !!d.expires_at && String(d.expires_at).slice(0, 10) < todayBangkok();
+// โค้ดแบบ "กำหนดราคาสุดท้าย" (fixed_price): ใส่โค้ดแล้วจ่ายเท่าที่ตั้งไว้ ไม่ว่าราคาปกติเท่าไร (ลดไปเหลือเท่านั้น)
+// ไม่เคยทำให้ราคาแพงขึ้น — ถ้าราคาปกติของรายการ ≤ ราคาของโค้ด โค้ดไม่ลดอะไร (ปฏิเสธ reason=no_effect โดยไม่ตัดสิทธิ์การใช้โค้ด)
+const isFixedPriceCode = (d) => !!d && d.fixed_price !== null && d.fixed_price !== undefined && Number.isFinite(Number(d.fixed_price));
+const discountAmountFor = (d, basePrice) => isFixedPriceCode(d) ? Math.max(0, basePrice - Number(d.fixed_price)) : (d.discount_amount > 0 ? d.discount_amount : Math.round(basePrice * d.discount_percent / 100));
 
 // ล็อกการใช้โค้ด "ก่อน" สร้างการจอง ด้วยการอัปเดตแบบมีเงื่อนไข (used_count ต้องยังเท่าค่าที่เพิ่งอ่าน)
 // ถ้ามีคนใช้ตัดหน้าไปพร้อมกัน เงื่อนไขจะไม่ตรง → อ่านใหม่แล้วตรวจอีกรอบ จึงไม่มีทางที่โค้ดใช้ได้ครั้งเดียวถูกใช้ซ้ำสองครั้ง
@@ -180,11 +184,12 @@ async function claimDiscount(discountId, basePrice) {
     if (!d || !d.active) return { error: "invalid" };
     if (isDiscountExpired(d)) return { error: "expired" };
     if (d.used_count >= d.max_uses) return { error: "used" };
+    if (isFixedPriceCode(d) && basePrice <= Number(d.fixed_price)) return { error: "no_effect", fixed_price: Number(d.fixed_price) }; // ไม่ลดอะไรให้ → ไม่ตัดสิทธิ์โค้ด
     const { ok, body: upd } = await sb(`discount_codes?id=eq.${d.id}&used_count=eq.${d.used_count}`, {
       method: "PATCH", headers: { Prefer: "return=representation" }, body: JSON.stringify({ used_count: d.used_count + 1 }),
     });
     if (ok && upd && upd.length > 0) {
-      const amount = d.discount_amount > 0 ? d.discount_amount : Math.round(basePrice * d.discount_percent / 100);
+      const amount = discountAmountFor(d, basePrice);
       return { row: upd[0], amount };
     }
   }
@@ -636,6 +641,7 @@ export default async function handler(req, res) {
         res.status(200).json({
           valid: true, id: d.id, code: d.code,
           discount_amount: d.discount_amount, discount_percent: d.discount_percent, expires_at: d.expires_at || null,
+          fixed_price: isFixedPriceCode(d) ? Number(d.fixed_price) : null,
         });
         return;
       }
@@ -743,7 +749,7 @@ export default async function handler(req, res) {
         let discountRow = null;
         if (discountCodeId && !isFirstTimePromo) { // โปรจองครั้งแรกไม่ร่วมกับโค้ดส่วนลด (โค้ดที่ส่งมาจะไม่ถูกใช้/ไม่ถูกตัดสิทธิ์)
           const claim = await claimDiscount(discountCodeId, basePrice);
-          if (claim.error) { res.status(400).json({ error: "discount_invalid", reason: claim.error }); return; } // โค้ดหมดอายุ/ถูกใช้แล้ว/ใช้ไม่ได้ — ไม่แอบคิดราคาเต็มโดยลูกค้าไม่รู้
+          if (claim.error) { res.status(400).json({ error: "discount_invalid", reason: claim.error, ...(claim.fixed_price != null ? { fixed_price: claim.fixed_price } : {}) }); return; } // โค้ดหมดอายุ/ถูกใช้แล้ว/ใช้ไม่ได้ — ไม่แอบคิดราคาเต็มโดยลูกค้าไม่รู้
           discountAmount = claim.amount;
           discountRow = claim.row;
         }
