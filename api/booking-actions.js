@@ -173,7 +173,7 @@ const isDiscountExpired = (d) => !!d.expires_at && String(d.expires_at).slice(0,
 // โค้ดแบบ "กำหนดราคาสุดท้าย" (fixed_price): ใส่โค้ดแล้วจ่ายเท่าที่ตั้งไว้ ไม่ว่าราคาปกติเท่าไร (ลดไปเหลือเท่านั้น)
 // ไม่เคยทำให้ราคาแพงขึ้น — ถ้าราคาปกติของรายการ ≤ ราคาของโค้ด โค้ดไม่ลดอะไร (ปฏิเสธ reason=no_effect โดยไม่ตัดสิทธิ์การใช้โค้ด)
 const isFixedPriceCode = (d) => !!d && d.fixed_price !== null && d.fixed_price !== undefined && Number.isFinite(Number(d.fixed_price));
-const discountAmountFor = (d, basePrice) => isFixedPriceCode(d) ? Math.max(0, basePrice - Number(d.fixed_price)) : (d.discount_amount > 0 ? d.discount_amount : Math.round(basePrice * d.discount_percent / 100));
+const discountAmountFor = (d, basePrice) => isFixedPriceCode(d) ? Math.max(0, basePrice - Number(d.fixed_price)) : Math.min(basePrice, d.discount_amount > 0 ? d.discount_amount : Math.round(basePrice * d.discount_percent / 100)); // ส่วนลดไม่เกินราคา (โค้ดมูลค่ามากกว่าราคา = ฟรี บันทึกส่วนลดเท่าราคาจริง)
 
 // ล็อกการใช้โค้ด "ก่อน" สร้างการจอง ด้วยการอัปเดตแบบมีเงื่อนไข (used_count ต้องยังเท่าค่าที่เพิ่งอ่าน)
 // ถ้ามีคนใช้ตัดหน้าไปพร้อมกัน เงื่อนไขจะไม่ตรง → อ่านใหม่แล้วตรวจอีกรอบ จึงไม่มีทางที่โค้ดใช้ได้ครั้งเดียวถูกใช้ซ้ำสองครั้ง
@@ -194,6 +194,16 @@ async function claimDiscount(discountId, basePrice) {
     }
   }
   return { error: "used" };
+}
+// ดูผลของโค้ดกับราคานี้ "โดยยังไม่ตัดสิทธิ์" (ใช้เทียบกับโปรจองครั้งแรกว่าอันไหนถูกกว่า) — เงื่อนไขเดียวกับ claimDiscount
+async function peekDiscount(discountId, basePrice) {
+  const { body } = await sb(`discount_codes?id=eq.${encodeURIComponent(discountId)}&select=*`);
+  const d = (body || [])[0];
+  if (!d || !d.active) return { error: "invalid" };
+  if (isDiscountExpired(d)) return { error: "expired" };
+  if (d.used_count >= d.max_uses) return { error: "used" };
+  if (isFixedPriceCode(d) && basePrice <= Number(d.fixed_price)) return { error: "no_effect", fixed_price: Number(d.fixed_price) };
+  return { row: d, amount: discountAmountFor(d, basePrice) };
 }
 // คืนสิทธิ์การใช้โค้ด 1 ครั้ง (ใช้ตอนสร้างการจองไม่สำเร็จ หรือยกเลิกรายการที่ยังไม่ได้ชำระ/ยังไม่ได้ยืนยัน)
 async function releaseDiscountById(id) {
@@ -734,7 +744,8 @@ export default async function handler(req, res) {
         }
 
         // ─── จองจ่ายเงินสดตามปกติ ────────────────────────────────────────────────
-        let basePrice = getDurationPrice(hour, dateObj, durationMinutes);
+        const regularPrice = getDurationPrice(hour, dateObj, durationMinutes);
+        let basePrice = regularPrice;
 
         // โปรโมชั่นจองครั้งแรก — เฉพาะจอง 60 นาที และยังไม่เคยมีการจอง (ที่ไม่ถูกยกเลิก) มาก่อนเลยในระบบ
         // เช็คที่เซิร์ฟเวอร์เสมอ ไม่เชื่อ flag จาก client — ถ้าราคาปกติถูกกว่าอยู่แล้วก็ใช้ราคาปกติ (ลูกค้าได้ราคาที่ถูกที่สุดเสมอ)
@@ -744,10 +755,17 @@ export default async function handler(req, res) {
           const firstTime = await isFirstTimeCustomer(customerId);
           if (firstTime) { basePrice = promoPrice; isFirstTimePromo = true; }
         }
+        // ลูกค้าใหม่ที่ใส่โค้ดมาด้วย: โปรจองครั้งแรกกับโค้ด "ไม่ซ้อนกัน" แต่ลูกค้าได้ราคาที่ถูกกว่าเสมอ
+        //   โค้ดให้ราคาต่ำกว่าโปร → ใช้โค้ด (ตัดสิทธิ์โค้ด ไม่ใช้โปร) / โปรถูกกว่าหรือเท่ากัน → ใช้โปร และไม่ตัดสิทธิ์โค้ด
+        if (isFirstTimePromo && discountCodeId) {
+          const peek = await peekDiscount(discountCodeId, regularPrice);
+          if (peek.error === "invalid" || peek.error === "expired" || peek.error === "used") { res.status(400).json({ error: "discount_invalid", reason: peek.error }); return; } // โค้ดใช้ไม่ได้จริง → บอกลูกค้า ไม่แอบเงียบ
+          if (!peek.error && regularPrice - peek.amount < promoPrice) { isFirstTimePromo = false; basePrice = regularPrice; }
+        }
 
         let discountAmount = 0;
         let discountRow = null;
-        if (discountCodeId && !isFirstTimePromo) { // โปรจองครั้งแรกไม่ร่วมกับโค้ดส่วนลด (โค้ดที่ส่งมาจะไม่ถูกใช้/ไม่ถูกตัดสิทธิ์)
+        if (discountCodeId && !isFirstTimePromo) {
           const claim = await claimDiscount(discountCodeId, basePrice);
           if (claim.error) { res.status(400).json({ error: "discount_invalid", reason: claim.error, ...(claim.fixed_price != null ? { fixed_price: claim.fixed_price } : {}) }); return; } // โค้ดหมดอายุ/ถูกใช้แล้ว/ใช้ไม่ได้ — ไม่แอบคิดราคาเต็มโดยลูกค้าไม่รู้
           discountAmount = claim.amount;
