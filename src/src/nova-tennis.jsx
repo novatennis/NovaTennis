@@ -1470,16 +1470,21 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
       .finally(() => { if (!cancelled) setFtChecking(false); });
     return () => { cancelled = true; };
   }, [phone, phoneOk, slot.durationMinutes, isGroup, date]);
-  const firstTimeEligible = !isGroup && firstTimePrice != null && firstTimePrice < slot.price && !matchedPkg;
-
-  const basePrice = (firstTimeEligible) ? Math.min(slot.price, firstTimePrice) : slot.price;
-  const calcDiscount = (d) => {
+  const promoAvail = !isGroup && firstTimePrice != null && firstTimePrice < slot.price && !matchedPkg; // ลูกค้าใหม่มีสิทธิ์โปรจองครั้งแรก (ยังไม่ได้ตัดสินว่าจะใช้โปรหรือโค้ด)
+  // ผลของโค้ดต่อ "ราคาปกติ" ของรายการนี้ (เซิร์ฟเวอร์คิดจากราคาปกติเช่นกัน)
+  const calcDiscountOn = (d, price) => {
     if (!d) return 0;
-    if (d.fixed_price != null) return Math.max(0, basePrice - d.fixed_price);   // โค้ด "ราคาสุดท้าย": เหลือเท่าที่ตั้ง (ไม่ทำให้แพงขึ้น)
-    if (d.discount_amount > 0) return d.discount_amount;
-    return Math.round(basePrice * d.discount_percent / 100);
+    if (d.fixed_price != null) return Math.max(0, price - d.fixed_price);   // โค้ด "ราคาสุดท้าย": เหลือเท่าที่ตั้ง (ไม่ทำให้แพงขึ้น)
+    return Math.min(price, d.discount_amount > 0 ? d.discount_amount : Math.round(price * d.discount_percent / 100));   // ส่วนลดไม่เกินราคา (โค้ดมูลค่ามากกว่าราคา = ฟรี)
   };
-  const discountAmount = (firstTimeEligible || isGroup) ? 0 : calcDiscount(discount); // โปรจองครั้งแรกไม่ร่วมกับโค้ดส่วนลด (เซิร์ฟเวอร์บังคับกฎเดียวกัน)
+  const codeSaves = (!isGroup && discount) ? calcDiscountOn(discount, slot.price) : 0;
+  const codeFinal = codeSaves > 0 ? Math.max(0, slot.price - codeSaves) : null;
+  // ลูกค้าใหม่ได้ "ราคาที่ถูกกว่า" ระหว่างโปรจองครั้งแรกกับโค้ด ไม่ซ้อนกัน (กติกาเดียวกับเซิร์ฟเวอร์): โค้ดต้องถูกกว่าโปรจริงๆ — เท่ากัน/แพงกว่า = ใช้โปร และไม่ตัดสิทธิ์โค้ด
+  const codeBeatsPromo = promoAvail && codeFinal != null && codeFinal < firstTimePrice;
+  const firstTimeEligible = promoAvail && !codeBeatsPromo;                  // โปรจองครั้งแรกที่ "ใช้จริง"
+  const discountApplied = codeFinal != null && (!promoAvail || codeBeatsPromo);   // โค้ดที่ "ใช้จริง" (จะถูกตัดสิทธิ์)
+  const basePrice = firstTimeEligible ? Math.min(slot.price, firstTimePrice) : slot.price;
+  const discountAmount = discountApplied ? codeSaves : 0;
   const finalPrice = Math.max(0, basePrice - discountAmount);
 
   const handleCheckCode = async () => {
@@ -1494,13 +1499,12 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
         setDiscountMsg(lang==="th" ? `โค้ดนี้ใช้กับรายการนี้ไม่ได้ — ราคาปกติ ฿${slot.price.toLocaleString()} ต่ำกว่าหรือเท่ากับราคาของโค้ด (฿${result.fixed_price.toLocaleString()}) อยู่แล้ว` : `This code can't be used here — the regular price (฿${slot.price.toLocaleString()}) is already at or below the code's price (฿${result.fixed_price.toLocaleString()}).`);
         setCheckingCode(false); return;
       }
+      if (calcDiscountOn(result, slot.price) <= 0) { // โค้ดที่ไม่ลดอะไรให้เลย (เช่นเซิร์ฟเวอร์ยังเป็นรุ่นเก่าที่ไม่รู้จักโค้ดชนิดนี้) — ไม่ใช้ ไม่ให้ลูกค้าเห็นราคาไม่ตรงหรือโค้ดถูกตัดสิทธิ์เปล่า
+        setDiscount(null);
+        setDiscountMsg(lang==="th" ? "โค้ดนี้ไม่ลดราคาในรายการนี้ กรุณาตรวจสอบโค้ด หรือติดต่อแอดมิน" : "This code doesn't reduce the price for this booking. Please check the code or contact the admin.");
+        setCheckingCode(false); return;
+      }
       setDiscount(result);
-      const saved = isFixed ? slot.price - result.fixed_price : (result.discount_amount > 0 ? result.discount_amount : Math.round(slot.price * result.discount_percent / 100));
-      const label = isFixed ? (lang==="th" ? `ราคาพิเศษ เหลือ ฿${result.fixed_price.toLocaleString()}` : `Special price ฿${result.fixed_price.toLocaleString()}`) : result.discount_amount > 0
-        ? (lang==="th" ? `ส่วนลด ฿${result.discount_amount}` : `฿${result.discount_amount} off`)
-        : (lang==="th" ? `ส่วนลด ${result.discount_percent}%` : `${result.discount_percent}% off`);
-      const expTxt = result.expires_at ? (lang==="th" ? ` • ใช้ได้ถึง ${new Date(result.expires_at+"T00:00:00").toLocaleDateString("th-TH",{day:"numeric",month:"short",year:"numeric"})}` : ` • valid until ${new Date(result.expires_at+"T00:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`) : "";
-      setDiscountMsg(`✅ ${label} — ${t.saveDiscount} ฿${saved}${expTxt}`);
     } else {
       setDiscount(null);
       setDiscountMsg(result?.error === "expired" ? (lang==="th" ? "โค้ดนี้หมดอายุแล้ว" : "This code has expired")
@@ -1509,6 +1513,19 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
     }
     setCheckingCode(false);
   };
+  // ข้อความผลโค้ด: คำนวณจากสถานะปัจจุบันทุกครั้งที่แสดง (ราคาที่เห็นกับข้อความจึงตรงกันเสมอ แม้เช็คสิทธิ์ลูกค้าใหม่เสร็จทีหลัง)
+  const discountNote = (() => {
+    if (!discount || isGroup) return null;
+    const th = lang === "th";
+    const fx = discount.fixed_price != null;
+    const label = fx ? (th ? `ราคาพิเศษ เหลือ ฿${discount.fixed_price.toLocaleString()}` : `Special price ฿${discount.fixed_price.toLocaleString()}`)
+      : discount.discount_amount > 0 ? (th ? `ส่วนลด ฿${discount.discount_amount}` : `฿${discount.discount_amount} off`)
+      : (th ? `ส่วนลด ${discount.discount_percent}%` : `${discount.discount_percent}% off`);
+    const expTxt = discount.expires_at ? (th ? ` • ใช้ได้ถึง ${new Date(discount.expires_at+"T00:00:00").toLocaleDateString("th-TH",{day:"numeric",month:"short",year:"numeric"})}` : ` • valid until ${new Date(discount.expires_at+"T00:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`) : "";
+    if (promoAvail && !codeBeatsPromo) return { ok: false, text: th ? `ℹ️ ราคาโปรจองครั้งแรก ฿${firstTimePrice.toLocaleString()} ถูกกว่าหรือเท่ากับราคาจากโค้ดนี้ (฿${codeFinal.toLocaleString()}) — ใช้ราคาโปร โค้ดยังไม่ถูกตัดสิทธิ์ เก็บไว้ใช้ครั้งต่อไปได้` : `ℹ️ The first-booking price (฿${firstTimePrice.toLocaleString()}) is lower than or equal to this code's price (฿${codeFinal.toLocaleString()}) — we'll use the first-booking price and keep your code for next time.` };
+    if (promoAvail && codeBeatsPromo) return { ok: true, text: th ? `✅ ${label} — ${fx ? "" : `เหลือ ฿${codeFinal.toLocaleString()} `}ถูกกว่าโปรจองครั้งแรก (฿${firstTimePrice.toLocaleString()}) ระบบใช้โค้ดนี้แทน${expTxt}` : `✅ ${label} — ${fx ? "" : `฿${codeFinal.toLocaleString()}, `}lower than the first-booking price (฿${firstTimePrice.toLocaleString()}), so we'll use this code${expTxt}` };
+    return { ok: true, text: `✅ ${label} — ${t.saveDiscount} ฿${codeSaves.toLocaleString()}${expTxt}` };
+  })();
 
   return (
     <div style={{padding:"20px 16px 100px"}} className="fu">
@@ -1522,7 +1539,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
           <Row label={`⏱ ${t.duration}`} val={`${slot.durationMinutes} ${t.minutesLabel}`} />
           {isGroup && <Row label={lang==="th"?"ราคาต่อสนาม":"Per court"} val={`฿${(slot.unitPrice ?? slot.price/courts.length).toLocaleString()} × ${courts.length}`} />}
           {firstTimeEligible && !useCredit && <Row label="🎉" val={lang==="th"?"ราคาพิเศษจองครั้งแรก":"First booking promo"} />}
-          {discount && !useCredit && !firstTimeEligible && !isGroup && <Row label="🏷" val={`-฿${discountAmount.toLocaleString()}`} />}
+          {discountApplied && !useCredit && <Row label="🏷" val={`-฿${discountAmount.toLocaleString()}`} />}
           <div style={{borderTop:"1px solid var(--dv)",margin:"12px 0"}} />
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <span style={{fontWeight:700,color:"var(--br)",fontSize:15}}>{t.total}</span>
@@ -1534,7 +1551,7 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
                 </>
               ) : (
                 <>
-                  {(discount || firstTimeEligible) && <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿{slot.price.toLocaleString()}</p>}
+                  {(discountApplied || firstTimeEligible) && <p style={{fontSize:13,color:"var(--mu)",textDecoration:"line-through"}}>฿{slot.price.toLocaleString()}</p>}
                   <span style={{fontSize:30,fontWeight:800,color:"var(--or)"}}>฿{finalPrice.toLocaleString()}</span>
                 </>
               )}
@@ -1591,22 +1608,22 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
             </div>
           </div>
         )}
-        {!useCredit && !firstTimeEligible && !isGroup && (
+        {!useCredit && !isGroup && (   // ช่องโค้ดแสดงตลอด รวมถึงลูกค้าใหม่ — ระบบเลือกราคาที่ถูกกว่าระหว่างโปรจองครั้งแรกกับโค้ดให้เอง
           <div>
             <label style={{fontSize:13,fontWeight:600,color:"var(--br)",marginBottom:7,display:"block"}}>{t.discount}</label>
             <div style={{display:"flex",gap:8}}>
               <input value={discountCode} onChange={e => setDiscountCode(e.target.value.toUpperCase())} placeholder="เช่น NOVA10"
                 style={{flex:1,padding:"13px 14px",borderRadius:10,fontSize:15,background:"#fff",border:"1.5px solid var(--dv)",color:"var(--tx)",outline:"none"}} />
-              <button onClick={handleCheckCode} disabled={checkingCode || !discountCode.trim()} style={{padding:"0 16px",borderRadius:10,border:"none",background:"var(--br)",color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer",whiteSpace:"nowrap",fontFamily:"'Noto Sans Thai',sans-serif"}}>
+              <button onClick={handleCheckCode} disabled={checkingCode || ftChecking || !discountCode.trim()} style={{padding:"0 16px",borderRadius:10,border:"none",background:"var(--br)",color:"#fff",fontWeight:700,fontSize:14,cursor:"pointer",whiteSpace:"nowrap",fontFamily:"'Noto Sans Thai',sans-serif"}}>
                 {checkingCode ? "..." : t.useCode}
               </button>
             </div>
-            {discountMsg && <p style={{fontSize:12,marginTop:6,color:discount?"#2d7a4f":"#c0392b"}}>{discountMsg}</p>}
+            {discountNote ? <p data-testid="discount-note" style={{fontSize:12,marginTop:6,color:discountNote.ok?"#2d7a4f":"#8a5a00",lineHeight:1.6}}>{discountNote.text}</p> : (discountMsg && <p data-testid="discount-err" style={{fontSize:12,marginTop:6,color:"#c0392b"}}>{discountMsg}</p>)}
           </div>
         )}
       </div>
 
-      {finalPrice===0 && discount && !firstTimeEligible && !isGroup && !useCredit && (
+      {finalPrice===0 && discountApplied && !useCredit && (
         <p style={{fontSize:12,color:"var(--mu)",marginBottom:10,lineHeight:1.6}}>🎁 {lang==="th" ? "โค้ดนี้ครอบคลุมยอดทั้งหมด ไม่ต้องโอนเงิน — ระบบจะส่งคำขอให้แอดมินยืนยัน" : "This code covers the full amount — nothing to pay. We'll send the request to the admin for confirmation."}</p>
       )}
       {linkErr && <p style={{fontSize:12.5,color:"#c0392b",marginBottom:10,lineHeight:1.6}}>{linkErr}</p>}
@@ -1629,16 +1646,16 @@ function CheckoutPage({ booking, onCancel, onConfirm, onConfirmWithPackage, onCo
             onConfirmWithPackage({ name: name.trim(), phone, packageId: matchedPkg.id });
             return;
           }
-          if (discount && !firstTimeEligible) {
+          if (discountApplied) {
             const confirmed = window.confirm(lang==="th" ? "การใช้โค้ดส่วนลด หากกดดำเนินการต่อแล้วจะไม่สามารถใช้โค้ดนี้ซ้ำได้อีก" : "Once you proceed, this discount code cannot be used again.");
             if (!confirmed) return;
           }
           // โค้ดครอบคลุมทั้งยอด (ไม่เหลือยอดให้โอน) → ไม่ต้องไปหน้า QR/แนบสลิป ส่งเป็นคำขอรอแอดมินยืนยันเลย
-          if (finalPrice === 0 && discount && !firstTimeEligible && !isGroup) {
+          if (finalPrice === 0 && discountApplied) {
             onConfirmFree({ name: name.trim(), phone, discount });
             return;
           }
-          onConfirm({name:name.trim(),phone,discount:firstTimeEligible?null:discount,finalPrice,discountAmount});
+          onConfirm({name:name.trim(),phone,discount:discountApplied?discount:null,finalPrice,discountAmount});
         }} style={{flex:2,padding:"14px",borderRadius:"var(--r)",border:"none",background:(ok&&!ftChecking&&!checkingPkg&&!linking)?"linear-gradient(90deg,var(--or),var(--or2))":"var(--cr2)",color:(ok&&!ftChecking&&!checkingPkg&&!linking)?"#fff":"var(--mu)",fontWeight:700,fontSize:15,cursor:(ok&&!ftChecking&&!checkingPkg&&!linking)?"pointer":"not-allowed"}}>{linking?(lang==="th"?"กำลังผูกเบอร์...":"Linking..."):(finalPrice===0&&discount&&!firstTimeEligible&&!isGroup&&!useCredit&&ok&&!ftChecking&&!checkingPkg)?(lang==="th"?"ยืนยันการจอง (ใช้โค้ดเต็มจำนวน) ✓":"Confirm Booking (full-value code) ✓"):(ok&&(ftChecking||checkingPkg))?(lang==="th"?"กำลังตรวจสอบสิทธิ์...":"Checking eligibility..."):useCredit?(lang==="th"?"ยืนยันการจอง (ใช้สิทธิ์) ✓":"Confirm Booking (Use Credit) ✓"):t.confirmBooking}</button>
       </div>
     </div>
@@ -3349,7 +3366,7 @@ async function drawCouponImage(cv, o) {
   }
   if (o.hint) { const px = cpFit(ctx, o.hint, 700, 28, "700", CP_FONT); ctx.font = `700 ${px}px ${CP_FONT}`; ctx.fillStyle = cpHexA(T.ink, .85); ctx.fillText("= " + o.hint.replace(/^=\s*/, ""), 90, 428); }
   const uses = Math.max(1, Math.round(+o.maxUses || 1));
-  const lines = ["ใส่โค้ดในช่อง “โค้ดส่วนลด” ตอนกรอกข้อมูลจอง", uses > 1 ? `โค้ดนี้ใช้ได้รวม ${uses} ครั้ง ใช้ครบแล้วหมดสิทธิ์` : "ใช้ได้ 1 ครั้งต่อ 1 โค้ด ใช้ซ้ำไม่ได้", "ไม่ใช้ร่วมกับโปรจองครั้งแรก แพ็คเกจ และจอง 2 สนามพร้อมกัน"];
+  const lines = ["ใส่โค้ดในช่อง “โค้ดส่วนลด” ตอนกรอกข้อมูลจอง", uses > 1 ? `โค้ดนี้ใช้ได้รวม ${uses} ครั้ง ใช้ครบแล้วหมดสิทธิ์` : "ใช้ได้ 1 ครั้งต่อ 1 โค้ด ใช้ซ้ำไม่ได้", "ไม่ใช้ร่วมกับแพ็คเกจและจอง 2 สนาม • ลูกค้าใหม่ได้ราคาที่ถูกกว่าเสมอ"];
   lines.forEach((t, i) => { ctx.fillStyle = T.accent; ctx.beginPath(); ctx.arc(98, 487 + i * 35 - 7, 5, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = cpHexA(T.ink, .8); const px = cpFit(ctx, t, 690, 24, "600", CP_FONT); ctx.font = `600 ${px}px ${CP_FONT}`; ctx.fillText(t, 116, 487 + i * 35); });
 
